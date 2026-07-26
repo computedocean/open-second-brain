@@ -24,12 +24,16 @@ import {
 import { loadBrainConfig } from "../../core/brain/policy.ts";
 import { buildPreCompressPack } from "../../core/brain/pre-compress-pack.ts";
 import {
+  assertContextReceiptWindowBound,
+  CONTEXT_RECEIPT_TRIGGERS,
   getContextReceipt,
   isContextReceiptTrigger,
   listContextReceipts,
   summarizeContextReceipt,
+  summarizeContextReceiptSession,
   type ContextReceiptOptions,
 } from "../../core/brain/context-receipts.ts";
+import { observedReuseRates } from "../../core/brain/observed-use.ts";
 import {
   diffContextPreset,
   getContextPreset,
@@ -43,7 +47,13 @@ import { BRAIN_LOG_EVENT_KIND_SET, type BrainLogEventKind } from "../../core/bra
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
-import { coerceStr, coerceStrList, coerceBool } from "../coerce.ts";
+import {
+  AGENT_SCOPE_SCHEMA,
+  coerceAgentScope,
+  coerceStr,
+  coerceStrList,
+  coerceBool,
+} from "../coerce.ts";
 import {
   coercePositiveInteger,
   optionalStringArg,
@@ -115,8 +125,10 @@ async function toolBrainContextPack(
   // gated on the density_ranking_context_pack config key (default off)
   // so the default pack stays byte-identical to the tier → recency order.
   const densityRanking = resolveDensityRankingContextPack(ctx.configPath ?? undefined);
+  const agentScope = coerceAgentScope(ctx, args, true);
   const report = packContext(ctx.vault, {
     maxTokens,
+    ...(agentScope !== undefined ? { agentScope } : {}),
     ...(densityRanking ? { densityRanking: true } : {}),
     ...(sessionFocus !== null ? { sessionFocus } : {}),
     ...(query ? { query } : {}),
@@ -225,7 +237,7 @@ async function toolBrainContextReceipts(
     if (trigger !== undefined && !isContextReceiptTrigger(trigger)) {
       throw new MCPError(
         INVALID_PARAMS,
-        "brain_context_receipts: trigger must be context_pack or pre_compress",
+        `brain_context_receipts: trigger must be one of ${CONTEXT_RECEIPT_TRIGGERS.join(", ")}`,
       );
     }
     const host = optionalStringArg("brain_context_receipts", args, "host");
@@ -265,7 +277,129 @@ async function toolBrainContextReceipts(
     };
   }
 
-  throw new MCPError(INVALID_PARAMS, "brain_context_receipts: operation must be list or show");
+  if (operation === "summary") return summarizeReceipts(ctx, args);
+
+  throw new MCPError(
+    INVALID_PARAMS,
+    "brain_context_receipts: operation must be list, show, or summary",
+  );
+}
+
+/**
+ * Session-scoped retrieval report (context-integrity-gates, Unit I): a
+ * read-only fold over receipts that already exist, joined to the
+ * observed-use verdicts for the same window.
+ *
+ * A window with no receipts reports exactly that. Receipt emission is
+ * opt-in, so counters of zero would describe a mechanism nobody enabled
+ * rather than a retrieval finding.
+ */
+async function summarizeReceipts(
+  ctx: ServerContext,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const trigger = optionalStringArg("brain_context_receipts", args, "trigger");
+  if (trigger !== undefined && !isContextReceiptTrigger(trigger)) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      `brain_context_receipts: trigger must be one of ${CONTEXT_RECEIPT_TRIGGERS.join(", ")}`,
+    );
+  }
+  const host = optionalStringArg("brain_context_receipts", args, "host");
+  const sessionId = optionalStringArg("brain_context_receipts", args, "session_id");
+  const since = optionalStringArg("brain_context_receipts", args, "since");
+  const until = optionalStringArg("brain_context_receipts", args, "until");
+  // Both bounds are compared LEXICALLY against stored `createdAt`
+  // strings. An uncomparable value (`"yesterday"`, a local-time stamp,
+  // `2026-13-01`) silently filters the window to empty and the fold
+  // reports "no receipts recorded for this filter" - "nothing happened"
+  // for what is really malformed input. Refuse it instead.
+  for (const [field, value] of [
+    ["since", since],
+    ["until", until],
+  ] as const) {
+    try {
+      assertContextReceiptWindowBound(field, value);
+    } catch (err) {
+      throw new MCPError(
+        INVALID_PARAMS,
+        `brain_context_receipts: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  const maxReceipts = coercePositiveInteger(
+    "brain_context_receipts",
+    "max_receipts",
+    args["max_receipts"],
+  );
+  const limit = coercePositiveInteger("brain_context_receipts", "limit", args["limit"]);
+
+  const window = {
+    ...(trigger !== undefined ? { trigger } : {}),
+    ...(host !== undefined ? { host } : {}),
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(until !== undefined ? { until } : {}),
+  };
+  const fold = summarizeContextReceiptSession(ctx.vault, {
+    ...window,
+    ...(maxReceipts !== undefined ? { maxReceipts } : {}),
+  });
+  if (!fold.recorded) {
+    return {
+      vault_path: ctx.vault,
+      recorded: false,
+      max_receipts: fold.max_receipts,
+      note: "no receipts recorded for this filter; receipt emission is opt-in per call",
+    };
+  }
+
+  // Observed use is folded over the SAME window, so a per-item verdict
+  // describes this session rather than the artifact's lifetime rate.
+  const reuse = observedReuseRates(ctx.vault, {
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(until !== undefined ? { until } : {}),
+  });
+  const items = limit === undefined ? fold.items : fold.items.slice(0, limit);
+
+  return {
+    vault_path: ctx.vault,
+    recorded: true,
+    receipt_count: fold.receipt_count,
+    item_total: fold.item_total,
+    distinct_items: fold.distinct_items,
+    withheld_receipts: fold.withheld_receipts,
+    // Receipts that inflate `receipt_count` and contribute no items: an
+    // injection that degraded to cache records `items: []` by design,
+    // and a receipt with no item array at all cannot be unfolded. Both
+    // used to vanish into the gap between `receipt_count` and
+    // `item_total`.
+    empty_receipts: fold.empty_receipts,
+    malformed_receipts: fold.malformed_receipts,
+    truncated: fold.truncated,
+    max_receipts: fold.max_receipts,
+    items: items.map((item) => {
+      const observed = reuse.get(item.path ?? item.id);
+      return {
+        id: item.id,
+        ...(item.path !== undefined ? { path: item.path } : {}),
+        injections: item.injections,
+        tokens: item.tokens,
+        ...(observed !== undefined
+          ? {
+              observed: {
+                used: observed.used,
+                ignored: observed.ignored,
+                contradicted: observed.contradicted,
+                total: observed.total,
+                score: observed.score,
+              },
+            }
+          : {}),
+      };
+    }),
+  };
 }
 
 // ----- brain_event_trace ---------------------------------------------------
@@ -407,8 +541,10 @@ async function toolBrainPreCompressPack(
   );
   const receipt = receiptOptionsFromArgs("brain_pre_compress_pack", args, "pre_compress", "mcp");
   const telemetry = telemetryOptionsFromArgs("brain_pre_compress_pack", args, "mcp");
+  const agentScope = coerceAgentScope(ctx, args, true);
   const pack = buildPreCompressPack(ctx.vault, {
     topK,
+    ...(agentScope !== undefined ? { agentScope } : {}),
     ...(maxCharsPerMemory !== undefined ? { maxCharsPerMemory } : {}),
     ...(maxTotalChars !== undefined ? { maxTotalChars } : {}),
     ...(configuredDegradation(ctx.vault) !== undefined
@@ -490,11 +626,13 @@ async function toolBrainAnticipatoryContext(
   } catch {
     // defaults apply; a broken config never blocks a read
   }
+  const anticipatoryScope = coerceAgentScope(ctx, args, true);
   const now = new Date();
   if (coerceBool(args, "refresh") === true) {
     const signal = coerceStr(args, "signal_text");
     refreshAnticipatoryCache(ctx.vault, {
       sessionId,
+      ...(anticipatoryScope !== undefined ? { agentScope: anticipatoryScope } : {}),
       ...(typeof signal === "string" && signal.trim() !== "" ? { signalText: signal } : {}),
       now,
       ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
@@ -504,6 +642,7 @@ async function toolBrainAnticipatoryContext(
   const result = readAnticipatoryContext(ctx.vault, {
     sessionId,
     now,
+    ...(anticipatoryScope !== undefined ? { agentScope: anticipatoryScope } : {}),
     ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
     ...(maxTokens !== undefined ? { maxTokens } : {}),
   });
@@ -511,6 +650,10 @@ async function toolBrainAnticipatoryContext(
     cache_state: result.cache_state,
     root_session_id: result.root_session_id,
     ...(result.generated_at !== undefined ? { generated_at: result.generated_at } : {}),
+    // Present only when a fresh-by-the-clock entry was refused on its
+    // provenance stamp or validity window, so an ordinary miss stays
+    // byte-identical (context-integrity-gates, Unit B).
+    ...(result.cache_refusal !== undefined ? { cache_refusal: result.cache_refusal } : {}),
     items: result.context.items.map((item) => ({
       id: item.id,
       tier: item.tier,
@@ -612,6 +755,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "string",
           description: "Optional turn id recorded on emitted telemetry.",
         },
+        agent_scope: AGENT_SCOPE_SCHEMA,
       },
       required: ["max_tokens"],
       additionalProperties: false,
@@ -621,14 +765,15 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_context_receipts",
     description:
-      "List context receipt summaries or show one full receipt by id. Receipts are append-only continuity records emitted by opt-in context injection callers. Read-only.",
+      "List context receipt summaries, show one full receipt by id, or fold a window into a retrieval summary (distinct items, per-item injection frequency, token cost, observed use). Receipts are append-only continuity records emitted by opt-in injection callers. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
-          enum: ["list", "show"],
-          description: "Use list for summaries, show for one full receipt by id.",
+          enum: ["list", "show", "summary"],
+          description:
+            "list returns summaries, show returns one full receipt by id, summary folds a window into a retrieval report.",
         },
         id: {
           type: "string",
@@ -636,7 +781,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         },
         trigger: {
           type: "string",
-          enum: ["context_pack", "pre_compress"],
+          enum: [...CONTEXT_RECEIPT_TRIGGERS],
           description: "Optional list filter by injection trigger.",
         },
         host: {
@@ -645,12 +790,29 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         },
         session_id: {
           type: "string",
-          description: "Optional list filter by recorded session id.",
+          description: "Optional list/summary filter by recorded session id.",
+        },
+        since: {
+          type: "string",
+          description:
+            "Summary only: inclusive lower bound on receipt createdAt. Canonical UTC only (YYYY-MM-DDTHH:MM:SS[.sss]Z); anything else is rejected, not filtered to empty.",
+        },
+        until: {
+          type: "string",
+          description:
+            "Summary only: inclusive upper bound on receipt createdAt. Canonical UTC only (YYYY-MM-DDTHH:MM:SS[.sss]Z); anything else is rejected, not filtered to empty.",
+        },
+        max_receipts: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Summary only: how many matching receipts are AGGREGATED (a fold bound, not a read bound - narrow the read with since/until). Exceeding it sets `truncated`.",
         },
         limit: {
           type: "integer",
           minimum: 1,
-          description: "Optional maximum number of summaries to return.",
+          description:
+            "Maximum summaries to return (list) or item rows to return (summary; `distinct_items` still reports the full count).",
         },
       },
       required: ["operation"],
@@ -787,6 +949,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "string",
           description: "Optional turn id recorded on emitted telemetry.",
         },
+        agent_scope: AGENT_SCOPE_SCHEMA,
       },
       additionalProperties: false,
     },
@@ -857,6 +1020,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "string",
           description: "Latest prompt/signal text steering the refreshed bundle.",
         },
+        agent_scope: AGENT_SCOPE_SCHEMA,
       },
       required: ["session_id"],
       additionalProperties: false,

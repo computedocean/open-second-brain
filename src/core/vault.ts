@@ -5,6 +5,45 @@
  * Mirrors `src/open_second_brain/vault.py`. Designed dependency-free; the small
  * YAML-like emitter handles only the scalar/inline-array shapes that round-trip
  * through Obsidian and the simple parser.
+ *
+ * ## Frontmatter diagnostics (unit F)
+ *
+ * The frontmatter reader is a line scanner, not a YAML parser, so it cannot
+ * fail — it drops what it does not understand, and the field simply never
+ * reaches the parsed map. That is how commit 426d06f8 (block-style lists
+ * dropped, producing spurious "missing field" errors in the doctor) stayed
+ * invisible until a human noticed the symptom.
+ *
+ * {@link parseFrontmatterTextWithNotices} is the diagnostic-carrying sibling:
+ * same map, same body, plus the notices. The rule for what counts as a
+ * dropped line — and what is legitimately skipped content that must stay
+ * silent — is stated on that function and is the authority for it.
+ * {@link parseFrontmatter} and {@link parseFrontmatterText} delegate to the
+ * siblings and discard the notices, so every call site not yet converted is
+ * byte-identical.
+ *
+ * ### Why most readers keep the two-tuple form
+ *
+ * Two consequences follow from the parser being a scanner rather than a
+ * YAML parser, and they are the reason the conversion is deliberately
+ * partial:
+ *
+ *   1. `parseFrontmatter` CANNOT throw. It reads inside its own `try` and
+ *      everything after that is string work. Every `catch { … }` wrapped
+ *      around nothing but a `parseFrontmatter` call is therefore
+ *      unreachable, and the arm that "handles" the failure has never run.
+ *      Those arms are removed where the `try` guards nothing else; the
+ *      control flow is provably identical because the branch was dead.
+ *   2. A reader that returns a plain value - a list of recipes, a graph
+ *      node, a ranked candidate set - has nowhere to put a notice.
+ *      Widening its return type would create a channel with no consumer,
+ *      which is the same silence in a new shape.
+ *
+ * The condition itself is not lost, because it is observable centrally:
+ * {@link listVaultPages}'s opt-in sink feeds `o2b brain doctor`, which
+ * sweeps the whole `Brain/` tree unconditionally, and the search indexer
+ * reports per-file notices through `IndexStats.frontmatterNotices`. A
+ * per-call channel at every reader would duplicate that, not add to it.
  */
 
 import { createHash } from "node:crypto";
@@ -14,6 +53,11 @@ import { dirname, join, relative } from "node:path";
 import { WIKILINK_TARGET_RE } from "./brain/wikilink.ts";
 import { atomicCreateFileSyncExclusive, atomicWriteFileSync } from "./fs-atomic.ts";
 import { stem } from "./fs-utils.ts";
+import {
+  DEGRADATION_CODE,
+  type DegradationNotice,
+  emitDegradationNotice,
+} from "./integrity/degradation.ts";
 import type { FrontmatterMap, FrontmatterValue, VaultPage } from "./types.ts";
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n?/;
@@ -59,26 +103,132 @@ const DEFAULT_SKIP_FILES = ["index.md", "log.md"] as const;
  * Only simple `key: value` lines are recognized — values are returned as strings,
  * with surrounding quotes stripped. Inline arrays `[a, b]` are parsed into arrays
  * of strings. Lines that don't match are silently skipped.
+ *
+ * Delegates to {@link parseFrontmatterWithNotices} and DISCARDS its
+ * diagnostics, so this signature and its output stay exactly as they were.
+ * Prefer the `WithNotices` sibling at any call site that has a report to
+ * carry the trace.
  */
 export function parseFrontmatter(path: string): readonly [FrontmatterMap, string] {
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    return [{}, ""];
-  }
-  return parseFrontmatterText(text);
+  const [metadata, body] = parseFrontmatterWithNotices(path);
+  return [metadata, body];
 }
 
 /**
  * Same parse as {@link parseFrontmatter} but over an in-memory string,
  * so a caller that already holds the file content (e.g. the search
  * indexer) does not pay a second `readFileSync`.
+ *
+ * Delegates to {@link parseFrontmatterTextWithNotices} and discards its
+ * diagnostics — see {@link parseFrontmatter}.
  */
 export function parseFrontmatterText(text: string): readonly [FrontmatterMap, string] {
+  const [metadata, body] = parseFrontmatterTextWithNotices(text);
+  return [metadata, body];
+}
+
+/** Site recorded on a notice when the caller names none. */
+const FRONTMATTER_SITE = "vault.parseFrontmatter";
+
+/**
+ * Longest run of a dropped source line reproduced in a notice `detail`.
+ * A notice renders as ONE line in doctor / index output, so an unbounded
+ * frontmatter line (a pasted blob, a minified payload) must not be able
+ * to dominate a report.
+ */
+const NOTICE_LINE_MAX = 120;
+const NOTICE_LINE_ELLIPSIS = "…";
+
+/** Attribution for the notices a frontmatter parse emits. */
+export interface FrontmatterNoticeOptions {
+  /**
+   * The subsystem to record as the notice `site`. Defaults to the parser
+   * itself; a converted call site passes its own name so a reader can
+   * tell WHICH walker hit the condition.
+   */
+  readonly site?: string;
+  /**
+   * The file the text came from, when the caller knows it. The path form
+   * ({@link parseFrontmatterWithNotices}) supplies this itself.
+   */
+  readonly path?: string;
+}
+
+/** `[metadata, body, notices]` — the diagnostic-carrying parse result. */
+export type FrontmatterParseWithNotices = readonly [
+  FrontmatterMap,
+  string,
+  ReadonlyArray<DegradationNotice>,
+];
+
+/**
+ * {@link parseFrontmatter} plus the diagnostics it would otherwise drop.
+ *
+ * An unreadable file yields one `frontmatter-unreadable` notice naming
+ * the path, and the same `[{}, ""]` result the two-tuple form has always
+ * returned — the read failure is reported, never raised.
+ */
+export function parseFrontmatterWithNotices(
+  path: string,
+  opts: FrontmatterNoticeOptions = {},
+): FrontmatterParseWithNotices {
+  const site = opts.site ?? FRONTMATTER_SITE;
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    const notices: DegradationNotice[] = [];
+    emitDegradationNotice(notices, {
+      code: DEGRADATION_CODE.frontmatterUnreadable,
+      site,
+      path,
+      detail: `frontmatter read failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return [{}, "", notices];
+  }
+  return parseFrontmatterTextWithNotices(text, { site, path });
+}
+
+/**
+ * {@link parseFrontmatterText} plus the diagnostics it would otherwise
+ * drop. The map and body are byte-identical to the two-tuple form; the
+ * third element is the new trace.
+ *
+ * ## What counts as a DROPPED line
+ *
+ * The scanner is line-based, not a YAML parser, so "unsupported grammar"
+ * has to be defined structurally. A line inside the `---` block is
+ * CONSUMED when it is one of:
+ *
+ *   - a `key: value` pair (`KEY_VALUE_RE`), including the empty-value
+ *     form that opens a block sequence or records a null scalar;
+ *   - a dash item (`DASH_ITEM_RE`) while a block sequence is open.
+ *
+ * It is legitimately SKIPPED, with no notice, when it is:
+ *
+ *   - blank, or whitespace-only — structural separation the format
+ *     expects, and a notice per blank line would be noise, not signal;
+ *   - a `#` comment — content the format explicitly discards.
+ *
+ * Everything else is a DROP and emits exactly one
+ * `frontmatter-line-dropped` notice carrying the 1-based line number
+ * within the block and the offending text. That covers the two shapes
+ * seen in the field: grammar the scanner has no branch for (a folded or
+ * literal block scalar, an indented nested mapping, a `-foo` string that
+ * is not a list item) and a dash item with no open key to land in.
+ *
+ * Emitting a notice never changes the parse. A dropped line is still
+ * dropped, exactly as before; only the trace is new.
+ */
+export function parseFrontmatterTextWithNotices(
+  text: string,
+  opts: FrontmatterNoticeOptions = {},
+): FrontmatterParseWithNotices {
+  const notices: DegradationNotice[] = [];
+  const site = opts.site ?? FRONTMATTER_SITE;
   const match = FRONTMATTER_RE.exec(text);
   if (!match) {
-    return [{}, text.trim()];
+    return [{}, text.trim(), notices];
   }
 
   const fmBlock = match[1]!;
@@ -110,7 +260,15 @@ export function parseFrontmatterText(text: string): readonly [FrontmatterMap, st
     blockKey = null;
 
     const kv = KEY_VALUE_RE.exec(line);
-    if (!kv) continue;
+    if (!kv) {
+      emitDegradationNotice(notices, {
+        code: DEGRADATION_CODE.frontmatterLineDropped,
+        site,
+        ...(opts.path !== undefined ? { path: opts.path } : {}),
+        detail: `frontmatter line ${i + 1} is not a supported key/value or list item: ${clipNoticeLine(line)}`,
+      });
+      continue;
+    }
     const key = kv[1]!;
     let value = kv[2]!.trim();
 
@@ -146,7 +304,14 @@ export function parseFrontmatterText(text: string): readonly [FrontmatterMap, st
     metadata[key] = stripQuotes(value);
   }
 
-  return [metadata, body];
+  return [metadata, body, notices];
+}
+
+/** Bound one source line to {@link NOTICE_LINE_MAX} for a one-line notice. */
+function clipNoticeLine(line: string): string {
+  return line.length <= NOTICE_LINE_MAX
+    ? line
+    : line.slice(0, NOTICE_LINE_MAX) + NOTICE_LINE_ELLIPSIS;
 }
 
 /**
@@ -314,21 +479,49 @@ export function extractWikilinks(content: string): string[] {
 export interface ListVaultPagesOptions {
   readonly skipDirs?: ReadonlyArray<string>;
   readonly skipFiles?: ReadonlyArray<string>;
+  /**
+   * Opt-in diagnostic sink (unit F). When supplied, the walk appends a
+   * notice for every directory it could not read and every frontmatter
+   * line it dropped, each carrying the absolute path it happened to.
+   *
+   * The sink is OPT-IN rather than a widened return type so a caller
+   * that has nowhere to report stays byte-identical and pays nothing.
+   * The walk's control flow does not depend on it: an unreadable
+   * subtree is skipped and a page with a dropped line is still listed,
+   * exactly as before.
+   */
+  readonly notices?: DegradationNotice[];
+  /** Site recorded on the notices; defaults to `vault.listVaultPages`. */
+  readonly site?: string;
 }
+
+const LIST_VAULT_PAGES_SITE = "vault.listVaultPages";
 
 /**
  * Walk the vault and return every Markdown page with parsed frontmatter
  * metadata. Pages are sorted by title (case-insensitive). Excluded dirs/files
  * mirror the Python defaults.
+ *
+ * Pass `opts.notices` to collect what the walk discarded — see
+ * {@link ListVaultPagesOptions}.
  */
 export function listVaultPages(vaultDir: string, opts: ListVaultPagesOptions = {}): VaultPage[] {
   const skipDirs = new Set(opts.skipDirs ?? DEFAULT_SKIP_DIRS);
   const skipFiles = new Set((opts.skipFiles ?? DEFAULT_SKIP_FILES).map((f) => f.toLowerCase()));
 
   const pages: VaultPage[] = [];
-  walk(vaultDir, vaultDir, skipDirs, skipFiles, pages);
+  walk(vaultDir, vaultDir, skipDirs, skipFiles, pages, {
+    sink: opts.notices,
+    site: opts.site ?? LIST_VAULT_PAGES_SITE,
+  });
   pages.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
   return pages;
+}
+
+/** Where {@link walk} reports what it discarded, and under which name. */
+interface WalkNoticeSink {
+  readonly sink: DegradationNotice[] | undefined;
+  readonly site: string;
 }
 
 /**
@@ -386,18 +579,30 @@ function walk(
   skipDirs: Set<string>,
   skipFiles: Set<string>,
   out: VaultPage[],
+  notices: WalkNoticeSink,
 ): void {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // Unit F: an unreadable directory used to make an entire subtree
+    // vanish from the listing with no trace. The walk still returns
+    // (fail-soft, as before); the branch is now named.
+    if (notices.sink !== undefined) {
+      emitDegradationNotice(notices.sink, {
+        code: DEGRADATION_CODE.vaultWalkEntrySkipped,
+        site: notices.site,
+        path: dir,
+        detail: `directory listing failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
     return;
   }
   for (const entry of entries) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (skipDirs.has(entry.name)) continue;
-      walk(root, full, skipDirs, skipFiles, out);
+      walk(root, full, skipDirs, skipFiles, out, notices);
       continue;
     }
     if (!entry.isFile()) continue;
@@ -406,12 +611,13 @@ function walk(
     const rel = relative(root, full);
     const parts = rel.split(/[\\/]/);
     if (parts.some((p) => skipDirs.has(p))) continue;
-    let meta: FrontmatterMap;
-    try {
-      [meta] = parseFrontmatter(full);
-    } catch {
-      continue;
-    }
+    // The former `catch { continue }` here was unreachable: the parser
+    // is a line scanner over a string it read inside its own try, so it
+    // cannot throw. What it CAN do is drop a line or fail the read, and
+    // both now reach the sink instead of vanishing. The page is still
+    // listed either way - identical control flow.
+    const [meta, , pageNotices] = parseFrontmatterWithNotices(full, { site: notices.site });
+    if (notices.sink !== undefined) notices.sink.push(...pageNotices);
     const titleVal = meta["title"];
     const title = typeof titleVal === "string" && titleVal ? titleVal : stem(entry.name);
     out.push({ title, path: full, metadata: meta });

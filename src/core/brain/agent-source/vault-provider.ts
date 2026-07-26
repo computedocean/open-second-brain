@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { BrainLogEntry } from "../log.ts";
 import { readAllLogEntries } from "../query.ts";
 import { brainDirs } from "../paths.ts";
+import { preferenceOwner } from "../owner-scoped-facts.ts";
 import { parsePreference, parseRetired } from "../preference.ts";
 import { parseSignal } from "../signal.ts";
 import type { BrainPreference, BrainRetired, BrainSignal } from "../types.ts";
@@ -30,8 +31,8 @@ function collectVaultContributions(vault: string): ReadonlyArray<AgentSourceCont
   for (const signal of signals) {
     contributions.push(signalContribution(signal));
   }
-  for (const preference of collectPreferences(dirs.preferences, dirs.retired)) {
-    contributions.push(preferenceContribution(preference, signalAgentById));
+  for (const owned of collectPreferences(dirs.preferences, dirs.retired)) {
+    contributions.push(preferenceContribution(owned, signalAgentById));
   }
   for (const entry of readAllLogEntries(vault)) {
     const contribution = logContribution(entry);
@@ -68,22 +69,28 @@ function collectSignals(...dirs: string[]): BrainSignal[] {
   return signals;
 }
 
-function collectPreferences(
-  preferencesDir: string,
-  retiredDir: string,
-): Array<BrainPreference | BrainRetired> {
+/**
+ * A parsed preference or retired record with the owner token its page
+ * declares (context-integrity-gates, Unit A). Both kinds carry `owner`
+ * since A7 made retirement KEEP ownership, so the token is read from the
+ * parsed record and resolved through the one shared rule - no second
+ * frontmatter read, and no way for the two kinds to disagree.
+ */
+interface OwnedRecord {
+  readonly record: BrainPreference | BrainRetired;
+  readonly owner: string | null;
+}
+
+function collectPreferences(preferencesDir: string, retiredDir: string): OwnedRecord[] {
   return [
     ...collectPreferenceDir(preferencesDir, "pref-"),
     ...collectPreferenceDir(retiredDir, "ret-"),
   ];
 }
 
-function collectPreferenceDir(
-  dir: string,
-  prefix: "pref-" | "ret-",
-): Array<BrainPreference | BrainRetired> {
+function collectPreferenceDir(dir: string, prefix: "pref-" | "ret-"): OwnedRecord[] {
   if (!existsSync(dir)) return [];
-  const out: Array<BrainPreference | BrainRetired> = [];
+  const out: OwnedRecord[] = [];
   const entries = readdirSync(dir, { withFileTypes: true }).toSorted((a, b) =>
     a.name.localeCompare(b.name),
   );
@@ -93,7 +100,8 @@ function collectPreferenceDir(
     }
     const path = join(dir, entry.name);
     try {
-      out.push(prefix === "pref-" ? parsePreference(path) : parseRetired(path));
+      const record = prefix === "pref-" ? parsePreference(path) : parseRetired(path);
+      out.push({ record, owner: preferenceOwner(record) });
     } catch {
       continue;
     }
@@ -123,9 +131,10 @@ function signalContribution(signal: BrainSignal): AgentSourceContribution {
 }
 
 function preferenceContribution(
-  preference: BrainPreference | BrainRetired,
+  owned: OwnedRecord,
   signalAgentById: ReadonlyMap<string, string>,
 ): AgentSourceContribution {
+  const preference = owned.record;
   const agents = new Set<string>();
   for (const evidence of preference.evidenced_by) {
     const id = normaliseWikilinkTarget(evidence);
@@ -141,6 +150,7 @@ function preferenceContribution(
     timestamp: preference.kind === "brain-retired" ? preference.retired_at : preference.created_at,
     topic: preference.topic,
     ...(preference.scope !== undefined ? { scope: preference.scope } : {}),
+    ...(owned.owner !== null ? { owner: owned.owner } : {}),
     title: preference.topic,
     text: [preference.topic, preference.status, preference.principle].join("\n"),
     data: {

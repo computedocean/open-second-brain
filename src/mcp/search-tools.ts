@@ -38,7 +38,13 @@ import {
 import { assessRecallAdequacy } from "../core/brain/recall-adequacy.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "./protocol.ts";
 import type { ServerContext, ToolDefinition } from "./tool-contract.ts";
-import { coerceBoolOptional, coerceStr, coerceStringOptional } from "./coerce.ts";
+import {
+  AGENT_SCOPE_SCHEMA,
+  coerceAgentScope,
+  coerceBoolOptional,
+  coerceStr,
+  coerceStringOptional,
+} from "./coerce.ts";
 import { MCP_PREVIEW_BUDGET } from "./preview-budget.ts";
 import { deriveRecallHint } from "../core/search/recall-hint.ts";
 import { projectScoreBreakdown } from "../core/search/enrich.ts";
@@ -1002,6 +1008,7 @@ const FILE_CONTEXT_INPUT_SCHEMA: Record<string, unknown> = {
     file_path: { type: "string", minLength: 1, maxLength: 1024 },
     limit: { type: "integer", minimum: 1, maximum: MCP_LIMIT_MAX },
     min_bytes: { type: "integer", minimum: 0, maximum: 10_000_000 },
+    agent_scope: AGENT_SCOPE_SCHEMA,
   },
   required: ["file_path"],
   additionalProperties: false,
@@ -1051,7 +1058,9 @@ async function toolBrainFileContext(
   });
 
   try {
+    const agentScope = coerceAgentScope(ctx, args, false);
     const outcome = await fileContextRecall(config, {
+      ...(agentScope !== undefined ? { agentScope } : {}),
       filePath,
       ...(limit !== undefined ? { limit } : {}),
       ...(minBytes !== undefined ? { minBytes } : {}),
@@ -1110,6 +1119,7 @@ const SEARCH_EXPAND_INPUT_SCHEMA: Record<string, unknown> = {
       maxLength: 32,
       description: "Pagination cursor returned as next_cursor by a prior expand call.",
     },
+    agent_scope: AGENT_SCOPE_SCHEMA,
   },
   required: ["chunk_id"],
   additionalProperties: false,
@@ -1171,6 +1181,7 @@ async function toolBrainSearchExpand(
   }
   const rawLimit = coerceIntInRange(args, "raw_limit", 1, MCP_LIMIT_MAX);
   const cursor = coerceStringOptional(args, "cursor", 32);
+  const expandScope = coerceAgentScope(ctx, args, false);
   const config = resolveSearchConfig({
     vault: ctx.vault,
     configPath: ctx.configPath ?? undefined,
@@ -1180,6 +1191,7 @@ async function toolBrainSearchExpand(
     result = await withTimeout(
       expandHit(config, {
         chunkId: rawChunk,
+        ...(expandScope !== undefined ? { agentScope: expandScope } : {}),
         ...(rawLimit !== undefined ? { rawLimit } : {}),
         ...(cursor !== undefined ? { cursor } : {}),
       }),
@@ -1289,13 +1301,25 @@ export async function buildSearchStatusBlock(ctx: ServerContext): Promise<Record
     }
     // Token-budget conscious: pick the MCP subset out of the shared
     // serializer's full field set rather than re-declaring the mapping.
+    //
+    // `warnings` used to be dropped with the rest, which is how an
+    // agent driving the vault entirely over MCP could not observe
+    // embedding-ABI drift at any setting short of `fail`
+    // (context-integrity-gates, Unit E): the drift line, the
+    // instruction-prefix line and the "sqlite-vec unavailable" line all
+    // died here. It is now spread back in only when non-empty, so a
+    // healthy vault's block is byte-identical and the token cost lands
+    // exactly on the vaults that have something to say. The structured
+    // `embedding_abi` field rides through in `rest` on the same
+    // condition, so an agent can branch instead of matching text.
     const {
       embedding_signature: _embeddingSignature,
       estimated_refresh_cost_usd: _estimatedRefreshCostUsd,
-      warnings: _warnings,
+      warnings,
       ...rest
     } = serializeIndexStatus(snap);
-    return rest;
+    const reportable = Array.isArray(warnings) ? warnings : [];
+    return reportable.length > 0 ? { ...rest, warnings: reportable } : rest;
   } catch (e) {
     return { exists: false, error: e instanceof Error ? e.message : String(e) };
   }

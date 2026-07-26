@@ -50,7 +50,14 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { buildManifest, manifestSidecarPath, writeManifestSidecar } from "./manifest.ts";
-import { BRAIN_ROOT_REL, brainDirs, snapshotPath, validateRunId } from "./paths.ts";
+import {
+  BRAIN_ROOT_REL,
+  brainDirs,
+  brainDirsForWrite,
+  snapshotPath,
+  validateRunId,
+} from "./paths.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 // ----- Errors ---------------------------------------------------------------
 
@@ -174,7 +181,7 @@ function detectTooling(): ToolAvailability {
  */
 export function createSnapshot(vault: string, runId: string): CreateSnapshotResult {
   validateRunId(runId);
-  const dirs = brainDirs(vault);
+  const dirs = brainDirsForWrite(vault);
   mkdirSync(dirs.snapshots, { recursive: true });
 
   const outPath = snapshotPath(vault, runId);
@@ -395,6 +402,11 @@ export function listSnapshots(vault: string): SnapshotInfo[] {
  * on the same dir returns `deleted: []`.
  */
 export function pruneSnapshots(vault: string, retentionCount: number): PruneSnapshotsResult {
+  // Vault-identity write guard (context-integrity-gates, Unit J). This is
+  // the most destructive operation in the module - an `rmSync` over
+  // archives - and it was the only one of the three without the guard
+  // its `createSnapshot` and `restoreSnapshot` siblings carry.
+  assertVaultIdentityForWrite(vault);
   if (!Number.isInteger(retentionCount) || retentionCount < 0) {
     throw new Error(
       `pruneSnapshots: retentionCount must be a non-negative integer; got ${retentionCount}`,
@@ -566,7 +578,7 @@ export function restoreSnapshot(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- reserved for future log emission
   _opts: { now?: Date } = {},
 ): RestoreSnapshotResult {
-  const dirs = brainDirs(vault);
+  const dirs = brainDirsForWrite(vault);
   const ext = extractSnapshotToTemp(vault, runId);
   try {
     // Replace every top-level entry under Brain/, EXCEPT `.snapshots/`.

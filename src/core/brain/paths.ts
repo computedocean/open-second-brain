@@ -27,6 +27,8 @@ import { existsSync } from "node:fs";
 import { join, posix } from "node:path";
 
 import { ensureInsideVault, vaultRelative } from "../path-safety.ts";
+import type { DegradationNotice } from "../integrity/degradation.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 export { ensureInsideVault, vaultRelative } from "../path-safety.ts";
 
@@ -171,6 +173,48 @@ export function brainDirs(vault: string): BrainDirs {
     bases: ensureInsideVault(join(vault, BRAIN_BASES_REL), vault),
     snapshots: ensureInsideVault(join(vault, BRAIN_SNAPSHOTS_REL), vault),
   };
+}
+
+/**
+ * {@link brainDirs} for a caller that is about to WRITE.
+ *
+ * Identical directories, plus the vault-identity assertion in front of
+ * them (context-integrity-gates, Unit J). The write-intent variant
+ * exists because the guard belongs on the write side only: read paths
+ * must stay unaffected, and a blanket assertion inside `brainDirs`
+ * would fire on every listing, every doctor pass, and every fail-soft
+ * hook that merely inspects the tree.
+ *
+ * An unmarked root emits a `vault-marker-absent` notice into `notices`
+ * and proceeds; a root whose marker differs from the one this process
+ * pinned raises `VaultIdentityMismatchError`. The bootstrap path
+ * deliberately uses plain {@link brainDirs}: it is what legitimately
+ * creates the tree, so it must not be gated on the marker it is about
+ * to write.
+ *
+ * ## Which call sites use this one
+ *
+ * A site is write-intent when EITHER the `BrainDirs` value it produces
+ * forms a path the same flow creates, moves, or deletes (even
+ * conditionally), OR the site is reached only from flows that mutate
+ * the Brain tree. Everything else stays on {@link brainDirs}:
+ *
+ *   - read, query, report, and analysis flows - widening the guard onto
+ *     them would break `src/openclaw/index.ts`, which silently defaults
+ *     to the process working directory, and the hooks, which fail open
+ *     by contract;
+ *   - sites reached from BOTH a mutating flow and a read-only or
+ *     dry-run preview of it, where the guard would fire on a preview;
+ *   - the path builders in this module. They are intent-neutral by
+ *     construction - `preferencePath` serves `parsePreference` and
+ *     `writePreference` alike - so a writer that reaches the tree
+ *     through one of them is guarded at its own entry point, not here.
+ *     Those writers call `assertVaultIdentityForWrite` directly; see
+ *     its docblock for the two call surfaces and why they differ.
+ */
+export function brainDirsForWrite(vault: string, notices?: DegradationNotice[]): BrainDirs {
+  assertVaultIdentityForWrite(vault, notices);
+  return brainDirs(vault);
 }
 
 /** Path of `Brain/_brain.yaml`. */

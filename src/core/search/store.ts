@@ -20,6 +20,16 @@ import lockfile from "proper-lockfile";
 
 import { registerWriterDb, unregisterWriterDb } from "./store-exit.ts";
 
+import { loadIntegrityConfigSafe } from "../brain/policy.ts";
+import {
+  checkStamp,
+  compareStamps,
+  formatStampMismatch,
+  STAMP_VERDICT,
+  type StampMismatch,
+  type StampTokens,
+} from "../integrity/stamp.ts";
+
 import { computeCorpusGeneration } from "./corpus-generation.ts";
 import { SearchError } from "./types.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
@@ -46,6 +56,82 @@ import {
  */
 export const EMBEDDING_PREFIX_QUERY_STATE_KEY = "embedding_prefix_query";
 export const EMBEDDING_PREFIX_PASSAGE_STATE_KEY = "embedding_prefix_passage";
+
+/**
+ * `index_state` keys behind the corpus-generation fingerprint. Named so
+ * the class accessors and {@link readCorpusGenerationSync} cannot drift
+ * into two spellings of the same key.
+ */
+export const EMBEDDING_MODEL_STATE_KEY = "embedding_model";
+export const EMBEDDING_DIMENSION_STATE_KEY = "embedding_dimension";
+export const INDEX_REVISION_STATE_KEY = "index_revision";
+
+/**
+ * sqlite-vec version the stored vectors were written against
+ * (context-integrity-gates, Unit E). `SELECT vec_version()` was already
+ * executed on every extension load and the row discarded every time;
+ * this key is where it now lands, so the ABI the vectors were produced
+ * under can be compared later instead of assumed.
+ */
+export const EMBEDDING_VEC_VERSION_STATE_KEY = "embedding_vec_version";
+
+/**
+ * The single remediation for embedding-ABI drift, named once so the
+ * store's refusal, the status warning and the `search check`
+ * recommendation cannot grow three spellings of the same instruction.
+ */
+export const EMBEDDING_ABI_FIX_COMMAND = "o2b search reindex --embeddings";
+
+/**
+ * `index_state` keys stamped by every index run (`last_indexed_at`) and
+ * by a FORCED one only (`last_full_index_at`). Both carry the same ISO
+ * instant when the run was forced, which is what makes their equality a
+ * usable "the last run resolved the whole vault" predicate - the
+ * precondition the broken-link ratchet verifies before it trusts a
+ * dangling count (context-integrity-gates, unit G).
+ */
+export const LAST_INDEXED_AT_STATE_KEY = "last_indexed_at";
+export const LAST_FULL_INDEX_AT_STATE_KEY = "last_full_index_at";
+
+/** Vault-wide link-resolution census (see {@link Store.linkResolutionCounts}). */
+export interface LinkResolutionCounts {
+  /**
+   * Link rows carrying a target path. Tag rows have `target_path IS
+   * NULL` and are excluded - a tag has nothing to resolve to.
+   */
+  readonly total: number;
+  /**
+   * Rows the read-time resolution ladder cannot resolve to any
+   * document - broken links as a reader experiences them.
+   */
+  readonly unresolved: number;
+}
+
+/**
+ * The READ-TIME link-resolution ladder, as one SQL expression over a
+ * `links` row aliased `l`, yielding the resolved document id or NULL.
+ *
+ * Three rungs, in order: the materialized `target_document_id` that
+ * `resolveLinkTargets` / `resolveAliasTargets` wrote, then a
+ * `<target>.md` exact path match, then an UNAMBIGUOUS nested-basename
+ * match (`basename = target` with exactly one such nested document -
+ * a top-level `target.md` has no leading slash and belongs to the exact
+ * rung above).
+ *
+ * Defined once and shared by {@link Store.resolvedDocLinkPairs} (which
+ * follows it) and {@link Store.linkResolutionCounts} (which counts what
+ * it leaves over), so "resolvable" and "broken" can never drift apart
+ * into two different opinions of the same vault.
+ */
+const RESOLVED_LINK_TARGET_SQL =
+  "COALESCE(" +
+  "  l.target_document_id, " +
+  "  (SELECT d.id FROM documents d WHERE d.path = l.target_path || '.md'), " +
+  "  (SELECT d.id FROM documents d " +
+  "     WHERE d.basename = l.target_path AND instr(d.path, '/') > 0 " +
+  "     AND 1 = (SELECT COUNT(*) FROM documents d2 " +
+  "              WHERE d2.basename = l.target_path AND instr(d2.path, '/') > 0))" +
+  ")";
 
 /** The query/passage instruction prefixes active for an index run. */
 export interface EmbeddingPrefixPair {
@@ -209,7 +295,18 @@ function ensureFts5(db: Database): void {
   }
 }
 
-function tryLoadVecExtension(db: Database): boolean {
+/**
+ * Load sqlite-vec and return the version it reports, or `null` when the
+ * extension is unavailable.
+ *
+ * The `vec_version()` probe was always executed and its row always
+ * discarded; returning it costs nothing and is what lets the ABI the
+ * vectors were written against be stamped rather than assumed
+ * (context-integrity-gates, Unit E). `null` doubles as the
+ * "not loaded" signal, so there is exactly one source of truth for both
+ * facts.
+ */
+function tryLoadVecExtension(db: Database): string | null {
   try {
     // sqlite-vec is an optional dependency. Wrap the import + load so
     // a missing platform package degrades to "extension unavailable"
@@ -218,11 +315,196 @@ function tryLoadVecExtension(db: Database): boolean {
     const vec = require("sqlite-vec") as { getLoadablePath(): string };
     db.loadExtension(vec.getLoadablePath());
     // Confirm by calling vec_version() — guards against partial loads.
-    db.query("SELECT vec_version()").get();
-    return true;
+    const row = db.query<{ v: string }, []>("SELECT vec_version() AS v").get();
+    return typeof row?.v === "string" ? row.v : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * Corpus-generation fingerprint read WITHOUT opening a {@link Store}.
+ *
+ * `Store.open` is async (the write path acquires a lock) and a read open
+ * refuses a schema mismatch, so neither form is usable from a
+ * synchronous caller that only wants to observe the index's identity and
+ * must keep working when there is no index at all. The context pack's
+ * provenance stamp (context-integrity-gates, Unit B) is exactly that
+ * caller. It lives here rather than beside the caller because this
+ * module is the single SQL boundary for the index.
+ *
+ * Returns `null` - "unrecorded", per `integrity/stamp.ts` - when the
+ * index file is absent or cannot be read. That is DISTINCT from a
+ * recorded generation string: a vault that gains or loses its index
+ * drifts from `null` to a value (or back) and the stamp comparison names
+ * it, rather than treating "nothing to compare" as agreement.
+ *
+ * The schema version comes from the file itself, not from
+ * {@link LATEST_SCHEMA_VERSION}: an index still at an older schema is a
+ * different corpus state, and folding it onto the current constant would
+ * hide precisely that.
+ */
+export function readCorpusGenerationSync(dbPath: string): string | null {
+  const peek = peekCorpusGenerationSync(dbPath);
+  return peek.kind === "read" ? peek.value : null;
+}
+
+/**
+ * {@link readCorpusGenerationSync} with the three outcomes kept apart, so
+ * a caller that must not treat a corrupt index as "no index" can tell.
+ */
+export function peekCorpusGenerationSync(dbPath: string): IndexPeek<string | null> {
+  return peekReadonlyIndex(dbPath, (read, db) => {
+    const dimRaw = read(EMBEDDING_DIMENSION_STATE_KEY);
+    const dim = dimRaw === null ? null : Number(dimRaw);
+    const revRaw = read(INDEX_REVISION_STATE_KEY);
+    const rev = revRaw === null ? 0 : Number(revRaw);
+    return computeCorpusGeneration({
+      embeddingModel: read(EMBEDDING_MODEL_STATE_KEY),
+      embeddingDimension: dim !== null && Number.isFinite(dim) ? dim : null,
+      schemaVersion: readSchemaVersion(db),
+      indexRevision: Number.isFinite(rev) && rev >= 0 ? Math.floor(rev) : 0,
+    });
+  });
+}
+
+/**
+ * Embedding-ABI tokens recorded in an index, without opening a
+ * {@link Store}.
+ *
+ * `indexCheck` needs these and cannot get them from its own probe: it
+ * deliberately runs against an IN-MEMORY database and never touches the
+ * real index, so a stored-versus-runtime comparison there has no stored
+ * side unless one is read explicitly.
+ *
+ * `null` means the index is absent or unreadable - not that its ABI
+ * matches.
+ */
+export function readEmbeddingAbiSync(dbPath: string): StampTokens | null {
+  return withReadonlyIndex(dbPath, (read) => recordedEmbeddingAbi(read));
+}
+
+/**
+ * Outcome of a synchronous peek at the index.
+ *
+ * ABSENT and UNREADABLE used to collapse to one `null`, which is wrong
+ * for a stamp: "no index here" and "an index that exists and is corrupt"
+ * are different states of the world, and a caller that records both as
+ * unrecorded makes two such sides compare EQUAL - "two unrecorded sides
+ * are not a finding" - so a corrupt index silently agrees with a missing
+ * one. They are now separate arms and the caller chooses.
+ */
+export type IndexPeek<T> =
+  | { readonly kind: "read"; readonly value: T }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unreadable"; readonly detail: string };
+
+/**
+ * Run `read` against a read-only handle on the index, naming which of
+ * the three outcomes occurred. Shared by the synchronous peeks so the
+ * classification lives in one place rather than once per caller.
+ */
+function peekReadonlyIndex<T>(
+  dbPath: string,
+  read: (state: (key: string) => string | null, db: Database) => T,
+): IndexPeek<T> {
+  if (!existsSync(dbPath)) return { kind: "absent" };
+  let db: Database;
+  try {
+    db = new Database(dbPath, { readonly: true });
+  } catch (e) {
+    return { kind: "unreadable", detail: e instanceof Error ? e.message : String(e) };
+  }
+  try {
+    return {
+      kind: "read",
+      value: read(
+        (key: string): string | null =>
+          db
+            .query<{ value: string }, [string]>("SELECT value FROM index_state WHERE key = ?")
+            .get(key)?.value ?? null,
+        db,
+      ),
+    };
+  } catch (e) {
+    return { kind: "unreadable", detail: e instanceof Error ? e.message : String(e) };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* a close failure cannot change what was already read */
+    }
+  }
+}
+
+/**
+ * {@link peekReadonlyIndex} collapsed to `T | null` for the callers that
+ * genuinely cannot act on the distinction.
+ */
+function withReadonlyIndex<T>(
+  dbPath: string,
+  read: (state: (key: string) => string | null, db: Database) => T,
+): T | null {
+  const peek = peekReadonlyIndex(dbPath, read);
+  return peek.kind === "read" ? peek.value : null;
+}
+
+/** The ABI tokens an index recorded, read through any state accessor. */
+function recordedEmbeddingAbi(state: (key: string) => string | null): StampTokens {
+  return {
+    [EMBEDDING_MODEL_STATE_KEY]: state(EMBEDDING_MODEL_STATE_KEY),
+    [EMBEDDING_DIMENSION_STATE_KEY]: state(EMBEDDING_DIMENSION_STATE_KEY),
+    [EMBEDDING_VEC_VERSION_STATE_KEY]: state(EMBEDDING_VEC_VERSION_STATE_KEY),
+  };
+}
+
+/**
+ * The ABI tokens the CURRENT build and configuration would produce. The
+ * counterpart of {@link recordedEmbeddingAbi}, kept beside it so the two
+ * sides of the comparison can never cover different fields.
+ */
+export function runtimeEmbeddingAbi(
+  config: ResolvedSearchConfig,
+  vecVersion: string | null,
+): StampTokens {
+  return {
+    [EMBEDDING_MODEL_STATE_KEY]: config.semantic.model,
+    [EMBEDDING_DIMENSION_STATE_KEY]:
+      config.semantic.dimension === null ? null : String(config.semantic.dimension),
+    [EMBEDDING_VEC_VERSION_STATE_KEY]: vecVersion,
+  };
+}
+
+/**
+ * The subset of an ABI comparison the index actually CONTRADICTS: it
+ * recorded a token and that token disagrees with this build.
+ *
+ * A mismatch whose recorded side is `null` is an UNRECORDED field - a
+ * store written before that token was stamped. An absent marker cannot
+ * tell an old store from a wrong one, so it is reported on the
+ * diagnostic surfaces and never drives a refusal or a per-read warning.
+ * Both consumers of that distinction (the `fail` verdict's refusal and
+ * the query path's warning) route through here rather than restating
+ * the predicate, so they cannot drift on what counts as contradicted.
+ */
+export function contradictedAbiFields(
+  mismatches: ReadonlyArray<StampMismatch>,
+): ReadonlyArray<StampMismatch> {
+  return mismatches.filter((m) => m.expected !== null);
+}
+
+/**
+ * One operator-facing line for embedding-ABI drift. Shared by the read
+ * open's refusal, the status warning and the `search check`
+ * recommendation, so the three cannot describe the same condition
+ * differently or name different fixes.
+ */
+export function formatEmbeddingAbiDrift(mismatches: ReadonlyArray<StampMismatch>): string {
+  return (
+    `embedding ABI drift between the stored index and this build ` +
+    `(${mismatches.map(formatStampMismatch).join("; ")}); stored vectors are not ` +
+    `comparable to queries embedded now. Run: ${EMBEDDING_ABI_FIX_COMMAND}`
+  );
 }
 
 /** Parse a JSON-encoded drift value; a corrupt cell surfaces as-is. */
@@ -371,19 +653,25 @@ function vecToBuffer(values: ReadonlyArray<number> | Float32Array): Buffer {
 export class Store {
   private db: Database;
   private readonly config: ResolvedSearchConfig;
+  private readonly loadedVecVersion: string | null;
   private readonly _vecLoaded: boolean;
   private readonly release: (() => Promise<void>) | null;
   private closed = false;
+  /** Empty unless a gated read-mode open found ABI drift; see {@link embeddingAbiMismatches}. */
+  private abiDrift: ReadonlyArray<StampMismatch> = Object.freeze([]);
 
   private constructor(
     db: Database,
     config: ResolvedSearchConfig,
-    vecLoaded: boolean,
+    vecVersion: string | null,
     release: (() => Promise<void>) | null,
   ) {
     this.db = db;
     this.config = config;
-    this._vecLoaded = vecLoaded;
+    this.loadedVecVersion = vecVersion;
+    // One source of truth: the version is present exactly when the
+    // extension loaded, so "loaded" is derived rather than tracked twice.
+    this._vecLoaded = vecVersion !== null;
     this.release = release;
   }
 
@@ -435,8 +723,14 @@ export class Store {
             `index schema version ${version} != ${LATEST_SCHEMA_VERSION}. Run: o2b search reindex`,
           );
         }
-        const vecLoaded = loadVec && tryLoadVecExtension(db);
-        return new Store(db, config, vecLoaded, null);
+        const vecVersion = loadVec ? tryLoadVecExtension(db) : null;
+        const store = new Store(db, config, vecVersion, null);
+        // The read path is where the silent-garbage window actually is:
+        // `ensureEmbeddingModel` runs only on a write open, so every MCP
+        // query reached `semanticTopK` - and a `chunk_vec` of unknown
+        // declared width - with nothing having compared anything.
+        store.resolveEmbeddingAbi();
+        return store;
       } catch (e) {
         db.close();
         throw e;
@@ -465,8 +759,8 @@ export class Store {
       applyPragmas(db);
       applyMigrations(db, { ftsTokenize: config.ftsTokenize });
       ensureFts5(db);
-      const vecLoaded = loadVec && tryLoadVecExtension(db);
-      const store = new Store(db, config, vecLoaded, release);
+      const vecVersion = loadVec ? tryLoadVecExtension(db) : null;
+      const store = new Store(db, config, vecVersion, release);
       store.ensureEmbeddingModel(config.semantic.model, config.semantic.dimension, {
         query: config.semantic.queryPrefix ?? "",
         passage: config.semantic.passagePrefix ?? "",
@@ -488,6 +782,63 @@ export class Store {
 
   vecLoaded(): boolean {
     return this._vecLoaded;
+  }
+
+  /** sqlite-vec version this connection loaded, or null when unavailable. */
+  vecVersion(): string | null {
+    return this.loadedVecVersion;
+  }
+
+  /**
+   * Embedding-ABI fields whose recorded token no longer matches this
+   * build (context-integrity-gates, Unit E).
+   *
+   * Empty when the stamps agree, when semantic search is disabled, and -
+   * structurally - whenever `integrity.embedding_abi` is `off`, so a
+   * consumer wired to this accessor cannot report anything while the
+   * operator has the gate off. A mismatch whose recorded side is `null`
+   * is an UNRECORDED field (a store predating the stamp), which is
+   * reported but never refused: an absent marker cannot tell an old
+   * store from a wrong one.
+   */
+  embeddingAbiMismatches(): ReadonlyArray<StampMismatch> {
+    return this.abiDrift;
+  }
+
+  /**
+   * Compare the recorded embedding ABI against this build's, under the
+   * operator's gate. Called on the READ open, which is where nothing
+   * checked before.
+   *
+   * Runs only when semantic search is enabled, because that is the only
+   * configuration that can reach `semanticTopK`; with it disabled the
+   * configured model and dimension are null and every comparison would
+   * be against nothing.
+   *
+   * The pure comparison runs FIRST and short-circuits, so the
+   * overwhelmingly common no-drift open never pays for a config read.
+   * When there is drift, {@link checkStamp} re-runs it under the
+   * resolved mode and remains the single authority on what `off`, `warn`
+   * and `fail` mean.
+   *
+   * It reports and refuses; it never rebuilds. `vec_version()` is not
+   * stable across environments, so two peers on different sqlite-vec
+   * builds each see a mismatch - an automatic rebuild here would loop
+   * across a synced vault, which is why the default is `warn` and why
+   * the remediation is a command the operator runs.
+   */
+  private resolveEmbeddingAbi(): void {
+    if (!this.config.semantic.enabled) return;
+    const recorded = recordedEmbeddingAbi((key) => this.getState(key));
+    const runtime = runtimeEmbeddingAbi(this.config, this.loadedVecVersion);
+    if (compareStamps(recorded, runtime).length === 0) return;
+    const mode = loadIntegrityConfigSafe(this.config.vault).embedding_abi;
+    const check = checkStamp(recorded, runtime, mode);
+    this.abiDrift = check.mismatches;
+    if (check.verdict !== STAMP_VERDICT.fail) return;
+    const drifted = contradictedAbiFields(check.mismatches);
+    if (drifted.length === 0) return;
+    throw new SearchError("EMBEDDING_DIMENSION_MISMATCH", formatEmbeddingAbiDrift(drifted));
   }
 
   schemaVersion(): number {
@@ -549,14 +900,14 @@ export class Store {
 
   /** Monotonic counter bumped on every index mutation; 0 if never set. */
   indexRevision(): number {
-    const raw = this.getState("index_revision");
+    const raw = this.getState(INDEX_REVISION_STATE_KEY);
     const n = raw === null ? 0 : Number(raw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   }
 
   /** Increment the index revision. Called after a mutating index run. */
   bumpIndexRevision(): void {
-    this.setState("index_revision", String(this.indexRevision() + 1));
+    this.setState(INDEX_REVISION_STATE_KEY, String(this.indexRevision() + 1));
   }
 
   /**
@@ -565,10 +916,10 @@ export class Store {
    * embedding change or content reindex invalidates cached results.
    */
   corpusGeneration(): string {
-    const dimRaw = this.getState("embedding_dimension");
+    const dimRaw = this.getState(EMBEDDING_DIMENSION_STATE_KEY);
     const dim = dimRaw === null ? null : Number(dimRaw);
     return computeCorpusGeneration({
-      embeddingModel: this.getState("embedding_model"),
+      embeddingModel: this.getState(EMBEDDING_MODEL_STATE_KEY),
       embeddingDimension: dim !== null && Number.isFinite(dim) ? dim : null,
       schemaVersion: LATEST_SCHEMA_VERSION,
       indexRevision: this.indexRevision(),
@@ -986,8 +1337,8 @@ export class Store {
     dimension: number | null,
     prefixes?: EmbeddingPrefixPair,
   ): ModelChangeOutcome {
-    const prevModel = this.getState("embedding_model");
-    const prevDimRaw = this.getState("embedding_dimension");
+    const prevModel = this.getState(EMBEDDING_MODEL_STATE_KEY);
+    const prevDimRaw = this.getState(EMBEDDING_DIMENSION_STATE_KEY);
     const prevDim = prevDimRaw === null ? null : Number(prevDimRaw);
 
     const modelChanged = prevModel !== null && model !== null && prevModel !== model;
@@ -1018,8 +1369,12 @@ export class Store {
       console.error(
         `embedding model changed from ${prevModel}/${prevDim} to ${model}/${dimension}, embeddings cleared`,
       );
-      this.deleteState("embedding_model");
-      this.deleteState("embedding_dimension");
+      this.deleteState(EMBEDDING_MODEL_STATE_KEY);
+      this.deleteState(EMBEDDING_DIMENSION_STATE_KEY);
+      // The recorded sqlite-vec version described the vectors that were
+      // just cleared, so it must not outlive them: leaving it would
+      // claim an ABI for storage that no longer holds any.
+      this.deleteState(EMBEDDING_VEC_VERSION_STATE_KEY);
     } else if (prefixChanged) {
       // Model/dimension unchanged: the prefix change alone triggers the clear.
       this.clearEmbeddings();
@@ -1030,8 +1385,15 @@ export class Store {
       );
     }
 
-    if (model !== null) this.setState("embedding_model", model);
-    if (dimension !== null) this.setState("embedding_dimension", String(dimension));
+    if (model !== null) this.setState(EMBEDDING_MODEL_STATE_KEY, model);
+    if (dimension !== null) this.setState(EMBEDDING_DIMENSION_STATE_KEY, String(dimension));
+    // Same shape as the model and dimension above: recorded only when
+    // this build actually has a value. With the extension unavailable
+    // there is nothing to record, and writing a placeholder would be a
+    // claim about storage this process never touched.
+    if (this.loadedVecVersion !== null) {
+      this.setState(EMBEDDING_VEC_VERSION_STATE_KEY, this.loadedVecVersion);
+    }
     if (prefixes !== undefined) {
       this.setState(EMBEDDING_PREFIX_QUERY_STATE_KEY, prefixes.query);
       this.setState(EMBEDDING_PREFIX_PASSAGE_STATE_KEY, prefixes.passage);
@@ -1090,6 +1452,38 @@ export class Store {
       "UPDATE links SET target_document_id = (SELECT id FROM documents WHERE documents.path = links.target_path) " +
         "WHERE target_path IS NOT NULL",
     );
+  }
+
+  /**
+   * Vault-wide link-resolution census (context-integrity-gates, unit G).
+   *
+   * `unresolved` counts the link rows that carry a target path and that
+   * {@link RESOLVED_LINK_TARGET_SQL} - the SAME ladder
+   * {@link resolvedDocLinkPairs} follows - cannot resolve to any
+   * document. That is what "broken" means to a reader: a materialized
+   * id, a `<target>.md` exact match, and an unambiguous basename all
+   * count as resolved, and only what survives all three rungs is
+   * reported.
+   *
+   * The narrower `target_document_id IS NULL` predicate is NOT used
+   * here. It also fires on every basename-style `[[note]]`, which the
+   * ladder resolves perfectly well and which an Obsidian-shaped vault
+   * is written in - a count that rises on a healthy edit is a gate that
+   * gets bumped rather than obeyed.
+   *
+   * Index-backed on every rung: `idx_links_target_path` bounds the
+   * scan, `documents.path` is UNIQUE, and the basename rungs
+   * equality-join `idx_documents_basename`.
+   */
+  linkResolutionCounts(): LinkResolutionCounts {
+    const row = this.db
+      .query<{ total: number; unresolved: number | null }, []>(
+        "SELECT count(*) AS total, " +
+          `sum(CASE WHEN ${RESOLVED_LINK_TARGET_SQL} IS NULL THEN 1 ELSE 0 END) AS unresolved ` +
+          "FROM links l WHERE l.target_path IS NOT NULL",
+      )
+      .get();
+    return Object.freeze({ total: row?.total ?? 0, unresolved: row?.unresolved ?? 0 });
   }
 
   // ── doc aliases (v7, link-recall-intelligence) ─────────────────────────────
@@ -1200,22 +1594,11 @@ export class Store {
   resolvedDocLinkPairs(): Array<{ readonly source: number; readonly target: number }> {
     const rows = this.db
       .query<{ source: number; target: number | null }, []>(
-        // Resolution ladder: materialized id, then `<target>.md` exact
-        // (path is UNIQUE + indexed), then an UNAMBIGUOUS nested-basename
-        // match. The basename branch equality-joins idx_documents_basename
-        // and mirrors the old `SUBSTR(path) = '/'||target||'.md'` scan
-        // exactly: a `/`-aligned basename suffix is precisely
-        // `basename = target AND path is nested` (top-level `target.md`
-        // has no leading slash and is owned by the exact branch above).
+        // The ladder itself lives in RESOLVED_LINK_TARGET_SQL, shared
+        // with `linkResolutionCounts` so the edges this yields and the
+        // rows that gate counts as broken are two views of one rule.
         "SELECT DISTINCT l.source_document_id AS source, " +
-          "  COALESCE(" +
-          "    l.target_document_id, " +
-          "    (SELECT d.id FROM documents d WHERE d.path = l.target_path || '.md'), " +
-          "    (SELECT d.id FROM documents d " +
-          "       WHERE d.basename = l.target_path AND instr(d.path, '/') > 0 " +
-          "       AND 1 = (SELECT COUNT(*) FROM documents d2 " +
-          "                WHERE d2.basename = l.target_path AND instr(d2.path, '/') > 0))" +
-          "  ) AS target " +
+          `  ${RESOLVED_LINK_TARGET_SQL} AS target ` +
           "FROM links l WHERE l.target_path IS NOT NULL",
       )
       .all();

@@ -4,6 +4,8 @@
  * Anchored in docs/plans/2026-05-16-brain-search-design.md §12, §14.
  */
 
+import type { DegradationNotice } from "../integrity/degradation.ts";
+import type { StampMismatch } from "../integrity/stamp.ts";
 import type { VaultIgnoreRule } from "../vault-scope/defaults.ts";
 import type { DegreePredicate } from "./property-filter.ts";
 import type {
@@ -274,6 +276,26 @@ export interface IndexStats {
     readonly message: string;
   }>;
   /**
+   * Frontmatter lines this run's scanner could not express as a
+   * `key: value` pair or a block-list item, and therefore dropped
+   * (unit F). The `path` on each notice is vault-relative.
+   *
+   * A separate field rather than an entry in `errors` on purpose:
+   * `errors` means "this file did not index", drives the `N error(s)`
+   * count in the watch summary, and is rendered under an `errors:`
+   * heading by `o2b search index`. A dropped frontmatter line is none
+   * of those - the file indexes fine, it just lost a field. Folding it
+   * into `errors` would change the meaning of an existing field and the
+   * reported error count for vaults that index cleanly today.
+   *
+   * Scoped to the files this run actually read: the mtime/size fastpath
+   * skips unchanged documents, so an unchanged malformed file is
+   * reported by the run that last read it, not by every run. Use
+   * `--force` (or `o2b brain doctor`, which scans the Brain tree
+   * unconditionally) for a full sweep.
+   */
+  readonly frontmatterNotices: ReadonlyArray<DegradationNotice>;
+  /**
    * Typed edges blocked by the schema pack's `link_constraints` during
    * this run's materialization post-pass
    * (write-time-integrity-governance). Empty when no constraints are
@@ -360,6 +382,21 @@ export interface IndexStatusSnapshot {
   readonly embeddingKeyPresent: boolean;
   readonly lastIndexedAt: string | null;
   readonly lastFullIndexAt: string | null;
+  /**
+   * Embedding-ABI fields whose recorded token no longer matches this
+   * build, as the GATED read open found them (context-integrity-gates,
+   * Unit E). Structurally empty whenever `integrity.embedding_abi` is
+   * `off`, which is what distinguishes this from the ungated
+   * {@link IndexCheckReport.embeddingAbi}: `search check` is a
+   * diagnostic the operator explicitly ran and refuses nothing, while
+   * status reports what the serving path actually enforced.
+   *
+   * The same condition also appears in {@link warnings} as one
+   * operator-facing line. This field is the machine-readable side of
+   * it, so an agent does not have to match on message text; both are
+   * emitted only when there is drift.
+   */
+  readonly embeddingAbi: ReadonlyArray<StampMismatch>;
   readonly warnings: ReadonlyArray<string>;
 }
 
@@ -372,6 +409,19 @@ export interface IndexCheckReport {
   readonly embeddingKeyResolved: boolean;
   readonly providerReachable: boolean | null;
   readonly providerReason: string | null;
+  /**
+   * Embedding-ABI fields whose token recorded in the index no longer
+   * matches this build - model, dimension, or sqlite-vec version
+   * (context-integrity-gates, Unit E). Empty when they agree, when
+   * there is no index to read, or when semantic search is disabled;
+   * the CLI emits the field only when non-empty, so a matching store's
+   * output is byte-identical.
+   *
+   * `expected` is what the index recorded and `actual` what this build
+   * would produce; an `expected` of `null` is a store written before the
+   * field was stamped, which is reported and never treated as wrong.
+   */
+  readonly embeddingAbi: ReadonlyArray<StampMismatch>;
   readonly warnings: ReadonlyArray<string>;
   readonly fatal: ReadonlyArray<string>;
   /**
@@ -424,6 +474,14 @@ export interface ExpandHitInput {
   readonly rawLimit?: number;
   /** Opaque pagination cursor returned as `next_cursor` by a prior call. */
   readonly cursor?: string;
+  /**
+   * Owner-scope isolation (context-integrity-gates, Unit A). `chunkId`
+   * is a sequential integer, so an unchecked drill-down enumerates whole
+   * note bodies. Under a scope, another owner's chunk is refused with
+   * the SAME error an absent chunk produces - a distinguishable refusal
+   * would confirm the chunk exists. Omitted / blank filters nothing.
+   */
+  readonly agentScope?: string;
 }
 
 /**

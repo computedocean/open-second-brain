@@ -51,7 +51,13 @@ import {
   loadBrainConfig,
 } from "./policy.ts";
 import { normaliseWikilinkTarget, renderPrefLink, type LinkOutputFormat } from "./wikilink.ts";
-import { parsePreference, parseRetired } from "./preference.ts";
+import { parseRetired } from "./preference.ts";
+import {
+  collectPreferences,
+  PREFERENCE_ID_PREFIX,
+  resolveOwnerScopeDelivery,
+} from "./preferences-collect.ts";
+import { isPreferenceVisible } from "./owner-scoped-facts.ts";
 import type { BrainLogEntry } from "./log.ts";
 import { listLogDates, readLogDay } from "./log-jsonl.ts";
 import {
@@ -93,6 +99,13 @@ export interface RenderDigestOptions {
    * counterparts on the summary instead of defaulting to zero.
    */
   readonly dreamSummary?: import("./dream.ts").DreamRunSummary;
+  /**
+   * Owner scope for delivery isolation (context-integrity-gates, Unit
+   * A). Enforced only when `integrity.owner_scope_delivery` is `fail`;
+   * omitted, or under the default `off`, nothing is filtered and the
+   * output is byte-identical to a vault without the gate.
+   */
+  readonly agentScope?: string;
 }
 
 export interface RenderDigestResult {
@@ -327,7 +340,7 @@ export function renderDigest(vault: string, opts: RenderDigestOptions = {}): Ren
     );
   }
 
-  const data = collectDigestData(vault, since, until);
+  const data = collectDigestData(vault, since, until, opts.agentScope);
   const empty = isEmpty(data);
 
   if (format === "json") {
@@ -419,7 +432,12 @@ interface DigestData {
   readonly actions: ReadonlyArray<ActionItem>;
 }
 
-function collectDigestData(vault: string, since: Date, until: Date): DigestData {
+function collectDigestData(
+  vault: string,
+  since: Date,
+  until: Date,
+  agentScope: string | undefined,
+): DigestData {
   const sinceMs = since.getTime();
   const untilMs = until.getTime();
   const inWindow = (iso: string | null): boolean => {
@@ -431,7 +449,7 @@ function collectDigestData(vault: string, since: Date, until: Date): DigestData 
 
   // 1. Iterate preferences/ for unconfirmed (created_at in window) and
   //    confirmed (confirmed_at in window).
-  const preferences = readAllPreferences(vault);
+  const preferences = readAllPreferences(vault, agentScope);
   const new_unconfirmed: DigestJsonNewUnconfirmed[] = [];
   const confirmed: DigestJsonConfirmed[] = [];
 
@@ -461,7 +479,7 @@ function collectDigestData(vault: string, since: Date, until: Date): DigestData 
 
   // 2. Iterate retired/ for entries retired in window.
   const retiredEntries: DigestJsonRetired[] = [];
-  const retiredAll = readAllRetired(vault);
+  const retiredAll = readAllRetired(vault, agentScope);
   for (const { ret, path } of retiredAll) {
     void path;
     if (inWindow(ret.retired_at)) {
@@ -696,21 +714,21 @@ interface PreferenceWithPath {
   readonly path: string;
 }
 
-function readAllPreferences(vault: string): ReadonlyArray<PreferenceWithPath> {
+function readAllPreferences(
+  vault: string,
+  agentScope: string | undefined,
+): ReadonlyArray<PreferenceWithPath> {
   const dirs = brainDirs(vault);
-  if (!existsSync(dirs.preferences)) return [];
-  const out: PreferenceWithPath[] = [];
-  for (const entry of readdirSync(dirs.preferences, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-    if (!entry.name.startsWith("pref-")) continue;
-    const path = join(dirs.preferences, entry.name);
-    try {
-      out.push({ pref: parsePreference(path), path });
-    } catch {
-      // The doctor reports corruption; digest skips silently.
-    }
-  }
-  return out;
+  // Shared delivery-path walk (context-integrity-gates, Unit A). This
+  // surface's listing is the strictest of the five - regular files only,
+  // and only `pref-*` names - so both rules are passed as options rather
+  // than unified away. The doctor reports corruption; digest skips
+  // silently, which is what the collector's parse already does.
+  return collectPreferences(dirs.preferences, {
+    namePrefix: PREFERENCE_ID_PREFIX,
+    regularFilesOnly: true,
+    ownerScope: resolveOwnerScopeDelivery(vault, agentScope),
+  }).entries.map(({ pref, path }) => ({ pref, path }));
 }
 
 interface RetiredWithPath {
@@ -718,16 +736,28 @@ interface RetiredWithPath {
   readonly path: string;
 }
 
-function readAllRetired(vault: string): ReadonlyArray<RetiredWithPath> {
+/**
+ * Retirement KEEPS ownership (context-integrity-gates, A7): a retired
+ * memory is withdrawn from the active set, never published to every
+ * agent. Same gate resolution as {@link readAllPreferences}, so an
+ * unscoped digest is byte-identical.
+ */
+function readAllRetired(
+  vault: string,
+  agentScope: string | undefined,
+): ReadonlyArray<RetiredWithPath> {
   const dirs = brainDirs(vault);
   if (!existsSync(dirs.retired)) return [];
+  const scope = resolveOwnerScopeDelivery(vault, agentScope).enforcedScope;
   const out: RetiredWithPath[] = [];
   for (const entry of readdirSync(dirs.retired, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
     if (!entry.name.startsWith("ret-")) continue;
     const path = join(dirs.retired, entry.name);
     try {
-      out.push({ ret: parseRetired(path), path });
+      const ret = parseRetired(path);
+      if (scope !== null && !isPreferenceVisible(ret, scope)) continue;
+      out.push({ ret, path });
     } catch {
       // ditto
     }

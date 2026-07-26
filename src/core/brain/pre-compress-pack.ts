@@ -15,11 +15,11 @@
  * the only ordering inputs are confidence, creation time, and id.
  */
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 
+import { renderActive } from "./active.ts";
 import { brainActivePath, brainDirs } from "./paths.ts";
-import { parsePreference } from "./preference.ts";
+import { collectPreferences, resolveOwnerScopeDelivery } from "./preferences-collect.ts";
 import { applyCharBudget, type CharBudgetDegradationMode } from "./recall-budget.ts";
 import { emitContextReceipt, type ContextReceiptOptions } from "./context-receipts.ts";
 import { emitGatedTelemetry } from "./continuity/emit.ts";
@@ -72,6 +72,13 @@ export interface PreCompressOptions {
   readonly receipt?: ContextReceiptOptions;
   /** Opt-in telemetry for recall coverage and gap diagnostics. */
   readonly telemetry?: RecallTelemetryOptions;
+  /**
+   * Owner scope for delivery isolation (context-integrity-gates, Unit
+   * A). Enforced only when `integrity.owner_scope_delivery` is `fail`;
+   * omitted, or under the default `off`, nothing is filtered and the
+   * output is byte-identical to a vault without the gate.
+   */
+  readonly agentScope?: string;
 }
 
 interface ConfirmedPref {
@@ -81,18 +88,15 @@ interface ConfirmedPref {
   readonly createdAt: string;
 }
 
-function collectConfirmed(vault: string): ConfirmedPref[] {
+function collectConfirmed(vault: string, agentScope: string | undefined): ConfirmedPref[] {
   const dir = brainDirs(vault).preferences;
-  if (!existsSync(dir)) return [];
   const out: ConfirmedPref[] = [];
-  for (const name of readdirSync(dir)) {
-    if (!name.endsWith(".md")) continue;
-    let pref;
-    try {
-      pref = parsePreference(join(dir, name));
-    } catch {
-      continue;
-    }
+  // Listing and parse come from the shared delivery-path walk
+  // (context-integrity-gates, Unit A); the confirmed-status filter is
+  // this surface's own and stays here.
+  for (const { pref } of collectPreferences(dir, {
+    ownerScope: resolveOwnerScopeDelivery(vault, agentScope),
+  }).entries) {
     if (pref.status !== BRAIN_PREFERENCE_STATUS.confirmed) continue;
     out.push({
       id: pref.id,
@@ -104,7 +108,25 @@ function collectConfirmed(vault: string): ConfirmedPref[] {
   return out;
 }
 
-function readActiveHead(vault: string): string | null {
+/**
+ * The active-digest head this caller may see.
+ *
+ * `active.md` is ONE file shared by every agent, so under an enforcing
+ * owner-scope gate the file's own bytes are the wrong answer: they carry
+ * every owner's memories. The scoped caller gets an in-memory
+ * {@link renderActive} instead, which is where the ownership predicate
+ * already attaches. Narrowing the FILE to make this read correct is what
+ * `brain_context` used to do, and it made a shared write follow a
+ * per-request filter (context-integrity-gates, A3).
+ *
+ * With no enforced scope - the shipped `off` default - the file is read
+ * verbatim exactly as before, stamp and all.
+ */
+function readActiveHead(vault: string, enforcedScope: string | null): string | null {
+  if (enforcedScope !== null) {
+    const text = renderActive(vault, { agentScope: enforcedScope }).document.trim();
+    return text.length > 0 ? text : null;
+  }
   const path = brainActivePath(vault);
   if (!existsSync(path)) return null;
   try {
@@ -122,14 +144,17 @@ function readActiveHead(vault: string): string | null {
  */
 export function buildPreCompressPack(vault: string, opts: PreCompressOptions): PreCompressPack {
   const startedAtMs = Date.now();
-  const ranked = collectConfirmed(vault).toSorted((a, b) => {
+  const ranked = collectConfirmed(vault, opts.agentScope).toSorted((a, b) => {
     if (b.confidence !== a.confidence) return b.confidence - a.confidence;
     if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
   const top = ranked.slice(0, Math.max(0, opts.topK));
 
-  const activeHead = readActiveHead(vault);
+  const activeHead = readActiveHead(
+    vault,
+    resolveOwnerScopeDelivery(vault, opts.agentScope).enforcedScope,
+  );
   const safetyById = new Map<string, ContextSafetyReport>();
   const entries: Array<{ item: string; text: string }> = [];
   if (activeHead !== null) {

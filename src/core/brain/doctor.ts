@@ -41,7 +41,13 @@ import { join, relative } from "node:path";
 
 import { realpathInsideVault, vaultRelative } from "../path-safety.ts";
 import { REMOVED_TOOLS } from "../removed-surfaces.ts";
-import { extractWikilinks, listVaultBasenames, parseFrontmatter } from "../vault.ts";
+import type { DegradationNotice } from "../integrity/degradation.ts";
+import {
+  extractWikilinks,
+  listVaultBasenames,
+  listVaultPages,
+  parseFrontmatter,
+} from "../vault.ts";
 import { computeActiveBudgetPressure } from "./active-budget-pressure.ts";
 import { resolveVaultScope } from "../vault-scope/index.ts";
 import { buildBacklinkIndex } from "./backlinks.ts";
@@ -52,6 +58,7 @@ import {
 } from "./entities/semantic-dedup.ts";
 import { findMalformedEntityLabels } from "./entities/label-hygiene.ts";
 import { buildCaptureBoundary } from "./capture-boundary.ts";
+import { verifyLineageLedger } from "./lineage/verify.ts";
 import { verifyContentHash } from "./content-hash.ts";
 import { readTierDriftCount } from "./frontmatter-tiers.ts";
 import { scanDanglingWorkruns } from "./dream-workrun.ts";
@@ -96,6 +103,8 @@ import {
   type ResolvedBrainHealthConfig,
   type TrustVerdict,
 } from "./types.ts";
+import { scanStaleLocks } from "./sync-lockfile.ts";
+import { vaultMarkerAbsentNotice } from "./vault-identity.ts";
 import { normaliseWikilinkTarget, parseArtifactRef } from "./wikilink.ts";
 
 // ----- Public types ---------------------------------------------------------
@@ -203,21 +212,44 @@ export interface RunDoctorResult {
 
 // ----- Entry point ----------------------------------------------------------
 
+/** Issue code for a resolved root that carries no Brain layer. */
+const BRAIN_ROOT_ABSENT_CODE = "brain-root-absent";
+
 export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctorResult {
   const issues: DoctorIssue[] = [];
 
   const dirs = brainDirs(vault);
   if (!existsSync(dirs.brain)) {
-    // No Brain layer present is not an error here — `o2b brain init`
-    // is the right command, but a vault without Brain is allowed in
-    // v0.9. Return clean. v0.10.16: emit the new trust-layer fields
-    // with their clean / empty defaults for shape symmetry with the
-    // normal-return path.
+    // A root with no Brain layer is NOT clean (context-integrity-gates,
+    // Unit J). It is exactly the shape a mis-resolved vault takes, and
+    // reporting it as clean is what let a wrong root pass the one
+    // command an operator runs to check the store. It is still not an
+    // error - an un-initialized vault is legitimate - so it is reported
+    // as a named warning plus an `uncertain` entry: every check below
+    // was skipped, so nothing about this root has actually been
+    // verified.
+    const message =
+      `no Brain layer at ${dirs.brain}; run \`o2b brain init\` if this is the ` +
+      "intended vault, otherwise the resolved vault root is wrong";
     return Object.freeze({
-      warnings: Object.freeze([]),
+      warnings: Object.freeze([
+        {
+          severity: "warning",
+          code: BRAIN_ROOT_ABSENT_CODE,
+          path: dirs.brain,
+          message,
+        } satisfies DoctorIssue,
+      ]),
       errors: Object.freeze([]),
-      trust_verdict: "clean" as TrustVerdict,
+      trust_verdict: "watch" as TrustVerdict,
       instruction_file_warnings: Object.freeze([]),
+      uncertain: Object.freeze([
+        {
+          code: BRAIN_ROOT_ABSENT_CODE,
+          path: dirs.brain,
+          message: "every Brain check was skipped: the layer is absent",
+        },
+      ]),
     });
   }
 
@@ -410,6 +442,54 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
     /* doctor never throws */
   }
 
+  // Unit F: frontmatter lines the scanner dropped anywhere under
+  // Brain/. Reported as UNCERTAINTY, not as a warning or an error: the
+  // note is still on disk and still indexes, but the doctor cannot
+  // claim it verified every field it declared, because a field it
+  // could not read is indistinguishable from a field that is absent.
+  // (That ambiguity is exactly what produced the spurious
+  // `missing field: tags` errors fixed in 426d06f8.)
+  const uncertain: DoctorUncertainEntry[] = [];
+  try {
+    collectFrontmatterUncertainty(vault, uncertain);
+  } catch {
+    /* doctor never throws */
+  }
+
+  // Unit D: session-lineage ledger integrity - a line edited after it
+  // was written, a line removed from the middle, or an observation the
+  // writer could not append. Uncertainty rather than an error for the
+  // same reason as above: continuity still resolves from this ledger,
+  // but the doctor cannot claim the history it read is the history that
+  // was written.
+  try {
+    collectLineageLedgerUncertainty(vault, uncertain);
+  } catch {
+    /* doctor never throws */
+  }
+
+  // Unit J: a resolved root with no identity marker. An absent marker
+  // cannot tell an old vault from a wrong one, so it is uncertainty
+  // rather than a warning - but it is the exact shape a mis-resolved
+  // root takes, and the doctor reporting such a root clean is what let
+  // one pass the single command an operator runs to check the store.
+  try {
+    collectVaultMarkerUncertainty(vault, uncertain);
+  } catch {
+    /* doctor never throws */
+  }
+
+  // Lock files left behind by a crashed writer. `scanStaleLocks` has
+  // documented itself as "the brain doctor surfaces these" since it was
+  // written and had no caller: a SIGKILLed process leaves a `.lock` that
+  // no breaker may safely remove, so the ONLY recovery is an operator
+  // deleting it, and the only way that happens is if something names it.
+  try {
+    collectStaleLockUncertainty(vault, uncertain);
+  } catch {
+    /* doctor never throws */
+  }
+
   // v0.14.0 semantic-health pass. Best-effort like every other lint:
   // a failure here must not poison the structural warning / error
   // stream. The report is attached to the result even on a clean run
@@ -468,8 +548,105 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
     trust_verdict: trustVerdict,
     ...(verificationCounts !== undefined ? { verification_delta_summary: verificationCounts } : {}),
     instruction_file_warnings: instructionWarnings,
+    // Conditional so a clean vault's result - and therefore the CLI's
+    // `--json` payload - is byte-identical to the shape it had before
+    // this field had a producer.
+    ...(uncertain.length > 0 ? { uncertain: Object.freeze(uncertain) } : {}),
     ...(semanticReport !== undefined ? { semantic_health: semanticReport } : {}),
   });
+}
+
+/** Site recorded on the notices the doctor's Brain-tree sweep collects. */
+const DOCTOR_FRONTMATTER_SITE = "brain.doctor";
+
+/**
+ * Sweep every Markdown file under `Brain/` for frontmatter the line
+ * scanner could not express, and fold each notice into the doctor's
+ * `uncertain` stream.
+ *
+ * One walk, through the same shared helper every other converted site
+ * uses ({@link listVaultPages} with its opt-in notice sink), so there is
+ * no second definition of "what counts as a dropped line".
+ *
+ * Unlike an index run - which reads only the files whose mtime or size
+ * moved - this sweep is unconditional, which is what makes the doctor
+ * the complete view of the condition.
+ */
+function collectFrontmatterUncertainty(vault: string, out: DoctorUncertainEntry[]): void {
+  const dirs = brainDirs(vault);
+  if (!existsSync(dirs.brain)) return;
+  const notices: DegradationNotice[] = [];
+  listVaultPages(dirs.brain, { notices, site: DOCTOR_FRONTMATTER_SITE });
+  for (const notice of notices) {
+    out.push({
+      code: notice.code,
+      ...(notice.path !== undefined ? { path: notice.path } : {}),
+      message: notice.detail,
+    });
+  }
+}
+
+/**
+ * Fold every session-lineage ledger finding into the doctor's
+ * `uncertain` stream. The verifier is read-only and never throws, so
+ * this needs no guard of its own beyond the doctor's blanket one.
+ */
+function collectLineageLedgerUncertainty(vault: string, out: DoctorUncertainEntry[]): void {
+  const report = verifyLineageLedger(vault);
+  for (const notice of report.notices) {
+    out.push({
+      code: notice.code,
+      path: notice.path ?? report.path,
+      message: notice.detail,
+    });
+  }
+}
+
+/**
+ * Report a resolved root that carries no vault identity marker.
+ *
+ * The producer is pure, throws nothing, and treats a corrupt marker as
+ * absent - the same collapse `readVaultIdentity` performs, because a
+ * truncated sync must not be reported as a wrong vault.
+ */
+function collectVaultMarkerUncertainty(vault: string, out: DoctorUncertainEntry[]): void {
+  const notice = vaultMarkerAbsentNotice(vault);
+  if (notice === null) return;
+  out.push({
+    code: notice.code,
+    ...(notice.path !== undefined ? { path: notice.path } : {}),
+    message: notice.detail,
+  });
+}
+
+/** Code for a `.lock` file the doctor found under the Brain tree. */
+const STALE_LOCK_CODE = "stale-lock";
+
+/**
+ * Report every `.lock` file under `Brain/`.
+ *
+ * Deliberately NOT age-filtered and deliberately not removed. The lock
+ * primitive is a single-attempt exclusive create with no breaker, by
+ * design: no timeout can distinguish a crashed writer from a slow live
+ * one, and killing a live writer's lock corrupts what it protects. So
+ * this reports the condition and leaves the judgment to the operator -
+ * which is the whole reason a lock a crash left behind must be nameable
+ * at all. A lock held by a healthy concurrent writer shows up here too,
+ * and is uncertainty rather than a warning for exactly that reason.
+ */
+function collectStaleLockUncertainty(vault: string, out: DoctorUncertainEntry[]): void {
+  const dirs = brainDirs(vault);
+  if (!existsSync(dirs.brain)) return;
+  for (const lockPath of scanStaleLocks(dirs.brain)) {
+    out.push({
+      code: STALE_LOCK_CODE,
+      path: lockPath,
+      message:
+        "a writer lock is present; while it is held every write it guards is refused. " +
+        "If no process owns it (a crash leaves one behind) remove the file by hand - " +
+        "nothing breaks it automatically, because a live writer cannot be told from a dead one",
+    });
+  }
 }
 
 // ----- Semantic health (v0.14.0) --------------------------------------------

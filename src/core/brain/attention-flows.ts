@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { parseFrontmatter, writeFrontmatterAtomic } from "../vault.ts";
 import { attentionFlowsDir, brainDirs } from "./paths.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { listProceduralMemory } from "./procedural-memory.ts";
 import { listPendingSkillProposals } from "./skill-proposals.ts";
 import { listRecurrenceEntries } from "./recurrence.ts";
@@ -41,6 +42,8 @@ export interface AttentionFlowEvaluation {
 }
 
 export function ensureDefaultAttentionFlows(vault: string): void {
+  // Vault-identity write guard (context-integrity-gates, Unit J).
+  assertVaultIdentityForWrite(vault);
   const dir = attentionFlowsDir(vault);
   mkdirSync(dir, { recursive: true });
   const defaultPath = join(dir, "open-loops.md");
@@ -78,20 +81,23 @@ export function listAttentionFlows(vault: string): ReadonlyArray<AttentionFlowRe
   for (const name of readdirSync(dir).toSorted()) {
     if (!name.endsWith(".md")) continue;
     const path = join(dir, name);
-    try {
-      const [fm] = parseFrontmatter(path);
-      if (fm["kind"] !== "brain-attention-flow") continue;
-      const actions = normalizeActions(fm["actions"]);
-      out.push({
-        id: typeof fm["id"] === "string" ? fm["id"] : name.replace(/\.md$/, ""),
-        title: typeof fm["title"] === "string" ? fm["title"] : name.replace(/\.md$/, ""),
-        actions,
-        standingQueryScopes: normalizeStandingQueryScopes(fm["standing_queries"]),
-        sourcePath: path,
-      });
-    } catch {
-      continue;
-    }
+    // Unit F: unreachable `catch { continue }` removed - nothing in this
+    // body throws (`parseFrontmatter` reads inside its own try, and both
+    // normalizers are total over `unknown`). A recipe whose frontmatter
+    // could not be read yields an empty map, fails the `kind` check on
+    // the next line, and is skipped exactly as the dead branch intended.
+    // See the "Why most readers keep the two-tuple form" section in
+    // src/core/vault.ts for where the condition IS reported.
+    const [fm] = parseFrontmatter(path);
+    if (fm["kind"] !== "brain-attention-flow") continue;
+    const actions = normalizeActions(fm["actions"]);
+    out.push({
+      id: typeof fm["id"] === "string" ? fm["id"] : name.replace(/\.md$/, ""),
+      title: typeof fm["title"] === "string" ? fm["title"] : name.replace(/\.md$/, ""),
+      actions,
+      standingQueryScopes: normalizeStandingQueryScopes(fm["standing_queries"]),
+      sourcePath: path,
+    });
   }
   return Object.freeze(out);
 }

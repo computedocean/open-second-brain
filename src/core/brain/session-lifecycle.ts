@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 
 import { appendAuditRecord } from "../reliability/audit.ts";
 import { appendLogEvent } from "./log.ts";
-import { brainDirs } from "./paths.ts";
+import { brainDirsForWrite } from "./paths.ts";
 import { buildCaptureBoundary, type SessionCaptureDecision } from "./capture-boundary.ts";
 import { extractFacts, routeExtractedFacts } from "./fact-extract.ts";
 import { buildDedupIndex, computeDedupHash, type DedupIndexEntry } from "./dedup-hash.ts";
@@ -18,8 +18,14 @@ import { resolveSessionHandoff } from "../config.ts";
 import { writeHandoffNote, type HandoffNoteResult } from "./handoff.ts";
 import { detectAdapter } from "./sessions/registry.ts";
 import type { SessionTurn } from "./sessions/types.ts";
-import { readLineageLedger, recordLineageObservation } from "./lineage/ledger.ts";
-import { resolveSessionLineage } from "./lineage/resolve.ts";
+import {
+  lineageGapSessionIds,
+  readLineageLedger,
+  recordLineageObservation,
+} from "./lineage/ledger.ts";
+import { resolveSessionLineageDetailed } from "./lineage/resolve.ts";
+import { readGitWorkspaceIdentity } from "./git/reader.ts";
+import { type DegradationNotice, formatDegradationNotice } from "../integrity/degradation.ts";
 import { isCompressionEvidenceEvent, type SessionLineage } from "./lineage/types.ts";
 import { refreshAnticipatoryCache } from "./anticipatory-cache.ts";
 
@@ -126,9 +132,25 @@ export async function captureSessionLifecycleEvent(
   // Read-only resolution runs for every session; the ledger only
   // grows for captured, non-dry runs. Fail-soft throughout.
   let lineage: SessionLineage | undefined;
+  /** Continuations that were available and REFUSED. */
+  const lineageNotices: DegradationNotice[] = [];
+  /**
+   * Observations that were made and NOT APPENDED. Kept apart from the
+   * abstentions above because they are opposite findings: one says the
+   * resolver declined to link, the other says the history the resolver
+   * will read next time is missing a line.
+   */
+  const lineageDrops: DegradationNotice[] = [];
   if (normalized.sessionId !== undefined) {
     try {
-      lineage = resolveSessionLineage(
+      // Unit C: probe the working state ONCE per lifecycle event, at
+      // the capture boundary, so the resolver below stays a pure
+      // function of its inputs. Two bounded git invocations; a
+      // directory outside any repository attests nothing and costs one
+      // failed spawn.
+      const workspace =
+        normalized.cwd !== undefined ? readGitWorkspaceIdentity(normalized.cwd) : null;
+      const resolution = resolveSessionLineageDetailed(
         {
           sessionId: normalized.sessionId,
           ...(normalized.parentSessionId !== undefined
@@ -141,11 +163,28 @@ export async function captureSessionLifecycleEvent(
             ? { compressionDepth: normalized.compressionDepth }
             : {}),
           ...(normalized.cwd !== undefined ? { cwd: normalized.cwd } : {}),
+          ...(workspace !== null ? { workspace } : {}),
         },
-        { ledger: readLineageLedger(vault), nowMs: now.getTime() },
+        {
+          ledger: readLineageLedger(vault),
+          // Unit C / block C: a session whose observation the writer
+          // lock refused has history the ledger cannot show. Without
+          // this the crutch reads it as brand new and stitches it onto
+          // an unrelated parallel session in the same directory.
+          gapSessionIds: lineageGapSessionIds(vault),
+          nowMs: now.getTime(),
+          notices: lineageNotices,
+        },
       );
+      lineage = resolution.lineage;
       if (mayWrite && !opts.dryRun) {
-        recordLineageObservation(vault, {
+        // The return value carries a NAMED gap when the observation was
+        // not appended. Discarding it - which this call site did, as a
+        // bare statement - restored the silent failure the widened
+        // return type exists to remove: the same audit record that
+        // reports a refused continuation can report a lost observation,
+        // and the two are the same class of finding.
+        const recorded = recordLineageObservation(vault, {
           sessionId: normalized.sessionId,
           at: now.toISOString(),
           ...(normalized.cwd !== undefined ? { cwd: normalized.cwd } : {}),
@@ -154,7 +193,9 @@ export async function captureSessionLifecycleEvent(
             ? { compressionEvidence: true }
             : {}),
           ...(lineage.source !== "flat" ? { lineage } : {}),
+          ...(workspace !== null ? { workspace } : {}),
         });
+        if (recorded.notice !== undefined) lineageDrops.push(recorded.notice);
       }
     } catch {
       lineage = undefined; // lineage is an enhancement, never a blocker
@@ -304,7 +345,7 @@ export async function captureSessionLifecycleEvent(
     logPath = appendLifecycleLog(vault, normalized, opts.agent, now, counters);
   }
 
-  const auditPath = appendAuditRecord(join(brainDirs(vault).log, "session-lifecycle"), {
+  const auditPath = appendAuditRecord(join(brainDirsForWrite(vault).log, "session-lifecycle"), {
     timestamp: now.toISOString(),
     actor: opts.agent,
     action: "session_lifecycle_capture",
@@ -324,6 +365,18 @@ export async function captureSessionLifecycleEvent(
             lineage_depth: chainLineage.depth,
             lineage_source: chainLineage.source,
           }
+        : {}),
+      // Unit C: a continuation that was AVAILABLE and refused. Absent
+      // on the ordinary flat path, so a session with nothing to link to
+      // keeps its previous audit shape exactly.
+      ...(lineageNotices.length > 0
+        ? { lineage_abstained: lineageNotices.map(formatDegradationNotice) }
+        : {}),
+      // Block C: the observation this event tried to record and could
+      // not. Absent on every successful append, so the ordinary audit
+      // shape is unchanged.
+      ...(lineageDrops.length > 0
+        ? { lineage_dropped: lineageDrops.map(formatDegradationNotice) }
         : {}),
       ...counters,
     },

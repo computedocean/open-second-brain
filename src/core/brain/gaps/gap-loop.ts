@@ -23,6 +23,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { brainGapTasksDir, BRAIN_GAP_TASKS_REL } from "../paths.ts";
+import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { summarizeRecallTelemetry } from "../recall-telemetry.ts";
 import { renderActivityTimeline, type ActivityItem } from "../render/activity-line.ts";
 import type { RecallRetriever } from "../recall-inject.ts";
@@ -94,6 +95,8 @@ export function promoteGapsToTasks(
   vault: string,
   opts: { threshold?: number; now: Date },
 ): GapPromotionResult {
+  // Vault-identity write guard (context-integrity-gates, Unit J).
+  assertVaultIdentityForWrite(vault);
   const dir = brainGapTasksDir(vault);
   const created: string[] = [];
   const skipped: string[] = [];
@@ -213,6 +216,10 @@ export async function autoCloseRecalledGaps(
   retriever: RecallRetriever,
   opts: { confidenceFloor?: number; now: Date },
 ): Promise<GapAutoCloseResult> {
+  // Vault-identity write guard (context-integrity-gates, Unit J), like
+  // its sibling `promoteGapsToTasks`: closing a task rewrites the note's
+  // frontmatter, so it is a write path, not a read.
+  assertVaultIdentityForWrite(vault);
   const floor = opts.confidenceFloor ?? GAP_LOOP_AUTO_CLOSE_FLOOR;
   const closed: string[] = [];
   const kept: string[] = [];

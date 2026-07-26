@@ -46,7 +46,9 @@ import {
   validateSchemaToken,
   type BrainSchemaVocabulary,
 } from "./schema-vocab.ts";
-import { brainDirs, preferencePath, retiredPath, validateSlug } from "./paths.ts";
+import { brainDirsForWrite, preferencePath, retiredPath, validateSlug } from "./paths.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
+import { OWNER_UNRESOLVED } from "../graph/agent-scope.ts";
 import { asProvenanceLevel, type ProvenanceLevel } from "./provenance/provenance.ts";
 import { sanitisePrinciple } from "./text/sanitize-principle.ts";
 import {
@@ -311,6 +313,11 @@ export function writePreference(
   input: WritePreferenceInput,
   options: WritePreferenceOptions = {},
 ): WritePreferenceResult {
+  // Vault-identity guard (context-integrity-gates, Unit J). This writer
+  // reaches the tree through `preferencePath`, not `brainDirs`, so
+  // `brainDirsForWrite` cannot cover it - the assertion has to sit at
+  // the entry point, ahead of the field validation and every write.
+  assertVaultIdentityForWrite(vault);
   if (!input.slug?.trim()) throw new Error("preference missing field: slug");
   if (!input.topic?.trim()) throw new Error("preference missing field: topic");
   if (!input.principle?.trim()) {
@@ -799,9 +806,7 @@ export function parsePreference(
     ...(optionalScalarString(meta, "scope") !== undefined
       ? { scope: optionalScalarString(meta, "scope") }
       : {}),
-    ...(optionalScalarString(meta, "owner") !== undefined
-      ? { owner: optionalScalarString(meta, "owner") }
-      : {}),
+    ...(optionalOwnerField(meta) !== undefined ? { owner: optionalOwnerField(meta) } : {}),
     ...(provenance !== null ? { provenance } : {}),
     ...(optionalScalarString(meta, "freshness_trend") !== undefined
       ? { freshness_trend: optionalScalarString(meta, "freshness_trend") }
@@ -985,6 +990,8 @@ export function parseRetired(path: string, options: ParsePreferenceOptions = {})
     ...(optionalScalarString(meta, "scope") !== undefined
       ? { scope: optionalScalarString(meta, "scope") }
       : {}),
+    // Retirement KEEPS ownership - see `BrainRetired.owner`.
+    ...(optionalOwnerField(meta) !== undefined ? { owner: optionalOwnerField(meta) } : {}),
     ...(optionalScalarString(meta, "superseded_by") !== undefined
       ? { superseded_by: optionalScalarString(meta, "superseded_by") }
       : {}),
@@ -1034,7 +1041,7 @@ export function moveToRetired(
   // canonical `preferences/` folder. Doing this check *before* any I/O
   // means a buggy caller cannot trick us into deleting an unrelated
   // file: a misrouted call fails fast with no destructive side effect.
-  const dirs = brainDirs(vault);
+  const dirs = brainDirsForWrite(vault);
   if (dirname(prefPath) !== dirs.preferences) {
     throw new Error(`moveToRetired: source path was not under preferences/: ${prefPath}`);
   }
@@ -1364,6 +1371,26 @@ function optionalNumber(meta: Record<string, unknown>, field: string, fallback: 
     return n;
   }
   throw new Error(`preference field '${field}' must be a number`);
+}
+
+/**
+ * Read the `owner:` frontmatter field (context-integrity-gates, Unit A).
+ *
+ * Distinct from {@link optionalScalarString} because a present-but-
+ * non-string value must NOT read as absent here: Obsidian Properties
+ * writes any list-shaped field as a YAML sequence, and `owner:` parsed as
+ * an array would otherwise make an owner-private memory ownerless — that
+ * is, shared with every agent. Such a claim resolves to
+ * {@link OWNER_UNRESOLVED}, which no requested scope can equal, so the
+ * memory reads as somebody else's. A usable string is stored VERBATIM,
+ * exactly as before; normalization for comparison stays in
+ * `preferenceOwner`.
+ */
+function optionalOwnerField(meta: Record<string, unknown>): string | undefined {
+  const raw = meta["owner"];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") return OWNER_UNRESOLVED;
+  return raw.trim() === "" ? undefined : raw;
 }
 
 function optionalScalarString(meta: Record<string, unknown>, field: string): string | undefined {

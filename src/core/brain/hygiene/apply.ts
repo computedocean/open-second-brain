@@ -21,9 +21,10 @@ import { join } from "node:path";
 
 import { appendAuditRecord } from "../../reliability/audit.ts";
 import { mergePreferences } from "../merge.ts";
-import { brainDirs } from "../paths.ts";
+import { brainDirsForWrite } from "../paths.ts";
 import { archivePage, executeRecompile, planRecompile } from "../recompile.ts";
 import { appendClaimEvent } from "../truth/store.ts";
+import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import type { HygienePlan } from "./plan.ts";
 import type { HygieneFinding } from "./types.ts";
 
@@ -148,6 +149,12 @@ export async function applyHygienePlan(
     });
   }
 
+  // Vault-identity write guard (context-integrity-gates, Unit J), after
+  // the dry-run early return and before the first executor. The per-
+  // finding loop is fail-soft, so an assertion reached only from inside
+  // an executor would be filed as a finding error instead of refusing.
+  assertVaultIdentityForWrite(vault);
+
   const applied: HygieneAppliedAction[] = [];
   const errors: { finding_id: string; message: string }[] = [];
   for (const finding of plan.selected) {
@@ -162,7 +169,7 @@ export async function applyHygienePlan(
   }
 
   if (applied.length > 0 || errors.length > 0) {
-    appendAuditRecord(join(brainDirs(vault).log, "hygiene"), {
+    appendAuditRecord(join(brainDirsForWrite(vault).log, "hygiene"), {
       timestamp: opts.now.toISOString(),
       actor: opts.agent,
       action: "hygiene_apply",

@@ -42,15 +42,24 @@ import { extractFrontmatterRelations } from "../graph/frontmatter-relations.ts";
 import { loadSchemaPack, type SchemaPack } from "../brain/schema-pack.ts";
 import { tieredFieldsForKind } from "../brain/frontmatter-tiers.ts";
 import { normalizeSchemaToken } from "../brain/schema-vocab.ts";
-import { parseFrontmatterText } from "../vault.ts";
+import type { DegradationNotice } from "../integrity/degradation.ts";
+import { parseFrontmatterTextWithNotices } from "../vault.ts";
 import { appendMetric } from "../brain/metrics.ts";
 import { throwIfAborted } from "../brain/safeguard.ts";
 import { extractEntities } from "./entities.ts";
+import { compareStamps, formatStampMismatch, type StampMismatch } from "../integrity/stamp.ts";
+
 import {
   acquireWriterLock,
+  EMBEDDING_ABI_FIX_COMMAND,
+  formatEmbeddingAbiDrift,
+  readEmbeddingAbiSync,
+  runtimeEmbeddingAbi,
   Store,
   EMBEDDING_PREFIX_QUERY_STATE_KEY,
   EMBEDDING_PREFIX_PASSAGE_STATE_KEY,
+  LAST_FULL_INDEX_AT_STATE_KEY,
+  LAST_INDEXED_AT_STATE_KEY,
 } from "./store.ts";
 import { LATEST_SCHEMA_VERSION } from "./schema.ts";
 import { SearchError } from "./types.ts";
@@ -94,6 +103,9 @@ export interface IndexVaultOptions {
   readonly signal?: AbortSignal;
 }
 
+/** Site recorded on the frontmatter notices an index run collects. */
+const INDEX_FRONTMATTER_SITE = "search.indexVault";
+
 interface MutableStats {
   added: number;
   updated: number;
@@ -103,6 +115,7 @@ interface MutableStats {
   embeddingsComputed: number;
   embeddingsRetries: number;
   errors: Array<{ readonly path: string; readonly message: string }>;
+  frontmatterNotices: DegradationNotice[];
   relationViolations: IndexStats["relationViolations"];
   tierDrift: IndexStats["tierDrift"];
   aliasResolved: number;
@@ -120,6 +133,7 @@ function newStats(): MutableStats {
     embeddingsComputed: 0,
     embeddingsRetries: 0,
     errors: [],
+    frontmatterNotices: [],
     relationViolations: [],
     tierDrift: [],
     aliasResolved: 0,
@@ -140,6 +154,7 @@ function freezeStats(s: MutableStats, durationMs: number): IndexStats {
     embeddingsComputed: s.embeddingsComputed,
     embeddingsRetries: s.embeddingsRetries,
     errors: Object.freeze([...s.errors]),
+    frontmatterNotices: Object.freeze([...s.frontmatterNotices]),
     relationViolations: Object.freeze([...s.relationViolations]),
     tierDrift: Object.freeze([...s.tierDrift]),
     aliasResolved: s.aliasResolved,
@@ -320,7 +335,15 @@ async function indexInto(
         // The document's declared frontmatter `type` is persisted so
         // the link-constraint post-pass can join endpoint types
         // without re-reading files (v6).
-        const [frontmatter] = parseFrontmatterText(content);
+        // Unit F: the scanner drops a line it cannot express instead of
+        // failing, so a note keeps indexing while a field silently
+        // vanishes. Collect what it dropped; the run reports it and
+        // nothing about the indexing changes.
+        const [frontmatter, , fmNotices] = parseFrontmatterTextWithNotices(content, {
+          site: INDEX_FRONTMATTER_SITE,
+          path: file.relPath,
+        });
+        for (const n of fmNotices) stats.frontmatterNotices.push(n);
         const docId = store.upsertDocument({
           path: file.relPath,
           title: chunkResult.title,
@@ -500,8 +523,11 @@ async function indexInto(
     }
 
     const now = new Date().toISOString();
-    store.setState("last_indexed_at", now);
-    if (opts?.force) store.setState("last_full_index_at", now);
+    store.setState(LAST_INDEXED_AT_STATE_KEY, now);
+    // The SAME instant on a forced run: their equality is the
+    // "this index resolved the whole vault" predicate the broken-link
+    // ratchet verifies before it trusts a count (unit G).
+    if (opts?.force) store.setState(LAST_FULL_INDEX_AT_STATE_KEY, now);
 
     // Bump the corpus-generation revision whenever the index actually
     // changed, so the persistent query cache (v0.20.0) is invalidated
@@ -826,6 +852,7 @@ export async function indexStatus(config: ResolvedSearchConfig): Promise<IndexSt
         embeddingKeyPresent: !!config.semantic.apiKey,
         lastIndexedAt: null,
         lastFullIndexAt: null,
+        embeddingAbi: Object.freeze([]),
         warnings: Object.freeze([]),
       });
     }
@@ -836,8 +863,8 @@ export async function indexStatus(config: ResolvedSearchConfig): Promise<IndexSt
     const model = store.getState("embedding_model");
     const dimRaw = store.getState("embedding_dimension");
     const dim = dimRaw ? Number(dimRaw) : null;
-    const last = store.getState("last_indexed_at");
-    const full = store.getState("last_full_index_at");
+    const last = store.getState(LAST_INDEXED_AT_STATE_KEY);
+    const full = store.getState(LAST_FULL_INDEX_AT_STATE_KEY);
 
     const warnings: string[] = [];
     if (config.semantic.enabled && !store.vecLoaded()) {
@@ -868,6 +895,25 @@ export async function indexStatus(config: ResolvedSearchConfig): Promise<IndexSt
             `[${configuredQuery}|${configuredPassage}]); run: o2b search reindex --embeddings`,
         );
       }
+    }
+
+    // Embedding-ABI drift (context-integrity-gates, Unit E). The read
+    // open already ran the gated comparison, so this only surfaces what
+    // it found: empty when the stamps agree AND whenever the operator
+    // has `integrity.embedding_abi` off. Gated on stored vectors for the
+    // same reason the prefix warning above is - an index with no
+    // embeddings has nothing that could be incomparable.
+    //
+    // Reported twice, deliberately: as one operator-facing line here and
+    // as the structured `embeddingAbi` field below. The MCP status block
+    // carries both, so an agent can branch on the field instead of
+    // matching on message text.
+    const abiDrift =
+      config.semantic.enabled && counts.embeddings > 0
+        ? store.embeddingAbiMismatches()
+        : Object.freeze([] as ReadonlyArray<StampMismatch>);
+    if (abiDrift.length > 0) {
+      warnings.push(formatEmbeddingAbiDrift(abiDrift));
     }
 
     // Best-effort spend estimate to bring stale/missing embeddings current.
@@ -902,6 +948,7 @@ export async function indexStatus(config: ResolvedSearchConfig): Promise<IndexSt
       embeddingKeyPresent: !!config.semantic.apiKey,
       lastIndexedAt: last,
       lastFullIndexAt: full,
+      embeddingAbi: abiDrift,
       warnings: Object.freeze(warnings),
     });
   } finally {
@@ -946,6 +993,8 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
   let sqliteOk = false;
   let fts5Ok = false;
   let vecExtension: "loaded" | "unavailable" | "not-attempted" = "not-attempted";
+  /** Runtime ABI token; captured from the probe rather than re-queried. */
+  let vecVersion: string | null = null;
   try {
     // Use an in-memory DB so the check never touches the real index.
     const { Database } = await import("bun:sqlite");
@@ -965,7 +1014,8 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const vec = require("sqlite-vec") as { getLoadablePath(): string };
         db.loadExtension(vec.getLoadablePath());
-        db.query("SELECT vec_version()").get();
+        const row = db.query<{ v: string }, []>("SELECT vec_version() AS v").get();
+        vecVersion = typeof row?.v === "string" ? row.v : null;
         vecExtension = "loaded";
       } catch (e) {
         vecExtension = "unavailable";
@@ -1002,6 +1052,21 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     }
   }
 
+  // Stored-versus-runtime embedding ABI (context-integrity-gates, Unit
+  // E). The probe above deliberately runs in memory and never touches
+  // the real index, so the stored side is read explicitly here - without
+  // it there is nothing to compare against.
+  //
+  // This is the DIAGNOSTIC surface, so it compares ungated: an operator
+  // who ran `search check` asked to be told. The gate governs the read
+  // path, which is where a comparison can refuse; a report cannot.
+  const recordedAbi = config.semantic.enabled ? readEmbeddingAbiSync(config.dbPath) : null;
+  const embeddingAbi =
+    recordedAbi === null
+      ? Object.freeze([] as ReadonlyArray<StampMismatch>)
+      : compareStamps(recordedAbi, runtimeEmbeddingAbi(config, vecVersion));
+  if (embeddingAbi.length > 0) warnings.push(formatEmbeddingAbiDrift(embeddingAbi));
+
   // §E.2 — Actionable hints derived from the check state.
   // Rules match the design doc table; agents and operators read the
   // list to know what command to run next without learning the
@@ -1011,6 +1076,7 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     embeddingKeyResolved,
     vecExtension,
     providerReachable,
+    embeddingAbi,
   });
 
   return Object.freeze({
@@ -1018,6 +1084,7 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     indexDirWritable,
     sqliteOk,
     fts5Ok,
+    embeddingAbi,
     vecExtension,
     embeddingKeyResolved,
     providerReachable,
@@ -1033,10 +1100,21 @@ interface BuildRecommendationsInput {
   readonly embeddingKeyResolved: boolean;
   readonly vecExtension: "loaded" | "unavailable" | "not-attempted";
   readonly providerReachable: boolean | null;
+  readonly embeddingAbi: ReadonlyArray<StampMismatch>;
 }
 
 function buildRecommendations(input: BuildRecommendationsInput): string[] {
   const recs: string[] = [];
+
+  // Embedding-ABI drift is the one condition here whose remediation is a
+  // single command, so it is named verbatim and copy-pasteable.
+  if (input.embeddingAbi.length > 0) {
+    recs.push(
+      `Stored vectors were written under a different embedding ABI ` +
+        `(${input.embeddingAbi.map(formatStampMismatch).join("; ")}). Run: ` +
+        `${EMBEDDING_ABI_FIX_COMMAND}`,
+    );
+  }
 
   if (input.config.semantic.enabled && !input.embeddingKeyResolved) {
     recs.push(

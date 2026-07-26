@@ -14,6 +14,8 @@
  */
 
 import { defaultConfigPath, resolveVault } from "../core/config.ts";
+import { formatDegradationNotice } from "../core/integrity/degradation.ts";
+import { formatStampMismatch } from "../core/integrity/stamp.ts";
 import {
   createSafeguard,
   resolveSafeguardTimeoutMs,
@@ -53,6 +55,7 @@ import {
   serializeEvidencePack,
   serializeSearchCard,
   serializeIndexStatus,
+  serializeStampMismatches,
   SEARCH_LIMIT_MIN,
   SEARCH_LIMIT_MAX,
 } from "../core/search/index.ts";
@@ -679,6 +682,7 @@ async function cmdSearchQuery(argv: ReadonlyArray<string>): Promise<number> {
     property: { type: "string-array" },
     degree: { type: "string-array" },
     visibility: { type: "string-array" },
+    "agent-scope": { type: "string" },
     "query-doc": { type: "string" },
     expand: { type: "boolean" },
     disclosure: { type: "string" },
@@ -750,6 +754,12 @@ async function cmdSearchQuery(argv: ReadonlyArray<string>): Promise<number> {
     ...(properties !== undefined ? { properties } : {}),
     ...(degreeFilters !== undefined ? { degreeFilters } : {}),
     ...(visibility !== undefined && visibility.length > 0 ? { visibility } : {}),
+    // Owner-scope isolation (context-integrity-gates, Unit A): an
+    // owner-private page is returned only to its own scope. Omitting the
+    // flag applies no ownership filtering at all.
+    ...(typeof flags["agent-scope"] === "string"
+      ? { agentScope: flags["agent-scope"] as string }
+      : {}),
     ...(structuredQuery !== undefined ? { structuredQuery } : {}),
     ...(flags["expand"] === true ? { expand: true } : {}),
     ...(disclosureRaw === "cards" ? { disclosure: "cards" as const } : {}),
@@ -927,6 +937,7 @@ async function cmdSearchExpand(argv: ReadonlyArray<string>): Promise<number> {
     chunk: { type: "string" },
     "raw-limit": { type: "string" },
     cursor: { type: "string" },
+    "agent-scope": { type: "string" },
     json: { type: "boolean" },
   });
   const chunkId = Number(flags["chunk"]);
@@ -947,6 +958,9 @@ async function cmdSearchExpand(argv: ReadonlyArray<string>): Promise<number> {
       chunkId,
       ...(rawLimit !== undefined ? { rawLimit } : {}),
       ...(typeof flags["cursor"] === "string" ? { cursor: flags["cursor"] as string } : {}),
+      ...(typeof flags["agent-scope"] === "string"
+        ? { agentScope: flags["agent-scope"] as string }
+        : {}),
     });
   } catch (e) {
     if (e instanceof SearchError) {
@@ -1155,6 +1169,18 @@ function jsonForStats(stats: IndexStats, cfg: ResolvedSearchConfig): unknown {
       embeddings_retries: stats.embeddingsRetries,
     },
     errors: stats.errors.map((e) => ({ path: e.path, message: e.message })),
+    // Unit F. Conditional so a vault with no malformed frontmatter emits
+    // exactly the payload it emitted before this field existed.
+    ...(stats.frontmatterNotices.length > 0
+      ? {
+          frontmatter_notices: stats.frontmatterNotices.map((n) => ({
+            code: n.code,
+            site: n.site,
+            ...(n.path !== undefined ? { path: n.path } : {}),
+            detail: n.detail,
+          })),
+        }
+      : {}),
     duration_ms: stats.durationMs,
     vault: cfg.vault,
     db_path: cfg.dbPath,
@@ -1176,6 +1202,14 @@ function renderStatsHuman(stats: IndexStats, cfg: ResolvedSearchConfig): string 
   if (stats.errors.length > 0) {
     lines.push(`  errors:`);
     for (const e of stats.errors) lines.push(`    - ${e.path}: ${e.message}`);
+  }
+  // Unit F. Below the errors block and only when non-empty: these files
+  // indexed successfully, they just lost a frontmatter field.
+  if (stats.frontmatterNotices.length > 0) {
+    lines.push(`  frontmatter:`);
+    for (const n of stats.frontmatterNotices) {
+      lines.push(`    - ${formatDegradationNotice(n)}`);
+    }
   }
   lines.push(`done in ${(stats.durationMs / 1000).toFixed(1)}s`);
   return lines.join("\n") + "\n";
@@ -1301,6 +1335,11 @@ function jsonForCheck(r: IndexCheckReport): unknown {
     embedding_key_resolved: r.embeddingKeyResolved,
     provider_reachable: r.providerReachable,
     provider_reason: r.providerReason,
+    // Emitted only on drift, so a matching store's JSON is byte-identical
+    // to the pre-gate output (context-integrity-gates, Unit E).
+    ...(r.embeddingAbi.length > 0
+      ? { embedding_abi: serializeStampMismatches(r.embeddingAbi) }
+      : {}),
     warnings: r.warnings,
     fatal: r.fatal,
     recommendations: r.recommendations,
@@ -1316,6 +1355,10 @@ function renderCheckHuman(r: IndexCheckReport): string {
   lines.push(`fts5_ok:               ${ok(r.fts5Ok)}`);
   lines.push(`vec_extension:         ${r.vecExtension}`);
   lines.push(`embedding_key:         ${ok(r.embeddingKeyResolved)}`);
+  // Only on drift: a matching store renders exactly as before.
+  for (const m of r.embeddingAbi) {
+    lines.push(`embedding_abi:         ${formatStampMismatch(m)}`);
+  }
   if (r.providerReachable !== null) {
     lines.push(`provider_reachable:    ${r.providerReachable ? "OK" : "FAIL"}`);
     if (r.providerReason) lines.push(`provider_reason:       ${r.providerReason}`);

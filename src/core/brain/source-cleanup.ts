@@ -59,6 +59,7 @@ import { manifestPath, readManifest, writeManifestAtomic } from "./ingest/conten
 import { appendContinuitySourceInvalidation } from "./continuity/store.ts";
 import { isoSecond } from "./time.ts";
 import { withDestructiveSnapshot } from "./snapshot-gate.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 /** Run-id label for the snapshot taken before a confirmed source cleanup. */
 const DELETE_BY_SOURCE_SNAPSHOT_LABEL = "delete-by-source";
@@ -244,13 +245,14 @@ function directMatch(
   } catch {
     return null;
   }
-  let meta: FrontmatterMap = {};
-  try {
-    [meta] = parseFrontmatter(absPath);
-  } catch {
-    // A page we cannot parse is scanned as raw text only.
-    meta = {};
-  }
+  // Unit F: `parseFrontmatter` cannot throw (it reads inside its own try;
+  // everything after is string work), so the `catch { meta = {} }` that
+  // stood here was unreachable - and its intent is what the parser
+  // already does, returning an empty map for a failed read, so a page
+  // whose frontmatter is unavailable is still scanned as raw text.
+  // Dropped lines are reported centrally; see the "Why most readers keep
+  // the two-tuple form" section in src/core/vault.ts.
+  const [meta] = parseFrontmatter(absPath);
 
   const kind = classifyKind(vault, absPath);
   const sourceLinks = stringArrayField(meta, "source");
@@ -333,12 +335,11 @@ function traceReferences(vault: string, sourceFile: string): Traced {
       if (alreadyMatched.has(absPath)) continue;
       const kind = classifyKind(vault, absPath);
       if (kind !== "preference") continue;
-      let meta: FrontmatterMap;
-      try {
-        [meta] = parseFrontmatter(absPath);
-      } catch {
-        continue;
-      }
+      // Unit F: unreachable `catch { continue }` removed - see directMatch
+      // above. An unreadable page yields an empty map, so it has no
+      // `_evidenced_by` links and falls out on the next line exactly as
+      // the dead branch intended.
+      const [meta] = parseFrontmatter(absPath);
       const evidencedBy = evidencedByLinks(meta);
       const targets = evidencedBy.map((link) => wikilinkTarget(link));
       if (targets.length === 0) continue;
@@ -492,6 +493,9 @@ export function deleteBySource(
   const canonical = canonicalNotePath(sourceFile);
   const confirm = opts.confirm === true;
   const includeOriginals = opts.includeOriginals === true;
+  // Vault-identity write guard (context-integrity-gates, Unit J).
+  // Dry-run (the default) plans and writes nothing, so it stays ungated.
+  if (confirm) assertVaultIdentityForWrite(vault);
 
   const { derived, mentions } = traceReferences(vault, sourceFile);
   const originals = findOriginals(vault, canonical);

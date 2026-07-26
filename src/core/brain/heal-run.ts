@@ -25,6 +25,7 @@ import {
 } from "../vault.ts";
 import { BRAIN_ROOT_REL } from "./paths.ts";
 import { planHealEnrichmentPrepared, prepareHealPhrases } from "./heal-enrich.ts";
+import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 export interface HealRunResult {
   /** Pages scanned (outside the Brain root). */
@@ -40,6 +41,8 @@ export interface HealRunResult {
  * scan/enrich counts. Writes only changed pages.
  */
 export function runHealEnrichment(vault: string): HealRunResult {
+  // Vault-identity write guard (context-integrity-gates, Unit J).
+  assertVaultIdentityForWrite(vault);
   // BRAIN_ROOT_REL is the Brain dir name relative to the vault (its
   // first path segment is the dir to skip). The skipDirs option REPLACES
   // the default exclusions, so the Brain root is added to the standard
@@ -79,14 +82,15 @@ export function runHealEnrichment(vault: string): HealRunResult {
 
   const changed: string[] = [];
   for (const p of pages) {
-    let meta;
-    let body;
-    try {
-      [meta, body] = parseFrontmatter(p.path);
-    } catch {
-      // A page we cannot parse is skipped, not aborted - heal is hygiene.
-      continue;
-    }
+    // Unit F: `parseFrontmatter` cannot throw (it reads inside its own
+    // try; everything after is string work), so the `catch { continue }`
+    // that stood here was unreachable - a page was never actually
+    // skipped by it. Dropped lines and unreadable reads are reported
+    // centrally instead; see the "Why most readers keep the two-tuple
+    // form" section in src/core/vault.ts. An unreadable page still
+    // yields an empty map here and plans no change, so heal stays
+    // hygiene: it never rewrites what it could not read.
+    const [meta, body] = parseFrontmatter(p.path);
     // Never link a page to its own title or aliases.
     const own = ownTokens.get(p.path) ?? new Set<string>();
     const plan = planHealEnrichmentPrepared({ frontmatter: meta, body }, prepared, own);
