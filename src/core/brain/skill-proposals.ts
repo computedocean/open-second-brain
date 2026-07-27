@@ -44,11 +44,35 @@ import {
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { listContinuityRecords, type ContinuityRecord } from "./continuity/store.ts";
 
+/**
+ * Pattern kind stamped on a proposal an author DECLARED through an
+ * `@osb skill` marker rather than one the miner inferred from
+ * continuity records.
+ *
+ * It is deliberately outside the verifier gate. That gate
+ * (`skill-proposal-verifier.ts`) scores a MINED candidate against its own
+ * supporting records - at least `VERIFIER_MIN_EVIDENCE` (3) distinct
+ * records structurally supporting the pattern, plus a confidence floor -
+ * so a thin or padded inference never reaches a human. A declaration has
+ * exactly one piece of evidence, the declaration itself, and claims no
+ * statistical confidence, so running the same gate over it would reject
+ * every marker and make the feature a silent no-op. The review gate that
+ * does apply is the human one: a declared proposal lands in `pending` and
+ * is promoted only by `acceptSkillProposal`.
+ */
+export const DECLARED_MARKER_PATTERN_KIND = "declared_marker";
+
 export type SkillProposalPatternKind =
   | "repeated_action"
   | "structural_similarity"
   | "co_occurrence"
-  | "temporal_routine";
+  | "temporal_routine"
+  | typeof DECLARED_MARKER_PATTERN_KIND;
+
+/** The three phases a proposal file can live in, most terminal first. */
+const PROPOSAL_PHASES = ["accepted", "rejected", "pending"] as const;
+
+export type SkillProposalPhase = (typeof PROPOSAL_PHASES)[number];
 
 export interface SkillProposalLearnOptions {
   readonly now?: Date;
@@ -123,7 +147,7 @@ export type SkillEvidenceOutcomeState = "unrecorded" | "successful" | "failing" 
 export interface SkillProposalEvidence {
   readonly slug: string;
   readonly id: string;
-  readonly phase: "pending" | "accepted" | "rejected";
+  readonly phase: SkillProposalPhase;
   /** Support the proposal claims from its own pattern match - self-reported. */
   readonly claimedEvidenceCount: number;
   readonly claimedConfidence: number;
@@ -164,6 +188,17 @@ const DEFAULT_PROCEDURAL_ROOTS = ["Brain/procedures", "skills"] as const;
 
 /** Version stamped on a freshly-drafted skill; increments on evolution. */
 const SKILL_PROPOSAL_INITIAL_VERSION = 1;
+
+/** Slug budget: how much of the pattern key survives, and the hash suffix length. */
+const PROPOSAL_SLUG_KEY_MAX_LEN = 40;
+const PROPOSAL_SLUG_HASH_LEN = 8;
+
+/**
+ * Heading that separates the reviewable skill body from the pattern and
+ * evidence sections. `renderAcceptedProcedureBody` splits on it, so both
+ * the writer and the reader must name it from here.
+ */
+const SUGGESTED_BODY_HEADING = "## Suggested skill body";
 
 /** Lock basename guarding the accept sequence, inside the proposals root. */
 const ACCEPT_LOCK_NAME = "accept";
@@ -351,6 +386,220 @@ export function listPendingSkillProposals(vault: string): ReadonlyArray<{
     });
   }
   return Object.freeze(out);
+}
+
+/** A declared skill proposal was rejected before anything was written. */
+export class DeclaredSkillProposalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeclaredSkillProposalError";
+  }
+}
+
+export interface DeclaredSkillProposalInput {
+  /** Human-facing skill name; its slug is the proposal's identity key. */
+  readonly name: string;
+  /** What the skill does, carried verbatim into the reviewable body. */
+  readonly body: string;
+  /** Where the declaration was found, as wikilinks. */
+  readonly sourceRefs: ReadonlyArray<string>;
+  readonly now?: Date;
+}
+
+/**
+ * What a declaration did, by name.
+ *
+ *   - `created`   - a new pending draft was written.
+ *   - `deduped`   - an equivalent draft is already PENDING review, so the
+ *                   declaration resolved to it and nothing was written.
+ *   - `suppressed`- the queue declined: the name is already reviewed
+ *                   (accepted or rejected), or a file already occupies the
+ *                   slug. Nothing was written and the declared body was
+ *                   NOT stored anywhere.
+ *
+ * The three are distinct because the caller's next move differs: a
+ * `deduped` declaration is safely consumed - the same skill is already
+ * queued for a human - while a `suppressed` one has nowhere its content
+ * survives, so consuming its marker would destroy the only copy.
+ */
+export type DeclaredSkillProposalOutcome = "created" | "deduped" | "suppressed";
+
+interface DeclaredSkillProposalResultBase {
+  readonly id: string;
+  readonly slug: string;
+  /** The proposal file this declaration created or resolved to. */
+  readonly path: string;
+}
+
+export type DeclaredSkillProposalResult = DeclaredSkillProposalResultBase &
+  (
+    | { readonly outcome: "created" | "deduped" }
+    /** `reason` is required here: a decline the caller cannot explain is a silent drop. */
+    | { readonly outcome: "suppressed"; readonly reason: string }
+  );
+
+/**
+ * Draft a PENDING proposal from an author's `@osb skill` declaration.
+ *
+ * The write lands in `pending` and nowhere else: acceptance stays the
+ * human step, exactly as it is for a mined proposal. See
+ * {@link DECLARED_MARKER_PATTERN_KIND} for why the mining verifier is not
+ * in this path. No `confidence` key is written either - a declaration
+ * makes no statistical claim, and `resolveSkillProposalEvidence` already
+ * reads an absent claim as zero self-reported support.
+ *
+ * One name, one proposal: see {@link DeclaredSkillProposalOutcome} for
+ * what happens when the name is taken.
+ */
+export function draftDeclaredSkillProposal(
+  vault: string,
+  input: DeclaredSkillProposalInput,
+): DeclaredSkillProposalResult {
+  // Vault-identity write guard (context-integrity-gates, Unit J).
+  assertVaultIdentityForWrite(vault);
+  const planned = planDeclaredSkillProposal(vault, input);
+  if ("declined" in planned) return planned.declined;
+  const plan = planned.plan;
+
+  const now = (input.now ?? new Date()).toISOString();
+  const sourceRefs = [...input.sourceRefs];
+
+  writeFrontmatterAtomic(
+    plan.path,
+    {
+      schema_version: 1,
+      kind: "brain-skill-proposal",
+      id: plan.id,
+      slug: plan.slug,
+      status: "pending",
+      pattern_kind: DECLARED_MARKER_PATTERN_KIND,
+      name_key: plan.nameKey,
+      version: SKILL_PROPOSAL_INITIAL_VERSION,
+      payload_hash: plan.payloadHash,
+      created_at: now,
+      updated_at: now,
+      evidence_count: String(sourceRefs.length),
+      source_refs: sourceRefs,
+    },
+    renderProposalDocument({
+      title: plan.name,
+      patternKind: DECLARED_MARKER_PATTERN_KIND,
+      key: plan.key,
+      suggestedBody: plan.body.split("\n"),
+      evidence: sourceRefs.map((ref) => `- declared in ${ref}`),
+    }),
+    {
+      overwrite: false,
+      existsErrorKind: "skill proposal",
+      vaultForRelativePath: vault,
+    },
+  );
+
+  return { id: plan.id, slug: plan.slug, path: plan.path, outcome: "created" };
+}
+
+/**
+ * What {@link draftDeclaredSkillProposal} would do, without writing.
+ *
+ * Same validation, same identity derivation, same decline reasons - the
+ * two share {@link planDeclaredSkillProposal}, so a preview cannot report
+ * an outcome the writer would not reach. Used by `scan-inline --dry-run`,
+ * which must count and report what a real run would do while touching
+ * nothing.
+ */
+export function previewDeclaredSkillProposal(
+  vault: string,
+  input: DeclaredSkillProposalInput,
+): DeclaredSkillProposalResult {
+  const planned = planDeclaredSkillProposal(vault, input);
+  if ("declined" in planned) return planned.declined;
+  const plan = planned.plan;
+  return { id: plan.id, slug: plan.slug, path: plan.path, outcome: "created" };
+}
+
+/** Everything a declared draft needs, once the queue has agreed to take it. */
+interface DeclaredSkillProposalPlan {
+  readonly id: string;
+  readonly slug: string;
+  readonly path: string;
+  readonly name: string;
+  readonly body: string;
+  readonly key: string;
+  readonly nameKey: string;
+  readonly payloadHash: string;
+}
+
+/**
+ * Decide what a declaration does before anything is written: a plan to
+ * draft, or the outcome the queue declined with.
+ *
+ * Both guards below refuse by name rather than letting the exclusive
+ * write throw an untyped `EEXIST` later - the same two guards the mined
+ * path carries in `learnSkillProposals`, in the same order.
+ */
+function planDeclaredSkillProposal(
+  vault: string,
+  input: DeclaredSkillProposalInput,
+):
+  | { readonly plan: DeclaredSkillProposalPlan }
+  | { readonly declined: DeclaredSkillProposalResult } {
+  const name = input.name.trim();
+  if (!name) throw new DeclaredSkillProposalError("declared skill proposal requires a name");
+  const body = input.body.trim();
+  if (!body) throw new DeclaredSkillProposalError(`declared skill proposal '${name}' has no body`);
+
+  const key = slugify(name);
+  const nameKey = nameKeyFor(DECLARED_MARKER_PATTERN_KIND, key);
+  for (const phase of PROPOSAL_PHASES) {
+    const existing = findProposalByNameKey(vault, phase, nameKey);
+    if (existing === null) continue;
+    const found = { id: existing.id, slug: existing.slug, path: existing.path };
+    if (phase === "pending") return { declined: { ...found, outcome: "deduped" } };
+    return {
+      declined: {
+        ...found,
+        outcome: "suppressed",
+        reason:
+          `a skill proposal named '${name}' is already ${phase} (${existing.id}); ` +
+          "this declaration was not drafted and its body was not stored",
+      },
+    };
+  }
+
+  const payloadHash = createHash("sha256")
+    .update(JSON.stringify({ patternKind: DECLARED_MARKER_PATTERN_KIND, key, body }), "utf8")
+    .digest("hex");
+  const slug = composeProposalSlug(DECLARED_MARKER_PATTERN_KIND, key, payloadHash);
+  const id = `prop-${slug}`;
+
+  for (const phase of PROPOSAL_PHASES) {
+    const occupied = proposalPhasePath(vault, phase, slug);
+    if (!existsSync(occupied)) continue;
+    return {
+      declined: {
+        id,
+        slug,
+        path: occupied,
+        outcome: "suppressed",
+        reason:
+          `a skill proposal file already occupies slug '${slug}' under ${phase}/; ` +
+          "this declaration was not drafted and its body was not stored",
+      },
+    };
+  }
+
+  return {
+    plan: {
+      id,
+      slug,
+      path: skillProposalPendingPath(vault, slug),
+      name,
+      body,
+      key,
+      nameKey,
+      payloadHash,
+    },
+  };
 }
 
 /**
@@ -723,17 +972,25 @@ function outcomeState(successes: number, failures: number): SkillEvidenceOutcome
   return failures > 0 ? "failing" : "successful";
 }
 
+/** Where a proposal with `slug` lives while it is in `phase`. */
+function proposalPhasePath(vault: string, phase: SkillProposalPhase, slug: string): string {
+  switch (phase) {
+    case "accepted":
+      return skillProposalAcceptedPath(vault, slug);
+    case "rejected":
+      return skillProposalRejectedPath(vault, slug);
+    case "pending":
+      return skillProposalPendingPath(vault, slug);
+  }
+}
+
 /** Locate a proposal in whichever phase holds it, terminal phases first. */
 function findReviewedProposal(
   vault: string,
   slug: string,
-): { phase: "pending" | "accepted" | "rejected"; fm: Record<string, unknown> } {
-  const candidates = [
-    ["accepted", skillProposalAcceptedPath(vault, slug)],
-    ["rejected", skillProposalRejectedPath(vault, slug)],
-    ["pending", skillProposalPendingPath(vault, slug)],
-  ] as const;
-  for (const [phase, path] of candidates) {
+): { phase: SkillProposalPhase; fm: Record<string, unknown> } {
+  for (const phase of PROPOSAL_PHASES) {
+    const path = proposalPhasePath(vault, phase, slug);
     if (!existsSync(path)) continue;
     const [fm] = parseFrontmatter(path);
     return { phase, fm: fm as Record<string, unknown> };
@@ -819,7 +1076,12 @@ function watermarkPath(vault: string): string {
 
 /** Stable name identity of a candidate, independent of the specific records. */
 function candidateNameKey(candidate: ProposalCandidate): string {
-  return `${candidate.patternKind}:${candidate.key}`;
+  return nameKeyFor(candidate.patternKind, candidate.key);
+}
+
+/** The stored `name_key`, shared by the mined and the declared paths. */
+function nameKeyFor(patternKind: SkillProposalPatternKind, key: string): string {
+  return `${patternKind}:${key}`;
 }
 
 /** Source references a candidate contributes (record ids plus their source ids). */
@@ -884,7 +1146,7 @@ interface FoundProposal {
 /** Find the first proposal in `phase` whose stored name key matches. */
 function findProposalByNameKey(
   vault: string,
-  phase: "pending" | "accepted" | "rejected",
+  phase: SkillProposalPhase,
   nameKey: string,
 ): FoundProposal | null {
   const dir = ensureInsideVault(join(vault, BRAIN_SKILL_PROPOSALS_REL, phase), vault);
@@ -1112,28 +1374,47 @@ function confidence(support: number, minSupport: number): number {
   return Math.max(0.55, Math.round(raw * 1000) / 1000);
 }
 
-function renderProposalBody(candidate: ProposalCandidate): string {
-  const evidence = candidate.records
-    .map((record) => {
-      const snippet = evidenceSnippet(record);
-      return `- ${record.createdAt} :: ${record.kind} :: ${record.id}${snippet ? ` :: ${snippet}` : ""}`;
-    })
-    .join("\n");
-
+/**
+ * The one proposal document shape, whether the pattern was mined or
+ * declared. Section order and headings are a contract with
+ * `renderAcceptedProcedureBody`, so both producers go through here.
+ */
+function renderProposalDocument(input: {
+  readonly title: string;
+  readonly patternKind: SkillProposalPatternKind;
+  readonly key: string;
+  readonly suggestedBody: ReadonlyArray<string>;
+  readonly evidence: ReadonlyArray<string>;
+}): string {
   return [
-    `# ${candidate.suggestedTitle}`,
+    `# ${input.title}`,
     "",
     "## Pattern",
-    `- kind: ${candidate.patternKind}`,
-    `- key: ${candidate.key}`,
+    `- kind: ${input.patternKind}`,
+    `- key: ${input.key}`,
     "",
-    "## Suggested skill body",
-    `When pattern \`${candidate.key}\` appears, follow the observed repeatable workflow.`,
-    "Capture inputs first, execute steps in stable order, and emit audit-friendly outputs.",
+    SUGGESTED_BODY_HEADING,
+    ...input.suggestedBody,
     "",
     "## Evidence",
-    evidence,
+    ...input.evidence,
   ].join("\n");
+}
+
+function renderProposalBody(candidate: ProposalCandidate): string {
+  return renderProposalDocument({
+    title: candidate.suggestedTitle,
+    patternKind: candidate.patternKind,
+    key: candidate.key,
+    suggestedBody: [
+      `When pattern \`${candidate.key}\` appears, follow the observed repeatable workflow.`,
+      "Capture inputs first, execute steps in stable order, and emit audit-friendly outputs.",
+    ],
+    evidence: candidate.records.map((record) => {
+      const snippet = evidenceSnippet(record);
+      return `- ${record.createdAt} :: ${record.kind} :: ${record.id}${snippet ? ` :: ${snippet}` : ""}`;
+    }),
+  });
 }
 
 function evidenceSnippet(record: ContinuityRecord): string {
@@ -1148,8 +1429,15 @@ function evidenceSnippet(record: ContinuityRecord): string {
 }
 
 function proposalSlug(candidate: ProposalCandidate, payloadHash: string): string {
-  const keySlug = slugify(candidate.key).slice(0, 40);
-  return `${candidate.patternKind}-${keySlug}-${payloadHash.slice(0, 8)}`;
+  return composeProposalSlug(candidate.patternKind, slugify(candidate.key), payloadHash);
+}
+
+function composeProposalSlug(
+  patternKind: SkillProposalPatternKind,
+  keySlug: string,
+  payloadHash: string,
+): string {
+  return `${patternKind}-${keySlug.slice(0, PROPOSAL_SLUG_KEY_MAX_LEN)}-${payloadHash.slice(0, PROPOSAL_SLUG_HASH_LEN)}`;
 }
 
 function candidateHash(candidate: ProposalCandidate): string {
@@ -1166,9 +1454,9 @@ function candidateHash(candidate: ProposalCandidate): string {
 }
 
 function renderAcceptedProcedureBody(proposalId: string, proposalBody: string): string {
-  const marker = "## Suggested skill body";
-  const idx = proposalBody.indexOf(marker);
-  const suggested = idx >= 0 ? proposalBody.slice(idx + marker.length).trim() : proposalBody.trim();
+  const idx = proposalBody.indexOf(SUGGESTED_BODY_HEADING);
+  const suggested =
+    idx >= 0 ? proposalBody.slice(idx + SUGGESTED_BODY_HEADING.length).trim() : proposalBody.trim();
   return [
     "# Procedure",
     "",

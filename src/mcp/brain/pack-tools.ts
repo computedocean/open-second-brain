@@ -11,12 +11,15 @@
 import {
   resolveDensityRankingContextPack,
   resolveRecallAdequacyThresholds,
+  resolveRecallGateTelemetry,
   resolveSearchFocusContextPack,
 } from "../../core/config.ts";
 import { resolveSearchConfig } from "../../core/search/index.ts";
 import { readActiveSessionFocus } from "../../core/search/session-focus.ts";
 import { packContext } from "../../core/brain/context-pack.ts";
 import { assessRecallAdequacy } from "../../core/brain/recall-adequacy.ts";
+import { recordRecallAdequacyDemand } from "../../core/brain/query-demand.ts";
+import { emitGatedTelemetry } from "../../core/brain/continuity/emit.ts";
 import {
   readAnticipatoryContext,
   refreshAnticipatoryCache,
@@ -101,6 +104,26 @@ async function toolBrainContextPack(
           resolveRecallAdequacyThresholds(ctx.configPath ?? undefined),
         )
       : undefined;
+  // signals-that-survive, unit 6: an unmet verdict is stamped onto the
+  // cross-query demand log under the bucket key normalizeQueryTerms already
+  // computes, so the knowledge-gap loop can aggregate recurrence without a
+  // second identity concept.
+  //
+  // ONE opt-in for that log, on every surface that writes it: the
+  // `recall_gate_telemetry` config key, exactly as `brain_recall_gate`
+  // uses. It is a vault-level durable log feeding a vault-level loop, so
+  // whether it is written is an operator decision, not a per-call one -
+  // gating it here on this tool's `telemetry` ARGUMENT instead made one
+  // feature answer to two different opt-ins and left the log's contents
+  // depending on which surface a caller happened to use. That argument
+  // keeps its own meaning: it selects whether THIS call emits its own
+  // continuity records. Fail-open as ever - a log write never breaks the
+  // pack.
+  if (adequacy !== undefined && query !== undefined) {
+    emitGatedTelemetry(resolveRecallGateTelemetry(ctx.configPath ?? undefined), () =>
+      recordRecallAdequacyDemand(ctx.vault, { query, verdict: adequacy }),
+    );
+  }
   // Focus wiring (Agent Surface Suite, t_5b478e47): gated on the
   // search_focus_context_pack config key (default off) so the default
   // pack stays byte-identical. Fail-soft - a broken search config

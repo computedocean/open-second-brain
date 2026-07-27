@@ -12,10 +12,15 @@
  * are never installed on an operator's machine.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
-import { IgnoreScope, parseIgnoreLayer, type IgnoreWarning } from "../fs/ignore.ts";
+import {
+  buildRepositoryBaseScope,
+  extendWithDirectoryIgnore,
+  formatIgnoreWarning,
+} from "../fs/git-discovery.ts";
+import type { IgnoreScope, IgnoreWarning } from "../fs/ignore.ts";
 import { scanFiles, type HardcodedPathFinding } from "./hardcoded-paths.ts";
 
 /**
@@ -101,44 +106,6 @@ function toPosixRel(root: string, abs: string): string {
   return relative(root, abs).split(sep).join("/");
 }
 
-/** Read one ignore file into the scope, folding any warnings in. Fail-soft on I/O. */
-function extendWithIgnoreFile(
-  scope: IgnoreScope,
-  filePath: string,
-  baseDir: string,
-  source: string,
-  warnings: IgnoreWarning[],
-): IgnoreScope {
-  if (!existsSync(filePath)) return scope;
-  let content: string;
-  try {
-    content = readFileSync(filePath, "utf8");
-  } catch {
-    return scope; // an unreadable ignore file is not a scan failure
-  }
-  const parsed = parseIgnoreLayer(content, baseDir, source);
-  warnings.push(...parsed.warnings);
-  return scope.extend(parsed.layer);
-}
-
-/**
- * Base ignore scope for the whole repo: `.git/info/exclude` at the lowest
- * precedence, then the root `.gitignore` above it. Nested `.gitignore` files
- * are layered per directory during the walk.
- */
-function buildBaseScope(root: string, warnings: IgnoreWarning[]): IgnoreScope {
-  let scope = IgnoreScope.empty();
-  scope = extendWithIgnoreFile(
-    scope,
-    join(root, ".git", "info", "exclude"),
-    "",
-    ".git/info/exclude",
-    warnings,
-  );
-  scope = extendWithIgnoreFile(scope, join(root, ".gitignore"), "", ".gitignore", warnings);
-  return scope;
-}
-
 /**
  * Recursively collect scannable files under `dir`, fail-soft on I/O. `scope`
  * carries the composed ignore rules from all shallower directories; this
@@ -152,13 +119,9 @@ function collectFiles(
   out: string[],
   warnings: IgnoreWarning[],
 ): void {
-  const dirScope = extendWithIgnoreFile(
-    scope,
-    join(dir, ".gitignore"),
-    toPosixRel(root, dir),
-    `${toPosixRel(root, dir)}/.gitignore`,
-    warnings,
-  );
+  const extended = extendWithDirectoryIgnore(scope, dir, toPosixRel(root, dir));
+  const dirScope = extended.scope;
+  warnings.push(...extended.warnings);
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -180,17 +143,19 @@ function collectFiles(
   }
 }
 
-/** Emit one stderr line per malformed ignore pattern, deduplicated. */
+/**
+ * Emit one stderr line per ignore-file warning, deduplicated. Covers both a
+ * malformed pattern and an ignore file that could not be honoured at all - the
+ * shared formatter words each kind, so this sink and the ingest planner's plan
+ * output never drift apart.
+ */
 function reportIgnoreWarnings(warnings: ReadonlyArray<IgnoreWarning>): void {
   const seen = new Set<string>();
   for (const w of warnings) {
     const key = `${w.source}:${w.line}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    process.stderr.write(
-      `hygiene: ignoring malformed ignore pattern at ${w.source}:${w.line} ` +
-        `(${w.pattern}): ${w.reason}\n`,
-    );
+    process.stderr.write(`hygiene: ignoring ${formatIgnoreWarning(w)}\n`);
   }
 }
 
@@ -203,8 +168,9 @@ function reportIgnoreWarnings(warnings: ReadonlyArray<IgnoreWarning>): void {
  * present the result is byte-identical to the baseline walk.
  */
 export function listScanTargets(root: string): string[] {
-  const warnings: IgnoreWarning[] = [];
-  const baseScope = buildBaseScope(root, warnings);
+  const base = buildRepositoryBaseScope(root, "");
+  const warnings: IgnoreWarning[] = [...base.warnings];
+  const baseScope = base.scope;
   const abs: string[] = [];
   for (const dir of SCAN_DIRS) {
     collectFiles(join(root, dir), root, baseScope, abs, warnings);

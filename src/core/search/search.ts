@@ -62,6 +62,7 @@ import { detectHybridDegrade, rerankByRelevance } from "./enrich.ts";
 import { applyReinforceBoost, loadReinforceStrengths, reinforceFingerprint } from "./reinforce.ts";
 import { readActiveSessionFocus } from "./session-focus.ts";
 import { applyTemporalBridge } from "./temporal-bridge.ts";
+import { detectTemporalIntent, stripTemporalDirectives } from "./temporal-intent.ts";
 import { resolveTimeRange } from "./time-range.ts";
 import { eventTimeInRange, parseValidityWindow, type ValidityWindow } from "./validity.ts";
 import { contradictedAbiFields, formatEmbeddingAbiDrift, Store } from "./store.ts";
@@ -197,8 +198,8 @@ export async function search(
   config: ResolvedSearchConfig,
   opts: SearchOptions,
 ): Promise<SearchOutcome> {
-  const query = (opts.query ?? "").trim();
-  if (!query) {
+  const rawQuery = (opts.query ?? "").trim();
+  if (!rawQuery) {
     throw new SearchError("INVALID_INPUT", "missing required argument: query");
   }
   // Recall profile (Recall & Working-Memory Quality Suite, t_98c39dd6) and
@@ -224,12 +225,45 @@ export async function search(
     opts.sessionFocus === undefined
       ? readActiveSessionFocus(config, opts.focusSession, Date.now())
       : opts.sessionFocus;
+  // One clock for every time-resolving decision in this call, so the hard
+  // filter and the query-declared window below cannot disagree by a few
+  // milliseconds of wall-clock drift.
+  const nowMs = Date.now();
   // Time-aware recall (recall-trust-suite): resolve since/until up front
   // so invalid input fails fast, before any store I/O.
   const timeRange =
     opts.since !== undefined || opts.until !== undefined
-      ? resolveTimeRange({ since: opts.since, until: opts.until }, Date.now())
+      ? resolveTimeRange({ since: opts.since, until: opts.until }, nowMs)
       : null;
+  // Query-side temporal intent (t_58fc4720). Resolved HERE, from the raw
+  // query as the caller typed it, and before any store I/O:
+  //
+  //   - detection must read the ORIGINAL text. Expansion rewrites the
+  //     keyword lane into bare lexical terms, and the `field:value`
+  //     grammar does not survive that rewrite - planning from the
+  //     rewritten text saw no directive while the strip below still
+  //     removed one, so a declared window was voided and its directive
+  //     reached the implicit-AND keyword lane as a term nothing matches;
+  //   - a malformed directive then fails as fast as `since` / `until`
+  //     does, rather than after the index is opened.
+  //
+  // From here on the query text is the RESIDUAL text: a directive states
+  // the window and is not a term, so it must not reach the keyword lane,
+  // the semantic lane, the coverage gate or the evidence pack. Stripping
+  // is byte-identical for a query that carries no directive.
+  const temporalIntent = detectTemporalIntent(rawQuery, nowMs);
+  const query = stripTemporalDirectives(rawQuery);
+  if (query === "") {
+    // A window with nothing to search for. Both lanes would be handed the
+    // empty string - FTS short-circuits on an empty match and the semantic
+    // lane embeds "" - so the honest answer is the same one the parameter
+    // form gives: a window FILTERS a query, it is not a query.
+    throw new SearchError(
+      "INVALID_INPUT",
+      "the query declares a time window and no search terms: " +
+        "add the terms to look for, or pass the window as the since / until parameters",
+    );
+  }
 
   // Read-only origins (cross-vault search) disable self-healing: a
   // rebuild would write an index INTO the external vault. Default
@@ -249,6 +283,10 @@ export async function search(
     // corpus-common tokens are derived from document frequency here
     // (language-agnostic, no stopword list) so an implicit-AND query is
     // not killed by a word that is ubiquitous in this vault.
+    // Expansion reads the RESIDUAL text (see the strip above): a window
+    // directive is an instruction, so it must never become an expansion
+    // token, and the residual is byte-identical when no window was
+    // declared.
     const commonTokens =
       opts.structuredQuery === undefined && expandActive === true
         ? highFrequencyTokens(store, query)
@@ -262,7 +300,14 @@ export async function search(
     // profile and the cache key. Expanded terms (if any) are folded in
     // once they have been derived from the store below.
     const surfaceVocabulary = summarySurfaceVocabulary(config.vault);
-    const basePlan = buildQueryPlan(keywordQuery, [], structured?.intent, surfaceVocabulary);
+    const basePlan = buildQueryPlan(
+      keywordQuery,
+      [],
+      structured?.intent,
+      surfaceVocabulary,
+      nowMs,
+      temporalIntent,
+    );
     // Summary-search router (t_7b96f242): a per-query structural decision,
     // independent of results, so it is resolved once here and echoed on
     // every outcome below. `default` is omitted from the outcome, keeping
@@ -278,8 +323,13 @@ export async function search(
     // change bumps the generation. The cache write is best-effort.
     // A time-filtered query bypasses the cache: a relative range
     // ("24h") resolves to a different absolute window on every call, so
-    // a cached row would serve a stale window within the TTL.
-    const cacheEnabled = config.recall.cacheEnabled && timeRange === null;
+    // a cached row would serve a stale window within the TTL. A window
+    // the QUERY declared (`since:24h`) is the same hazard from the other
+    // direction: its resolved signature is in the plan hash, so every
+    // call keys differently, never hits, and writes one more row that can
+    // never be served. Both forms are excluded by the one condition.
+    const cacheEnabled =
+      config.recall.cacheEnabled && timeRange === null && temporalIntent === null;
     const ttlMs = config.recall.cacheTtlSeconds * 1000;
     let cacheKey: string | null = null;
     let generation = "";
@@ -365,7 +415,14 @@ export async function search(
         maxTerms: config.recall.synonymMaxTerms,
       });
       if (expandedTerms.length > 0) {
-        plan = buildQueryPlan(keywordQuery, expandedTerms, structured?.intent, surfaceVocabulary);
+        plan = buildQueryPlan(
+          keywordQuery,
+          expandedTerms,
+          structured?.intent,
+          surfaceVocabulary,
+          nowMs,
+          temporalIntent,
+        );
         kwOutcome = runFtsQueryDetailed(store, keywordQuery, {
           limit: limit * config.recall.poolMultiplier,
           pathPrefix,
@@ -526,6 +583,15 @@ export async function search(
       validityWindowCache.set(path, window);
       return window;
     };
+    // Declared EVENT time for a path (unix ms), or null when the page
+    // declares none: validity start, else validity end. The single
+    // definition of "event time, storage time only as fallback" shared by
+    // the temporal bridge and the query-side temporal layer.
+    const declaredEventTimeMs = (path: string): number | null => {
+      const window = validityWindowFor(path);
+      if (window === null || window.invalid) return null;
+      return window.validFromMs ?? window.validUntilMs;
+    };
 
     // Self-correcting two-pass recall (t_ef92dfdc): a zero-candidate
     // first pass in evidence-pack mode means the implicit-AND keyword
@@ -596,10 +662,10 @@ export async function search(
         });
       }
       const poolCoverage = coverageOverChunks(store, query, coverageIds);
-      const plan = planTargetedRetry(poolCoverage);
-      if (plan.fire) {
-        const targeted = runFtsQueryDetailed(store, plan.terms[0]!, {
-          expandedTerms: plan.terms.slice(1),
+      const retryPlan = planTargetedRetry(poolCoverage);
+      if (retryPlan.fire) {
+        const targeted = runFtsQueryDetailed(store, retryPlan.terms[0]!, {
+          expandedTerms: retryPlan.terms.slice(1),
           limit: semanticPoolSize(limit),
           pathPrefix: pathPrefix ?? null,
         });
@@ -615,9 +681,9 @@ export async function search(
           secondPass = Object.freeze({
             triggered: true,
             kind: "targeted",
-            reason: `partial coverage ${poolCoverage.idfWeightedCoverage.toFixed(2)} < ${COMPLETENESS_COMPLETE_THRESHOLD}; targeted retry on uncovered rare terms: ${plan.terms.join(", ")}`,
+            reason: `partial coverage ${poolCoverage.idfWeightedCoverage.toFixed(2)} < ${COMPLETENESS_COMPLETE_THRESHOLD}; targeted retry on uncovered rare terms: ${retryPlan.terms.join(", ")}`,
             added: newHits.length,
-            targetedTerms: plan.terms,
+            targetedTerms: retryPlan.terms,
           });
         }
       }
@@ -814,6 +880,24 @@ export async function search(
       }
     }
 
+    // Query-side temporal intent (t_58fc4720): hand the ranker the
+    // DECLARED event time of every candidate that states one, so the
+    // temporal layer judges a note by when it is about rather than by
+    // when it was last written. Candidates with no declaration are
+    // omitted and the ranker falls back to their mtime; with no window
+    // declared the map is never built at all.
+    let eventTimeMsByChunk: ReadonlyMap<number, number> | undefined;
+    if (temporalIntent !== null) {
+      const byChunk = new Map<number, number>();
+      for (const chunkId of idsList) {
+        const h = hydrated.get(chunkId);
+        if (h === undefined) continue;
+        const declared = declaredEventTimeMs(h.path);
+        if (declared !== null) byChunk.set(chunkId, declared);
+      }
+      if (byChunk.size > 0) eventTimeMsByChunk = byChunk;
+    }
+
     // When a property filter is active, overfetch the ranked
     // candidates so the post-filter result set still has a chance
     // of producing `limit` matching rows. Without this, the
@@ -905,6 +989,7 @@ export async function search(
           ...(trendByDoc !== undefined ? { trendByDoc } : {}),
           ...(reuseRateByChunk !== undefined ? { reuseRateByChunk } : {}),
           ...(relationalRankedChunkIds.length > 0 ? { relationalRankedChunkIds } : {}),
+          ...(eventTimeMsByChunk !== undefined ? { eventTimeMsByChunk } : {}),
         },
         {
           keywordWeight: opts.keywordWeight ?? config.keywordWeight,
@@ -920,6 +1005,7 @@ export async function search(
           ...(sessionFocus !== undefined ? { sessionFocus } : {}),
           fusionMode: config.fusionMode,
           rrfK: config.rrfK,
+          temporalIntent,
         },
       );
       const capHit = ranked.length >= rankCap;
@@ -947,10 +1033,8 @@ export async function search(
           ranked = applyTemporalBridge(ranked, {
             range: timeRange,
             eventTimeMs: (path) => {
-              const w = validityWindowFor(path);
-              if (w !== null && !w.invalid && (w.validFromMs !== null || w.validUntilMs !== null)) {
-                return w.validFromMs ?? w.validUntilMs!;
-              }
+              const declared = declaredEventTimeMs(path);
+              if (declared !== null) return declared;
               try {
                 return statSync(join(config.vault, path)).mtimeMs;
               } catch {
