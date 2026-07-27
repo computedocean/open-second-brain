@@ -59,7 +59,7 @@ import { appendLogEvent } from "./log.ts";
 import { acquireLockSync } from "./sync-lockfile.ts";
 import { isoSecond } from "./time.ts";
 import { BRAIN_LOG_EVENT_KIND, type DoctorIssue } from "./types.ts";
-import { normaliseWikilinkTarget } from "./wikilink.ts";
+import { isBrainArtifactId, normaliseWikilinkTarget } from "./wikilink.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 // ----- Diagnostics-signal model --------------------------------------------
@@ -370,6 +370,24 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         nextCommand: "o2b brain entity prune",
         autoRepairable: false,
       },
+      {
+        // A subtree the doctor could not enter, reported into the
+        // `uncertain` stream by every sweep that walks the store by
+        // hand. The CLI folds that stream into the codes it resolves
+        // exits for, so an unregistered code printed the finding and
+        // nothing after it - the dead end this release removes.
+        //
+        // The exit is the RE-READ, as with `skill-accept-locked`: no
+        // command changes a mode or a mount, and the one thing an
+        // operator needs after restoring access is the pass over the
+        // subtree that was skipped. Registering it here rather than
+        // spelling a sentence beside the notice is what keeps the
+        // structural command in one place.
+        code: "vault-walk-entry-skipped",
+        issueClass: "subtree the doctor could not read",
+        nextCommand: "o2b brain doctor",
+        autoRepairable: false,
+      },
       // --- Skill-accept transaction refusals (no-dead-ends, phase 3) ---
       // Both are states the accept transaction itself can leave an
       // operator in, and both used to refuse without naming a way out.
@@ -550,13 +568,11 @@ const DOCTOR_EVIDENCE_FIELD = "evidenced_by";
 const TARGET_SEP = "::";
 /** Raw frontmatter key for the derived evidence list. */
 const EVIDENCED_BY_KEY = "_evidenced_by";
-/** Brain-managed id prefixes: only these are pruned as orphaned. */
-const BRAIN_ID_RE = /^(pref|ret|sig)-/;
 
 function isBrokenBrainRef(raw: string, known: ReadonlySet<string>): string | null {
   const target = normaliseWikilinkTarget(raw);
   if (!target) return null;
-  if (!BRAIN_ID_RE.test(target)) return null; // external / non-Brain link: leave it
+  if (!isBrainArtifactId(target)) return null; // external / non-Brain link: leave it
   if (known.has(target)) return null;
   return target;
 }
@@ -624,7 +640,7 @@ const orphanedReferenceFixer: Fixer = {
       // The doctor reports every unresolvable basename; only Brain-managed
       // ids are this fixer's business. An external / non-Brain link is
       // left exactly where it is, as it always was.
-      if (!BRAIN_ID_RE.test(issue.target)) continue;
+      if (!isBrainArtifactId(issue.target)) continue;
       const rel = vaultRelative(issue.path, vault);
       items.push(
         issue.field === DOCTOR_EVIDENCE_FIELD

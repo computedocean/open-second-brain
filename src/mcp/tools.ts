@@ -22,17 +22,19 @@
  */
 
 import {
+  ConfigReadError,
   discoverConfig,
   redactMapping,
   resolveExposeHostPaths,
   vaultStoreReference,
 } from "../core/config.ts";
+import type { ConfigDiscovery } from "../core/types.ts";
 import { REMOVED_TOOLS } from "../core/removed-surfaces.ts";
 import { computeBrainStatus } from "../core/brain/status.ts";
 import { doctor } from "../core/doctor.ts";
 import { nextCommandField } from "../core/brain/next-step.ts";
 import { collectRuntimeNotices } from "../core/brain/runtime-notices.ts";
-import { isDir } from "../core/fs-utils.ts";
+import { probeVaultDirectory, type UnresolvedField } from "../core/vault-presence.ts";
 import { resolveVaultScope, walkVaultScope } from "../core/vault-scope/index.ts";
 import { BRAIN_TOOLS } from "./brain-tools.ts";
 import { SEARCH_TOOLS, buildSearchStatusBlock } from "./search-tools.ts";
@@ -78,30 +80,97 @@ function vaultRelpath(target: string, vault: string): string {
 }
 
 /**
+ * A field whose value could not be resolved, carrying the reason. Same
+ * shape `toolStatus` already degrades the `vault` block to when the vault
+ * scope cannot be resolved, and `buildSearchStatusBlock` its own: the
+ * failure is a value the consumer reads, never a key it has to notice is
+ * missing.
+ */
+
+function unresolved(err: Error): UnresolvedField {
+  return { error: err.message };
+}
+
+/**
  * The `vault_path` field for an MCP response. By default this is the
  * opaque, stable store reference (`vault://<hex>`) rather than the
  * absolute host path, since MCP responses land in model context. The
  * `expose_host_paths` config escape hatch restores the raw path for
  * operators whose tooling depends on it (D2).
+ *
+ * Both branches read the device-local config - the escape hatch is a
+ * config flag and the reference is keyed by a config-held secret - so an
+ * unreadable config leaves this field, and ONLY this field, unresolvable.
+ * It reports the reason rather than raising, because raising here took
+ * down whole diagnostic payloads on their very last field. Degrading to
+ * the raw host path instead would breach the redaction contract this
+ * function exists to enforce, so there is no value to fall back to.
  */
-function vaultPathField(ctx: ServerContext): string {
+function vaultPathField(ctx: ServerContext): string | UnresolvedField {
   const configPath = ctx.configPath ?? undefined;
-  return resolveExposeHostPaths(configPath)
-    ? ctx.vault
-    : vaultStoreReference(ctx.vault, configPath);
+  try {
+    return resolveExposeHostPaths(configPath)
+      ? ctx.vault
+      : vaultStoreReference(ctx.vault, configPath);
+  } catch (err) {
+    if (err instanceof ConfigReadError) return unresolved(err);
+    throw err;
+  }
 }
 
 // ── Tool implementations ────────────────────────────────────────────────────
 
+/**
+ * `discoverConfig`, or the reason it could not answer.
+ *
+ * `second_brain_status` exists to report what this install sees in its
+ * config, so a config it cannot read is the tool's SUBJECT, not a reason to
+ * fail: raising here cost the caller `config_path`, `config_exists`,
+ * `config_keys` and `config` - every field that answers the question - and
+ * returned an error naming nothing the operator could act on beyond what
+ * the payload would have said anyway.
+ */
+function discoverConfigOrReason(configPath: string | undefined): ConfigDiscovery | ConfigReadError {
+  try {
+    return discoverConfig(configPath);
+  } catch (err) {
+    if (err instanceof ConfigReadError) return err;
+    throw err;
+  }
+}
+
 async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> {
-  const discovery = discoverConfig(ctx.configPath ?? undefined);
-  const vaultExists = isDir(ctx.vault);
-  const configKeys = Object.keys(discovery.data).toSorted();
+  const discovered = discoverConfigOrReason(ctx.configPath ?? undefined);
+  const broken = discovered instanceof ConfigReadError ? discovered : null;
+  // `exists: true` on the broken branch is the whole point of the read
+  // split: the file IS there, and `false` would say this install was never
+  // configured. `config_keys` and `config` cannot be known, so they carry
+  // the reason rather than an empty list an agent would read as "no keys".
+  const discovery: ConfigDiscovery =
+    broken === null
+      ? (discovered as ConfigDiscovery)
+      : { path: broken.path, exists: true, data: {} };
+  // Three blocks below are gated on this answer, and on the UNEXAMINABLE
+  // branch each is built carrying the reason rather than skipped: an
+  // omitted block reads as the same confident negative the bare `false`
+  // did, which is precisely what the probe could not determine. The absent
+  // branch keeps omitting them, because there the omission IS the answer.
+  const { present: vaultExists, unexaminable } = probeVaultDirectory(ctx.vault);
+  const configKeys = broken === null ? Object.keys(discovery.data).toSorted() : unresolved(broken);
   // Safe to call on a vault that has no Brain layer yet — returns
   // `present: false` with zero counts.
-  const brain = vaultExists ? computeBrainStatus(ctx.vault) : null;
+  const brain = vaultExists ? computeBrainStatus(ctx.vault) : unexaminable;
+  // On the broken branch this gate is unresolvable, so the block is built
+  // rather than skipped: `buildSearchStatusBlock` resolves its own config
+  // and degrades to `{ exists: false, error }` naming the same file. A skip
+  // would have been the silent omission - a missing block reads as "search
+  // is off", which is exactly the answer the gate could not give.
   const searchDisabled = discovery.data["search_enabled"] === "false";
-  const search = vaultExists && !searchDisabled ? await buildSearchStatusBlock(ctx) : null;
+  const search = searchDisabled
+    ? null
+    : vaultExists
+      ? await buildSearchStatusBlock(ctx)
+      : unexaminable;
   // v0.10.9 — `vault` block exposes the shared exclusion policy plus
   // aggregate include/exclude counts. Per-path detail lives in the CLI
   // (`o2b vault status`); MCP payloads stay small.
@@ -113,7 +182,7 @@ async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> 
   // config blocks visible even when the vault scope cannot be
   // resolved. Catch and degrade to `{ error: "..." }` instead of
   // taking the whole `second_brain_status` payload down with it.
-  let vault: Record<string, unknown> | null = null;
+  let vault: Record<string, unknown> | UnresolvedField | null = unexaminable;
   if (vaultExists) {
     try {
       const scope = resolveVaultScope(ctx.vault);
@@ -135,9 +204,13 @@ async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> 
     config_path: String(discovery.path),
     config_exists: discovery.exists,
     config_keys: configKeys,
-    config: redactMapping(discovery.data),
+    config: broken === null ? redactMapping(discovery.data) : unresolved(broken),
     vault_path: vaultPathField(ctx),
-    vault_exists: vaultExists,
+    // `boolean | { error }`. Both answerable cases keep their exact literal
+    // - `true` when the directory is there, `false` when it is genuinely
+    // not - and the third value exists only for the case that previously
+    // impersonated the second.
+    vault_exists: unexaminable ?? vaultExists,
     ...(vault ? { vault } : {}),
     ...(brain ? { brain } : {}),
     ...(search ? { search } : {}),
@@ -148,7 +221,14 @@ async function toolQuery(
   ctx: ServerContext,
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  if (!isDir(ctx.vault)) {
+  // Refusing either way, but not with the same reason: an operator told
+  // their vault is missing goes and creates one, which is the wrong move
+  // when the directory is there behind a parent it cannot traverse.
+  const presence = probeVaultDirectory(ctx.vault);
+  if (presence.unexaminable !== null) {
+    throw new MCPError(INVALID_PARAMS, presence.unexaminable.error);
+  }
+  if (!presence.present) {
     throw new MCPError(INVALID_PARAMS, `vault directory missing: ${ctx.vault}`);
   }
   const pattern = coerceStr(args, "pattern", false);

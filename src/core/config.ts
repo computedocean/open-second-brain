@@ -7,7 +7,7 @@
  * via parallel suites in tests/core/config.test.ts.
  */
 
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, type Stats } from "node:fs";
 import { createHmac, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -15,7 +15,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 
 import { atomicWriteFileSync } from "./fs-atomic.ts";
-import { isFile } from "./fs-utils.ts";
 import { resolveActiveProfileVault } from "./brain/portability/profiles.ts";
 import { resolvePointerVault } from "./brain/portability/pointer.ts";
 import {
@@ -58,6 +57,43 @@ export class UnsupportedPlatformError extends Error {
     );
     this.name = "UnsupportedPlatformError";
     this.platform = platform;
+  }
+}
+
+/**
+ * Raised when the plugin config file is PRESENT but its contents cannot be
+ * obtained: a directory (or any non-regular file) where the file should be,
+ * a path that cannot be stat'ed at all (an untraversable parent, a symlink
+ * loop), a file that cannot be opened, or bytes that are not UTF-8.
+ *
+ * Named and specific for the same reason {@link UnsupportedPlatformError}
+ * is: the alternative - reporting the file as absent - is a
+ * plausible-looking answer to a question this module cannot answer. Absent
+ * means "no operator settings, defaults apply"; every gate resolved from
+ * this file is default-OFF, so absorbing an unreadable file turns the
+ * operator's flags off and leaves the install indistinguishable from one
+ * that never set them.
+ */
+export class ConfigReadError extends Error {
+  /** The config file that could not be read. */
+  readonly path: string;
+
+  constructor(path: string, reason: string) {
+    // The remedy rides in the message rather than in each reporting
+    // surface. This error escapes through four channels with nothing in
+    // common - the CLI dispatch, an MCP error envelope, a hook's stderr,
+    // and a subcommand that wraps it in its own prose - and a remedy
+    // rendered per surface would drift between them or be dropped by the
+    // wrappers. Long and instructive matches
+    // {@link UnsupportedPlatformError}, for the same reason: the whole
+    // value of a refusal is telling the operator what to do next.
+    super(
+      `failed to read plugin config ${path}: ${reason}. The file is present, so its ` +
+        "settings are NOT in force and are not read as absent; make it readable " +
+        `(chmod u+r "${path}") or set OPEN_SECOND_BRAIN_CONFIG to a readable config file.`,
+    );
+    this.name = "ConfigReadError";
+    this.path = path;
   }
 }
 
@@ -139,17 +175,97 @@ export function parseSimpleYaml(text: string): Record<string, string> {
   return data;
 }
 
-/** Read and parse the config file, or report it as missing. */
+/**
+ * Read and parse the config file, or report it as missing.
+ *
+ * TWO conditions, not one, and they are kept apart on purpose - the same
+ * split `Brain/_brain.yaml` makes in `brain/policy/load.ts`:
+ *
+ *   - ABSENT - nothing at this path. There are no operator settings to
+ *     contradict, so `exists: false` with no data is the correct answer and
+ *     every resolver above falls back to its documented default. This is
+ *     the common case on any install that has not run `o2b init`.
+ *   - PRESENT BUT UNREADABLE - a non-regular file (a directory in the
+ *     file's place), a path that cannot be stat'ed, a file that cannot be
+ *     opened, or bytes that are not UTF-8. The operator's settings exist
+ *     and are NOT the ones in force. Reporting that as absent turned every
+ *     default-OFF gate resolved from this file back to `false` and left the
+ *     install looking exactly like one that never set a flag;
+ *     {@link ConfigReadError} names the file instead.
+ *
+ * The parse itself has no third condition: {@link parseSimpleYaml} skips
+ * whatever it cannot represent (comments, blank lines, nested blocks), and
+ * that tolerance is deliberate parity with the legacy Python reader. That
+ * tolerance is about SHAPE, not encoding - see {@link readConfigText}.
+ */
 export function discoverConfig(path?: string): ConfigDiscovery {
   const resolved = path ?? defaultConfigPath();
-  if (!isFile(resolved)) {
+  const stat = statConfigPath(resolved);
+  if (stat === undefined) {
     return { path: resolved, exists: false, data: {} };
   }
+  // Ahead of the read rather than letting `readFileSync` raise `EISDIR`,
+  // because it also covers the paths a read cannot survive: a FIFO at the
+  // config path would block the process forever.
+  if (!stat.isFile()) {
+    throw new ConfigReadError(resolved, "path exists but is not a regular file");
+  }
+  return { path: resolved, exists: true, data: parseSimpleYaml(readConfigText(resolved)) };
+}
+
+/**
+ * Stat of the config path: `undefined` for a genuine absence, {@link Stats}
+ * otherwise, {@link ConfigReadError} when the answer is unknowable.
+ *
+ * This replaces an `existsSync` check, which is not the absent/broken split
+ * it looks like: it answers `false` for EVERY stat failure, so a perfectly
+ * readable config behind a directory lacking the execute bit (or under a
+ * symlink loop, or past a name-too-long component) reported as absent and
+ * silently reverted the operator's `vault` and every gate in the file to
+ * its default. Only ENOENT on this path is an absence; every other errno is
+ * a failure to read it.
+ *
+ * `throwIfNoEntry: false` is what makes that split free rather than a
+ * downgrade: it suppresses ENOENT alone and still raises every other errno,
+ * so the common absent case pays one syscall and constructs no error - the
+ * same cost `existsSync` had, since it is the same `stat`.
+ */
+function statConfigPath(resolved: string): Stats | undefined {
   try {
-    const text = readFileSync(resolved, "utf8");
-    return { path: resolved, exists: true, data: parseSimpleYaml(text) };
-  } catch {
-    return { path: resolved, exists: false, data: {} };
+    return statSync(resolved, { throwIfNoEntry: false });
+  } catch (err) {
+    throw new ConfigReadError(resolved, (err as Error).message ?? String(err));
+  }
+}
+
+/**
+ * Decoded contents of a config file that is known to be a regular file, or
+ * a {@link ConfigReadError}.
+ *
+ * The decode is FATAL, so bytes that are not UTF-8 are the present-but-
+ * unreadable condition rather than a lossy parse. `parseSimpleYaml` is
+ * tolerant about the SHAPE of a line - that is deliberate parity with the
+ * legacy Python reader - but nothing about it licenses accepting bytes we
+ * cannot represent: a lossy decode drops whichever keys the undecodable
+ * run straddles, which is the same silent revert-to-default as reading the
+ * file as absent. It is also destructive, because {@link setConfigValue}
+ * merges onto what this returns and would persist the operator's file with
+ * every undecodable byte replaced.
+ */
+function readConfigText(resolved: string): string {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(resolved);
+  } catch (err) {
+    throw new ConfigReadError(resolved, (err as Error).message ?? String(err));
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (err) {
+    throw new ConfigReadError(
+      resolved,
+      `not valid UTF-8: ${(err as Error).message ?? String(err)}`,
+    );
   }
 }
 
@@ -271,6 +387,26 @@ export function resolveAgentName(configPath?: string): string {
  * hand-edited value self-heals to a fresh generated id; the
  * `sync-conflict` prefix is reserved so a renamed Syncthing conflict
  * copy can never masquerade as a shard.
+ *
+ * ## A config that cannot be READ is a refusal, deliberately
+ *
+ * {@link resolveDeviceId} and {@link resolveInstallationSecret} tolerate a
+ * config directory they cannot LOCK - the lock only orders a race, and
+ * losing it costs at most a duplicate generation. They do NOT tolerate a
+ * config they cannot READ, and {@link ConfigReadError} propagates out of
+ * both. The self-heal is the reason: a miss means generate-and-persist,
+ * an unreadable file is not a miss, and treating it as one is destructive
+ * twice over. {@link setConfigValue} merges onto what it read, so writing
+ * a generated id through it would flatten the operator's whole config to
+ * that single line; and the value itself is load-bearing - a fresh device
+ * id silently re-shards this device's log, a fresh installation secret
+ * silently changes every `vault://` reference agents correlate by. There
+ * is no neutral answer to fall back to, so the file is named instead.
+ *
+ * The env overrides are the escape hatch that makes the refusal
+ * survivable: `O2B_DEVICE_ID` (and, for tests,
+ * {@link INSTALLATION_SECRET_ENV_KEY}) are honoured before the file is
+ * opened at all.
  */
 export const DEVICE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
@@ -295,12 +431,15 @@ export function resolveDeviceId(configPath?: string): string {
   const existing = read();
   if (existing !== null) return existing;
 
-  // First-use generation. Two processes racing here could each persist
-  // a different id and split one device's logs across two shards, so
-  // the read-generate-write sequence holds a directory lock (same
-  // bounded-retry shape as the log writer's `acquireLogLock`). A
-  // lock failure (read-only config home, exotic fs) falls through to
-  // the unlocked path - identity resolution must never fail.
+  // First-use generation, reached only because the config was READ and
+  // holds no usable id (see the identity docblock above for why an
+  // unreadable one never gets here). Two processes racing could each persist a different
+  // id and split one device's logs across two shards, so the
+  // read-generate-write sequence holds a directory lock (same
+  // bounded-retry shape as the log writer's `acquireLogLock`). A lock
+  // failure (read-only config home, exotic fs) falls through to the
+  // unlocked path - losing the lock costs at most a duplicate generation,
+  // which is not worth failing over.
   const dir = dirname(resolved);
   mkdirSync(dir, { recursive: true });
   let release: (() => void) | undefined;
@@ -381,9 +520,9 @@ export function resolveInstallationSecret(configPath?: string): string {
   const existing = read();
   if (existing !== null) return existing;
 
-  // First-use generation under a directory lock, mirroring resolveDeviceId:
-  // a lock failure falls through to the unlocked path so secret resolution
-  // never fails outright.
+  // First-use generation under a directory lock, mirroring resolveDeviceId
+  // in both halves: a lock failure falls through to the unlocked path,
+  // while a config that could not be READ never reaches here at all.
   const dir = dirname(resolved);
   mkdirSync(dir, { recursive: true });
   let release: (() => void) | undefined;
@@ -421,6 +560,13 @@ const VAULT_STORE_REF_HEX_LEN = 32;
  * negligible. It is stable across calls on the same install (agents correlate
  * by it) and never leaks the raw path. Returned by MCP tools in place of the
  * absolute path unless {@link resolveExposeHostPaths} is on.
+ *
+ * @throws {@link ConfigReadError} when the device-local config holding the
+ *   key cannot be read. Propagated, not absorbed: the only fallbacks would
+ *   be a fresh key (breaking the stability every consumer correlates by) or
+ *   the raw host path (the leak this function exists to prevent). Callers
+ *   that render a payload report the condition in the field - see
+ *   `vaultPathField` in `src/mcp/tools.ts`.
  */
 export function vaultStoreReference(vaultPath: string, configPath?: string): string {
   const key = resolveInstallationSecret(configPath);
