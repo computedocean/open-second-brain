@@ -11,11 +11,23 @@ import { mineCommitDecisions } from "../../../core/brain/git/decisions.ts";
 import { GitIngestError, ingestGitHistory } from "../../../core/brain/git/ingest.ts";
 import { listGitCommits, listGitRepos, listGitTags } from "../../../core/brain/git/store.ts";
 import type { GitCommitFilter, GitCommitRecord } from "../../../core/brain/git/store.ts";
+import { nextCommandField } from "../../../core/brain/next-step.ts";
+import { emitNextStep, type AdvisoryStream } from "../../advisory-rail.ts";
 import { brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
 
 const USAGE = "usage: o2b brain git <ingest|status|find|mine> [args] [--vault V] [--json]";
 
 const FIND_DEFAULT_LIMIT = 20;
+
+/**
+ * Advisory stream for this verb (no-dead-ends, task 5). Two subverbs
+ * reach the same "nothing ingested yet" state, and both used to carry
+ * their own `(run: o2b brain git ingest <repo-path>)` parenthetical
+ * inside the status line. One registry code, one rail, one shape.
+ */
+function gitAdvisoryStream(argv: ReadonlyArray<string>, jsonRequested: boolean): AdvisoryStream {
+  return { command: "brain", argv, jsonRequested };
+}
 
 export async function cmdBrainGit(argv: string[]): Promise<number> {
   const action = argv[0];
@@ -53,11 +65,17 @@ async function cmdMine(argv: string[]): Promise<number> {
           skipped_existing: res.skippedExisting,
           notes: res.notes,
         })),
+        // no-dead-ends, phase 3: the rail returns the resolved step when
+        // it suppresses the line; this payload carries it.
+        ...(results.length === 0 ? nextCommandField("git-history-absent") : {}),
       });
       return 0;
     }
     if (results.length === 0) {
-      ok("no git history ingested yet (run: o2b brain git ingest <repo-path>)");
+      ok("no git history ingested yet");
+      // The `--json` branch above returned, so this stream is provably
+      // a human one.
+      emitNextStep("git-history-absent", gitAdvisoryStream(argv, false));
       return 0;
     }
     for (const res of results) {
@@ -135,11 +153,17 @@ async function cmdStatus(argv: string[]): Promise<number> {
       tags: listGitTags(vault, entry.key).length,
     }));
     if (flags["json"] === true) {
-      okJson({ ok: true, repos });
+      okJson({
+        ok: true,
+        repos,
+        ...(repos.length === 0 ? nextCommandField("git-history-absent") : {}),
+      });
       return 0;
     }
     if (repos.length === 0) {
-      ok("no git history ingested yet (run: o2b brain git ingest <repo-path>)");
+      ok("no git history ingested yet");
+      // The `--json` branch above returned; this stream is human.
+      emitNextStep("git-history-absent", gitAdvisoryStream(argv, false));
       return 0;
     }
     for (const repo of repos) {

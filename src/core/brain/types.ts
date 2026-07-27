@@ -1081,6 +1081,18 @@ export interface ProceduralMemoryEntry {
    */
   readonly successCount: number;
   readonly failureCount: number;
+  /**
+   * Execution contract read back from the procedure's frontmatter
+   * (no-dead-ends, Unit I). Written by the skill-proposal accept path and
+   * surfaced here so the four fields are a contract a caller can act on
+   * rather than decoration on a file nobody parses. Same shape and reader
+   * as {@link ProceduralMemoryEntry.triggers}: absent frontmatter reads as
+   * an empty list, so a pre-contract vault is unaffected.
+   */
+  readonly prerequisites: ReadonlyArray<string>;
+  readonly rollback: ReadonlyArray<string>;
+  readonly sideEffects: ReadonlyArray<string>;
+  readonly verification: ReadonlyArray<string>;
 }
 
 // ----- Configuration (`Brain/_brain.yaml`) ----------------------------------
@@ -1747,6 +1759,25 @@ export interface DoctorIssue {
   readonly path?: string;
   /** Human-readable description, suitable for `--text` rendering. */
   readonly message: string;
+  /**
+   * Frontmatter field the broken reference sits in (`broken-wikilink`).
+   *
+   * no-dead-ends, task 12. The field name and the target below used to
+   * exist only inside `message`, so an applier deciding prune-versus-
+   * review had to regex the sentence - which is how a detector and an
+   * applier come to disagree about what was detected. Both are optional
+   * because only the link codes carry them; every other issue is
+   * byte-identical to what it was.
+   */
+  readonly field?: string;
+  /** Wikilink target that resolves to nothing (`broken-wikilink`, `broken-backlinks`). */
+  readonly target?: string;
+  /**
+   * Basenames of the artifacts that reference {@link target}
+   * (`broken-backlinks`). The dangling target has no file, so the issue
+   * carries no `path`; these sources are what an operator can act on.
+   */
+  readonly sources?: ReadonlyArray<string>;
 }
 
 /**

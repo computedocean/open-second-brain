@@ -31,6 +31,8 @@ import { resolveSearchConfig } from "../../../core/search/index.ts";
 import { Store } from "../../../core/search/store.ts";
 import { SearchError } from "../../../core/search/types.ts";
 import { listVaultPages, parseFrontmatter } from "../../../core/vault.ts";
+import { emitNextStep, type AdvisoryStream } from "../../advisory-rail.ts";
+import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
 
 const USAGE =
@@ -66,6 +68,10 @@ export async function cmdBrainClusters(argv: string[]): Promise<number> {
     json: { type: "boolean" },
   });
   const asJson = flags["json"] === true;
+  // no-dead-ends, task 5: the fail-soft "no index" exit below shares its
+  // registry code with the identical branch in `bridges`, so the two
+  // cannot drift on what an operator is told to run.
+  const stream: AdvisoryStream = { command: "brain", argv, jsonRequested: asJson };
   const action = positional[0];
   if ((action !== "run" && action !== "list") || positional.length !== 1) {
     process.stderr.write(`${USAGE}\n`);
@@ -78,8 +84,12 @@ export async function cmdBrainClusters(argv: string[]): Promise<number> {
     if (action === "list") {
       const dir = join(vault, "Brain", "clusters");
       if (!existsSync(dir)) {
-        if (asJson) okJson({ clusters: [] });
-        else ok("no cluster notes yet - run: o2b brain clusters run");
+        if (asJson) okJson({ clusters: [], ...nextCommandField("cluster-notes-absent") });
+        else ok("no cluster notes yet");
+        // no-dead-ends, phase 3: this pointer was hand-written in the
+        // same file as a migrated one, so `list` printed `- run: ...`
+        // while `run` printed `next: ...`.
+        emitNextStep("cluster-notes-absent", stream);
         return 0;
       }
       const clusters = readdirSync(dir)
@@ -98,9 +108,18 @@ export async function cmdBrainClusters(argv: string[]): Promise<number> {
             : null;
         })
         .filter((c) => c !== null);
-      if (asJson) okJson({ clusters });
-      else if (clusters.length === 0) ok("no generated cluster notes");
-      else {
+      if (asJson) {
+        okJson({
+          clusters,
+          ...(clusters.length === 0 ? nextCommandField("cluster-notes-absent") : {}),
+        });
+      } else if (clusters.length === 0) {
+        // The directory exists but holds nothing this verb generated -
+        // the SAME state as the missing-directory branch above, which
+        // previously said nothing forward at all.
+        ok("no generated cluster notes");
+        emitNextStep("cluster-notes-absent", stream);
+      } else {
         for (const c of clusters) {
           ok(`${c.cluster}: ${c.size} notes, density ${c.density} (${c.path})`);
         }
@@ -154,8 +173,14 @@ export async function cmdBrainClusters(argv: string[]): Promise<number> {
         exc instanceof SearchError &&
         (exc.code === "INDEX_MISSING" || exc.code === "SCHEMA_MISMATCH")
       ) {
-        if (asJson) okJson({ communities: 0, reason: "index not built" });
-        else ok("clusters run: search index not initialised - run: o2b search index");
+        if (asJson) {
+          okJson({
+            communities: 0,
+            reason: "index not built",
+            ...nextCommandField("search-index-missing"),
+          });
+        } else ok("clusters run: search index not initialised");
+        emitNextStep("search-index-missing", stream);
         return 0;
       }
       throw exc;

@@ -8,7 +8,67 @@ import {
   planRemediation,
 } from "../../../core/brain/health/remediation.ts";
 import { loadBrainConfigDetailed, resolveHealth } from "../../../core/brain/policy.ts";
-import { brainVerbContext, fail, ok, parse, resolveBrainAgent, usageError } from "../helpers.ts";
+import { nextCommandField } from "../../../core/brain/next-step.ts";
+import { NO_EXIT_KEY, noExitReasons } from "../../../core/brain/doctor-exits.ts";
+import type { DoctorIssue } from "../../../core/brain/types.ts";
+import { advisoryIsLegal, emitNextSteps, type AdvisoryStream } from "../../advisory-rail.ts";
+import {
+  brainVerbContext,
+  fail,
+  info,
+  ok,
+  parse,
+  resolveBrainAgent,
+  usageError,
+} from "../helpers.ts";
+
+/**
+ * One reported issue, machine-readable: the record the doctor produced
+ * plus the structural next command when its code is registered.
+ *
+ * The key is spread LAST so the pre-existing field order is untouched
+ * and an unregistered code produces byte-identical JSON. The builder is
+ * shared with the `brain_doctor` MCP tool through `nextCommandField`, so
+ * the two surfaces cannot disagree on the spelling or on which codes
+ * resolve.
+ */
+function withNextCommand<T extends Pick<DoctorIssue, "code">>(issue: T): Record<string, unknown> {
+  return { ...issue, ...nextCommandField(issue.code) };
+}
+
+/**
+ * One reported issue, human-readable. `label` carries its own trailing
+ * padding because the three streams have never been column-aligned and
+ * this task does not change a byte of what they print; the renderer
+ * exists so the three call sites stop repeating the same template.
+ */
+function renderIssueLine(
+  label: string,
+  issue: Pick<DoctorIssue, "code" | "message"> & { readonly path?: string },
+): string {
+  return `${label} ${issue.code}: ${issue.message}${issue.path ? ` (${issue.path})` : ""}\n`;
+}
+
+/**
+ * The other half of the rail's answer: why a reported code named no
+ * command.
+ *
+ * `emitNextSteps` prints one line per exit and nothing for a code with
+ * none, which left two different situations looking identical - a class
+ * no single command resolves, and a class nobody has registered yet.
+ * `doctor-exits.ts` publishes the first as a written reason, and this
+ * prints it once per code, after the exits.
+ *
+ * It follows the rail's own stream discipline rather than deciding for
+ * itself: on a machine stream the reasons ride in the payload instead.
+ * The limit, stated: only codes the table publishes produce a line, so a
+ * code forwarded into `uncertain` from another module's vocabulary stays
+ * as quiet as it was - those are classified in `applier-capability.ts`.
+ */
+function explainMissingExits(codes: Iterable<string>, stream: AdvisoryStream): void {
+  if (!advisoryIsLegal(stream)) return;
+  for (const [code, reason] of noExitReasons(codes)) info(`no exit: ${code} - ${reason}`);
+}
 
 export async function cmdBrainDoctor(argv: string[]): Promise<number> {
   const { flags } = parse(argv, {
@@ -60,13 +120,24 @@ export async function cmdBrainDoctor(argv: string[]): Promise<number> {
     return fail(`doctor failed: ${(exc as Error).message ?? exc}`);
   }
 
+  // Where an advisory line may legally go. `brain` renders its own JSON,
+  // so under `--json` the rail suppresses every line and the pointer
+  // travels as a payload field instead. The verb never decides this for
+  // itself - see `advisory-rail.ts`.
+  const stream: AdvisoryStream = {
+    command: "brain",
+    argv,
+    jsonRequested: Boolean(flags["json"]),
+  };
+
   if (flags["remediate"]) {
     // Never auto-repair a vault that has structural errors - those need
     // an operator, and remediation assumes a parseable tree.
     if (result.errors.length > 0) {
-      for (const e of result.errors) {
-        process.stdout.write(`[ERROR] ${e.code}: ${e.message}${e.path ? ` (${e.path})` : ""}\n`);
-      }
+      for (const e of result.errors) process.stdout.write(renderIssueLine("[ERROR]", e));
+      const errorCodes = result.errors.map((e) => e.code);
+      emitNextSteps(errorCodes, stream);
+      explainMissingExits(errorCodes, stream);
       return fail("doctor found errors; remediation aborted");
     }
     try {
@@ -85,29 +156,52 @@ export async function cmdBrainDoctor(argv: string[]): Promise<number> {
   // field into a broken build.
   const uncertain = result.uncertain ?? [];
 
+  // Every code the three streams reported, in the order an operator reads
+  // them. Feeds both the rail and the explanation of what the rail could
+  // not name, so the two can never disagree about which codes have an exit.
+  const reportedCodes = [...result.errors, ...result.warnings, ...uncertain].map(
+    (issue) => issue.code,
+  );
+  // Published reasons for the reported codes that resolve to no command.
+  // Empty - hence the key absent, hence byte-identical output - whenever
+  // every reported code has an exit, and on a clean vault.
+  const noExit = noExitReasons(reportedCodes);
+
   if (flags["json"]) {
     process.stdout.write(
       JSON.stringify(
         {
-          warnings: result.warnings,
-          errors: result.errors,
-          ...(uncertain.length > 0 ? { uncertain } : {}),
+          warnings: result.warnings.map(withNextCommand),
+          errors: result.errors.map(withNextCommand),
+          ...(uncertain.length > 0 ? { uncertain: uncertain.map(withNextCommand) } : {}),
+          // Beside the streams, once per code, rather than repeated on
+          // every issue record: a reason is about a CLASS, unlike a next
+          // command, and two hundred malformed timestamps share one.
+          ...(noExit.size > 0 ? { [NO_EXIT_KEY]: Object.fromEntries(noExit) } : {}),
         },
         null,
         2,
       ) + "\n",
     );
   } else {
-    for (const e of result.errors)
-      process.stdout.write(`[ERROR] ${e.code}: ${e.message}${e.path ? ` (${e.path})` : ""}\n`);
-    for (const w of result.warnings)
-      process.stdout.write(`[WARN]  ${w.code}: ${w.message}${w.path ? ` (${w.path})` : ""}\n`);
-    for (const u of uncertain)
-      process.stdout.write(`[UNSURE] ${u.code}: ${u.message}${u.path ? ` (${u.path})` : ""}\n`);
+    for (const e of result.errors) process.stdout.write(renderIssueLine("[ERROR]", e));
+    for (const w of result.warnings) process.stdout.write(renderIssueLine("[WARN] ", w));
+    for (const u of uncertain) process.stdout.write(renderIssueLine("[UNSURE]", u));
     if (result.errors.length === 0 && result.warnings.length === 0 && uncertain.length === 0) {
       ok("brain doctor: clean");
     }
   }
+
+  // no-dead-ends, task 4: the exits, after the diagnosis. Errors first,
+  // then warnings, then the uncertain stream - the order an operator
+  // reads them in. The rail prints nothing under `--json` (the pointer
+  // rode out as `next_command` above) and nothing for a code with no
+  // registered signal.
+  emitNextSteps(reportedCodes, stream);
+  // ...and, after them, why the codes that named none have none. Without
+  // this a finding with no exit and a finding whose exit nobody
+  // registered read identically.
+  explainMissingExits(reportedCodes, stream);
 
   if (result.errors.length > 0) return 1;
   if (result.warnings.length > 0 && flags["strict"]) return 2;

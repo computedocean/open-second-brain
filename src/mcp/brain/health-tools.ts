@@ -10,10 +10,40 @@ import { resolveSearchConfig } from "../../core/search/index.ts";
 import { collectMaintenanceActions } from "../../core/brain/maintenance/collect.ts";
 import { runDoctor } from "../../core/brain/doctor.ts";
 import { applyRepair } from "../../core/brain/diagnostics.ts";
+import { nextCommandField } from "../../core/brain/next-step.ts";
+import { NO_EXIT_KEY, noExitReasons } from "../../core/brain/doctor-exits.ts";
 import { buildOperatorSnapshot } from "../../core/brain/operator-snapshot.ts";
+import type { DoctorIssue } from "../../core/brain/types.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { coerceBool, coerceFormat } from "../coerce.ts";
 import { vaultRelativeSafe } from "./shared.ts";
+
+/**
+ * One reported issue, as an MCP caller sees it.
+ *
+ * The projection is an explicit allowlist rather than a spread of the
+ * record, so a field added to `DoctorIssue` reaches this surface only
+ * when it is listed. `field` / `target` / `sources` (no-dead-ends, task
+ * 12) are listed for exactly that reason - the CLI's `--json` renderer
+ * carries them by spreading the record, and the two surfaces must not
+ * disagree about what a broken-link finding contains.
+ *
+ * Every added key is conditional on the value being present, so an issue
+ * that carries none of them produces the byte-identical payload it did
+ * before they existed.
+ */
+function issueView(ctx: ServerContext, issue: DoctorIssue): Record<string, unknown> {
+  return {
+    severity: issue.severity,
+    code: issue.code,
+    message: issue.message,
+    ...(issue.path !== undefined ? { path: vaultRelativeSafe(ctx.vault, issue.path) } : {}),
+    ...(issue.field !== undefined ? { field: issue.field } : {}),
+    ...(issue.target !== undefined ? { target: issue.target } : {}),
+    ...(issue.sources !== undefined ? { sources: issue.sources } : {}),
+    ...nextCommandField(issue.code),
+  };
+}
 
 async function toolBrainDoctor(
   ctx: ServerContext,
@@ -53,22 +83,26 @@ async function toolBrainDoctor(
   // to false. Errors always do.
   const ok = result.errors.length === 0 && (!strict || result.warnings.length === 0);
 
+  // Why a reported code carries no `next_command`. Without it the field's
+  // absence has two readings - a class no single command resolves, and a
+  // class nobody has registered - and an agent cannot tell them apart.
+  // Resolved through the same table the CLI renderer reads.
+  const noExit = noExitReasons(
+    [...result.errors, ...result.warnings, ...(result.uncertain ?? [])].map((i) => i.code),
+  );
+
   return {
     format,
     ok,
     strict,
-    errors: result.errors.map((i) => ({
-      severity: i.severity,
-      code: i.code,
-      message: i.message,
-      ...(i.path !== undefined ? { path: vaultRelativeSafe(ctx.vault, i.path) } : {}),
-    })),
-    warnings: result.warnings.map((i) => ({
-      severity: i.severity,
-      code: i.code,
-      message: i.message,
-      ...(i.path !== undefined ? { path: vaultRelativeSafe(ctx.vault, i.path) } : {}),
-    })),
+    // no-dead-ends, task 4: `next_command` is the structural CLI string
+    // the diagnostics registry holds for this code, resolved through the
+    // same `nextCommandField` the `o2b brain doctor --json` renderer
+    // uses so the two surfaces cannot drift. Absent - not null - for a
+    // code with no registered signal, because there is no honest command
+    // to name and a generic one would be invented.
+    errors: result.errors.map((i) => issueView(ctx, i)),
+    warnings: result.warnings.map((i) => issueView(ctx, i)),
     // v0.10.15: ranked maintenance actions surfaced as a parallel
     // signal to errors/warnings. The list is independent of `strict`
     // because nothing here downgrades the `ok` flag - actions are
@@ -109,9 +143,15 @@ async function toolBrainDoctor(
             code: u.code,
             ...(u.path !== undefined ? { path: vaultRelativeSafe(ctx.vault, u.path) } : {}),
             message: u.message,
+            ...nextCommandField(u.code),
           })),
         }
       : {}),
+    // Once per code, beside the streams rather than on every issue: a
+    // reason is about a CLASS, unlike a next command, and two hundred
+    // malformed timestamps share one. Absent when every reported code has
+    // an exit, so a clean payload is byte-identical to the pre-task shape.
+    ...(noExit.size > 0 ? { [NO_EXIT_KEY]: Object.fromEntries(noExit) } : {}),
   };
 }
 

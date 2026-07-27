@@ -105,7 +105,19 @@ o2b brain context-pack        Bounded-token vault slice for priming an agent's c
 o2b brain synthesise          Concept-scoped JSON envelope: target node + linkers + optional unlinked mentions
 o2b brain moc-audit           Per-MOC coverage audit: classify cluster members into well-covered / fragile / candidate-missing
 o2b brain unlinked            Raw-text mentions outside `[[...]]` (Unicode-aware boundaries)
+o2b brain skill-proposals recover [--discard-unreadable]
+                              Resolve accept sequences a crash abandoned, rolling each back to its pending draft or forward to rebuilt projections. Refuses by name, naming the exact file, on a held `Brain/skill-proposals/accept.lock` (nothing breaks a lock - a live writer cannot be told from a crashed one) and on an accept-journal marker that cannot be parsed; `--discard-unreadable` removes those markers, which unblocks accepting without claiming the sequence each marked was resolved
 ```
+
+Recovery is a vault-wide sweep, not a per-slug one: `recover` - and every
+`accept`, which runs the same sweep first - resolves EVERY outstanding
+journal it finds, so accepting one proposal can roll another slug's
+abandoned sequence back. That is deliberate. The sweep and the accept
+share one vault-wide lock, which is what makes it safe, and leaving a
+crashed sequence unresolved would let the next accept build on a
+duplicate. It writes only under `Brain/skill-proposals/` and
+`Brain/procedures/`, and only files the abandoned sequence itself
+created - the journal records whether each target pre-existed.
 
 ### Context continuity and receipts (since v0.29.0)
 
@@ -454,6 +466,8 @@ exits 2 on an un-initialized vault where it previously exited 0.
 
 ```text
 o2b brain dream               [run] [--dry-run] | stage | validate <run-id> | apply <run-id> | discard <run-id> | list - staged lifecycle over a persisted proposal bundle; validate/apply exit 1 on drift
+o2b brain dream --step S      run ONE independently-runnable step instead of the full pass: `scan` (pure read) or `heal-enrich` (asking for it is the opt-in, so the config gate is not consulted). Any other token - including a dream reporting phase - exits 2 with the specific reason that step cannot run alone and the runnable set. Returns a partial result marked `partial: true`, never a run summary. Mirrors MCP `brain_dream` `step`
+o2b brain dream --gate N=V    override one phase gate for THIS RUN ONLY (`--gate heal_enrich=true|false`); repeatable, never written back to `Brain/_brain.yaml`, so a targeted pass needs no config edit and no revert. An unknown gate or a non-boolean value exits 2 naming the known gates. Mirrors MCP `brain_dream` `gates: {heal_enrich: bool}`
 o2b brain doctor              gains the removed-tool-reference warning: vault notes, root instruction files, and installed skills naming a tool removed in 1.0.0 are flagged with the replacement
 o2b brain doctor              opt-in `entity-alias-candidate` lint (off by default): with `entity_semantic_dedup_enabled: true` surfaces lexical entity-name variants ("Google LLC" vs "Google Inc") as PROPOSAL-ONLY alias-merge candidates via a deterministic jaccard layer (`entity_semantic_dedup_lexical_threshold`, default 0.8); never auto-merges or rewrites the identity key. The embedding-cosine layer (`entity_semantic_dedup_threshold`, default 0.92, reuses the configured embedding provider) is exposed as a library reader for apply plans
 o2b brain daily | weekly | monthly | morning-brief | timeline
@@ -461,6 +475,14 @@ o2b brain daily | weekly | monthly | morning-brief | timeline
 o2b brain digest | daily | weekly
                               with report_snapshots_enabled persist Brain/reports/<surface>/<date>.json and report a deterministic Since-last-run delta
 ```
+
+### Forward pointers (`next:` / `next_command`)
+
+A verb that succeeds and leaves the caller with somewhere to go names that place through one mechanism. On a human stream it prints one `next: <command>` line; under `--json` the same command arrives as an additive `next_command` string field in the payload, and the key is **absent** whenever no exit resolves. The command is always a structural `o2b` invocation resolved from the diagnostics registry - never prose - so a caller can execute it verbatim.
+
+Verbs that carry it today: `o2b status`, `o2b brain init`, `bridges list|discover`, `clusters list|run`, `dream list`, `git status|mine`, `inbox-drain`, `intention list`, `intent-review`, `tune status`, `o2b search index|reindex|status`. `o2b brain tiers check` deliberately carries none under `--json`: that state has two exits (restore or accept), the wire key is singular, and naming one would tell a machine caller the other does not exist.
+
+**When there is no command.** About two thirds of the doctor's issue codes resolve to none, because the repair is a judgement over content or an edit whose target shape the finding cannot supply. Those are not silent: `o2b brain doctor` prints `no exit: <code> - <reason>` once per reported code, and `--json` (and MCP `brain_doctor`) carries the same reasons in an additive `no_exit` object beside the issue streams - once per code rather than repeated on each record, because a reason is about a class. Every doctor code is one or the other; `tests/core/brain/doctor-exit-census.test.ts` enumerates them from the detector and fails on a code that is neither, so an unregistered code can no longer mean "nobody got round to it". The key and the lines are absent whenever every reported code has an exit, and on a clean vault.
 
 Long-running operations (dream, `o2b search index | reindex`, bridges discover, clusters run, the maintenance lane) run under a cooperative safeguard deadline: `safeguard_timeout_seconds` (default 600, `0` disables, env `OPEN_SECOND_BRAIN_SAFEGUARD_TIMEOUT`) with per-operation overrides like `safeguard_timeout_dream_seconds`. A tripped deadline aborts at the next checkpoint - between atomic writes - and reports `{ok:false, timed_out:true}` on exit 1; maintenance-lane task results carry `timed_out` per task. The frozen-surface policy lives in `docs/stability.md`; the 0.x to 1.0.0 migration table in `docs/updating.md`.
 

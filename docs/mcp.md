@@ -43,7 +43,7 @@ flags for a narrower per-process full server.
 | `brain_agent_diff`          | Read-only comparison between source agents using browse/search/diff/map modes over the same provenance foundation.                             | —                                              |
 | `brain_audit`               | Read-only per-preference mutation trail (create / promote / update / retire / merge) with agent, reason, revision + content-hash before/after. | `pref_id`                                      |
 | `brain_brief`               | Read-only Brain summary for any window: `view: morning \| daily \| weekly \| monthly \| operator \| digest`.                                   | `view`                                         |
-| `brain_analytics`           | Read-only Brain analytics for any lens: `view: timeline \| attention_flows \| belief_evolution \| concept_synthesis`.                          | `view`                                         |
+| `brain_analytics`           | Read-only Brain analytics for any lens: `view: timeline \| attention_flows \| belief_evolution \| concept_synthesis \| dedup`. `view=dedup` summarises the persisted exact-hash ingest dedup records into a trend plus a per-source re-ingest ranking; every count is an exact sha-256 drop, never a semantic figure (the semantic detectors nominate merge candidates and never drop). | `view`                                         |
 | `brain_search`              | Read-only vault search with optional structured query lanes, explicit focus hints, time ranges, evidence-pack diagnostics, and a selectable recall `profile` (`fast \| balanced \| thorough`). | `query`                                        |
 | `brain_recall_feedback`     | Record explicit up/down recall feedback for one search result; feeds the deterministic learned-weight fold.                                     | `query`, `result_path`, `verdict`              |
 | `brain_recall_gate`         | Read-only classifier for whether an automatic recall attempt should run; returns `retrieve` plus a stable reason. When the caller passes `scores`, also attaches an adequacy verdict (`sufficient` \| `weak` \| `insufficient`), a recommended action (`proceed` \| `re_recall` \| `abstain`), and an optional `escalate` flag over the gate-telemetry relevance scores plus the epistemic mix; thresholds via `recall_adequacy_sufficient` / `recall_adequacy_weak` / `recall_adequacy_min_results`.                              | `prompt`                                       |
@@ -138,7 +138,15 @@ deterministic media/base64 sanitization. `brain_session_grep`,
 recall DAG populated by CLI `import-session --recall` or the core API.
 `brain_session_summary` accepts `operation: "write"|"get"|"list"` (write takes
 `session_id` plus any of `request`, `decisions`, `learnings`, `next_steps`,
-`source_turn_ids`, `host`). `brain_idea_lineage` accepts `id` and optional
+`source_turn_ids`, `host`, `project_scope`). `project_scope` is the same
+project axis `brain_search` filters on, normalized to the same `[a-z0-9-]` slug:
+on `write` it files the digest under that project and folds it into the dedupe
+key, so the same content under two projects is two digests; on `list` it returns
+only that project's digests. Omitted, the digest and its dedupe key are
+byte-identical to the pre-project shape. A value with no alphanumeric is an
+`INVALID_PARAMS` error naming the argument, never a silent drop to unscoped.
+This is unrelated to the `o2b brain project` verb, which links a code directory
+to its owning vault at the configuration level. `brain_idea_lineage` accepts `id` and optional
 `max_depth`. `brain_note_history` accepts `path` and optional `gap_hours` /
 `max_count`.
 `brain_recall_gate` accepts optional `previous_prompt` and
@@ -607,3 +615,39 @@ Both servers reuse the same backing CLI (`o2b mcp --scope writer` vs the default
   reason when a cached pack is refused because the vault state it was
   built from has moved or its validity window has expired, instead of
   silently serving or silently rebuilding.
+- Since v1.40.0 `brain_doctor` additively carries `next_command` on each
+  reported issue whose code has a registered exit, and a `no_exit` object
+  giving, once per code, the reason a class has no single command. The
+  two are complementary: a caller can tell a class it can act on from one
+  that needs a human judgement over content, and neither is silent. Both
+  keys are absent when every reported code has an exit, so the payload is
+  byte-identical for a vault whose findings all resolve.
+- Since v1.40.0 `vault_health` notices carry the same `next_command`
+  field, resolved from the same registry, so the notice channel no longer
+  requires a consumer to match the command out of an English sentence.
+- Since v1.40.0 `brain_dream` accepts `step` and `gates`. `step` runs one
+  independently-runnable step; any other value, including the five phase
+  labels, is refused with the coupling named rather than silently running
+  more than was asked. `gates` overrides a dream gate for that run only
+  and never writes to `_brain.yaml`. `step` is deliberately not a schema
+  enum, because an enum would swallow the per-step refusal reason, which
+  is the deliverable for the steps that cannot run alone.
+- Since v1.40.0 `brain_skill_proposals` accepts a `recover` operation and
+  four contract arguments on `accept` (`prerequisites`, `rollback`,
+  `side_effects`, `verification`), plus an `evidence` operation that
+  reports a proposal's self-declared support beside the independently
+  recorded procedural outcomes. Three states stay distinct: recorded
+  successes, recorded failures, and no recorded outcome at all - the last
+  is never reported as a zero success rate. `recover` is the operator
+  surface for an accept sequence a crash left outstanding.
+- Since v1.40.0 `brain_procedural_memory` entries carry the four contract
+  fields back on `list`, so a contract written at acceptance is readable
+  rather than write-only.
+- Since v1.40.0 `brain_session_summary` accepts an optional
+  `project_scope`, normalized by the same slug rule as the session axis.
+  A digest written without one keeps its existing dedupe key byte for
+  byte, so deduplication of pre-existing digests is unaffected.
+- Since v1.40.0 `brain_analytics` accepts `view: dedup`, folding the new
+  `ingest_dedup` continuity records into a trend. The counts are exact-hash
+  drops only; the semantic layers nominate candidates and never drop, so
+  nothing in this view may be read as a semantic discard.

@@ -11,6 +11,8 @@ import {
   setIntention,
   showIntention,
 } from "../../../core/brain/intentions.ts";
+import { nextCommandField } from "../../../core/brain/next-step.ts";
+import { emitNextStep, type AdvisoryStream } from "../../advisory-rail.ts";
 import { brainVerbContext, fail, normalizeFlagString, ok, okJson, parse } from "../helpers.ts";
 
 export async function cmdBrainIntention(argv: string[]): Promise<number> {
@@ -44,11 +46,18 @@ export async function cmdBrainIntention(argv: string[]): Promise<number> {
           updated_at: c.updatedAt,
           text: c.text,
         })),
+        // no-dead-ends, phase 3: the exit the human stream prints as a
+        // rail line, carried here as a field.
+        ...(intentions.length === 0 ? nextCommandField("intentions-absent") : {}),
       });
       return 0;
     }
     if (intentions.length === 0) {
       ok("no active intentions");
+      // no-dead-ends, task 5: the exit is this verb's own setter.
+      // The `--json` branch above returned; this stream is human.
+      const stream: AdvisoryStream = { command: "brain", argv, jsonRequested: false };
+      emitNextStep("intentions-absent", stream);
       return 0;
     }
     for (const c of intentions) ok(`${c.scope} v${c.version} (${c.updatedAt}): ${c.text}`);

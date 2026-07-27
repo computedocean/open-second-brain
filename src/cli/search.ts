@@ -81,6 +81,8 @@ import { IndexWatchRunner } from "../core/search/watch-runner.ts";
 import { SafeguardAbortError } from "../core/brain/safeguard.ts";
 import { canonicalNotePath } from "../core/path-safety.ts";
 import { watch, type FSWatcher } from "node:fs";
+import { nextCommandField } from "../core/brain/next-step.ts";
+import { emitNextStep, type AdvisoryStream } from "./advisory-rail.ts";
 import { CliError, parseFlags } from "./argparse.ts";
 import { CronTemplateError, renderCronTemplate } from "./search-cron-template.ts";
 
@@ -1016,6 +1018,43 @@ async function cmdSearchExpand(argv: ReadonlyArray<string>): Promise<number> {
 
 // ─── index ────────────────────────────────────────────────────────────────────
 
+/**
+ * Advisory stream for the two index builders (no-dead-ends, task 5).
+ * `index` and `reindex` reach the same terminal state - an index that
+ * now exists and has not been queried - so they name the same exit
+ * through the same registry code.
+ *
+ * The read path is deliberately NOT covered: `search query` self-heals a
+ * missing index by building it, and pointing an operator at the indexer
+ * there would describe a world that self-heal removed.
+ */
+function indexAdvisoryStream(argv: ReadonlyArray<string>, jsonRequested: boolean): AdvisoryStream {
+  return { command: "search", argv, jsonRequested };
+}
+
+/**
+ * True when the run this `stats` describes left the index covering every
+ * document, which is what the `search-index-built` class ("search index
+ * up to date") asserts.
+ *
+ * `stats.errors` means, per its own declaration, "this file did not
+ * index". Emitting the class with entries in it would tell the operator
+ * the index is current while the tool knows documents are missing from
+ * it, and would point at `o2b search query` as though a query over it
+ * were complete. Re-labelling the class instead was considered and
+ * rejected: a truthful label for the failed case would have to be
+ * vacuous, and it would leave the misleading COMMAND in place.
+ *
+ * A run with errors is left deliberately without a rail line. The errors
+ * block already names every affected path and message, and what repairs
+ * an unreadable or malformed note is a judgement over that file's
+ * content - there is no `o2b` command that performs it, and naming the
+ * indexer again would advise repeating the run that just failed.
+ */
+function indexIsComplete(stats: IndexStats): boolean {
+  return stats.errors.length === 0;
+}
+
 async function cmdSearchIndex(argv: ReadonlyArray<string>): Promise<number> {
   const { flags } = parseFlags(argv, {
     vault: { type: "string" },
@@ -1049,11 +1088,23 @@ async function cmdSearchIndex(argv: ReadonlyArray<string>): Promise<number> {
     },
   });
 
+  const complete = indexIsComplete(stats);
   if (flags["json"]) {
-    process.stdout.write(JSON.stringify(jsonForStats(stats, cfg)) + "\n");
-    return 0;
+    // no-dead-ends, phase 3: the rail suppresses its line on this stream
+    // and returns the resolved step precisely so the payload can carry
+    // it. Absent whenever the run left the index incomplete.
+    process.stdout.write(
+      JSON.stringify({
+        ...(jsonForStats(stats, cfg) as Record<string, unknown>),
+        ...(complete ? nextCommandField("search-index-built") : {}),
+      }) + "\n",
+    );
+  } else {
+    process.stdout.write(renderStatsHuman(stats, cfg));
   }
-  process.stdout.write(renderStatsHuman(stats, cfg));
+  if (complete) {
+    emitNextStep("search-index-built", indexAdvisoryStream(argv, flags["json"] === true));
+  }
   return 0;
 }
 
@@ -1254,11 +1305,23 @@ async function cmdSearchReindex(argv: ReadonlyArray<string>): Promise<number> {
     forceCost: flags["force-cost"] === true,
     onFile: flags["verbose"] ? (e) => process.stderr.write(`${e.kind}\t${e.path}\n`) : undefined,
   });
+  const complete = indexIsComplete(stats);
   if (flags["json"]) {
-    process.stdout.write(JSON.stringify(jsonForStats(stats, cfg)) + "\n");
-    return 0;
+    // no-dead-ends, phase 3: the rail suppresses its line on this stream
+    // and returns the resolved step precisely so the payload can carry
+    // it. Absent whenever the run left the index incomplete.
+    process.stdout.write(
+      JSON.stringify({
+        ...(jsonForStats(stats, cfg) as Record<string, unknown>),
+        ...(complete ? nextCommandField("search-index-built") : {}),
+      }) + "\n",
+    );
+  } else {
+    process.stdout.write(renderStatsHuman(stats, cfg));
   }
-  process.stdout.write(renderStatsHuman(stats, cfg));
+  if (complete) {
+    emitNextStep("search-index-built", indexAdvisoryStream(argv, flags["json"] === true));
+  }
   return 0;
 }
 
@@ -1274,16 +1337,32 @@ async function cmdSearchStatus(argv: ReadonlyArray<string>): Promise<number> {
   const cfg = resolveConfig(flags);
   const status = await indexStatus(cfg);
   if (flags["json"]) {
-    process.stdout.write(JSON.stringify(serializeIndexStatus(status)) + "\n");
+    process.stdout.write(
+      JSON.stringify({
+        ...(serializeIndexStatus(status) as Record<string, unknown>),
+        // Same polarity as the human twin below, so the two conditions
+        // read as one rule rather than as each other's negation.
+        ...(!status.exists ? nextCommandField("search-index-missing") : {}),
+      }) + "\n",
+    );
     return 0;
   }
   process.stdout.write(renderStatusHuman(status));
+  // no-dead-ends, phase 3: the pointer used to be spliced into the
+  // renderer's first line, which is a second emission mechanism AND
+  // beyond the reach of a scan over writer call sites. The rail decides
+  // the format; the condition is the one the claim rests on.
+  if (!status.exists) {
+    // The `--json` branch above returned, so this stream is provably a
+    // human one; the JSON payload carries the same exit as a field.
+    emitNextStep("search-index-missing", indexAdvisoryStream(argv, false));
+  }
   return 0;
 }
 
 function renderStatusHuman(s: IndexStatusSnapshot): string {
   if (!s.exists) {
-    return `index: not initialised. Run: o2b search index\n  path: ${s.indexPath}\n`;
+    return `index: not initialised\n  path: ${s.indexPath}\n`;
   }
   const lines: string[] = [];
   lines.push(`index: ${s.indexPath}`);

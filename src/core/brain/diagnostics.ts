@@ -14,7 +14,13 @@
  * Repair contract:
  *   - `doctor.ts` (plain / `--strict`) is read-only and byte-identical;
  *     nothing here runs unless the operator opts in with `--repair`.
- *   - `planRepair` is a pure read: it previews what `--apply` would do.
+ *   - `planRepair` is a pure read: it previews what `--apply` would do,
+ *     DERIVED FROM the doctor's findings rather than from a scan of its
+ *     own (no-dead-ends, task 9). Each fixer receives exactly the
+ *     findings carrying the doctor code it covers. Neither fixer keeps a
+ *     private detector: the doctor reports `dangling-workrun` from the
+ *     same scan the WAL fixer used to run, and `broken-wikilink` is a
+ *     superset of the orphaned-reference population.
  *   - `applyRepair({ dryRun: true })` is the preview surface (writes
  *     nothing); `{ dryRun: false }` performs the fixes and appends ONE
  *     typed `doctor-repair` event per applied fix.
@@ -37,7 +43,7 @@
  *     lifecycle provenance or break a required field.
  */
 
-import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { normalizeAgentArgument } from "../agent-identity.ts";
@@ -45,14 +51,14 @@ import { resolveAgentName } from "../config.ts";
 import { vaultRelative } from "../path-safety.ts";
 import { parseFrontmatter, writeFrontmatterAtomic } from "../vault.ts";
 
+import { UnclassifiedRepairCodeError, requireMechanicalRepair } from "./applier-capability.ts";
+
 import { collectAllBasenames, runDoctor } from "./doctor.ts";
 import { scanDanglingWorkruns, WORKRUN_PHASE } from "./dream-workrun.ts";
 import { appendLogEvent } from "./log.ts";
-import { brainDirs } from "./paths.ts";
-import { parsePreference, parseRetired } from "./preference.ts";
 import { acquireLockSync } from "./sync-lockfile.ts";
 import { isoSecond } from "./time.ts";
-import { BRAIN_LOG_EVENT_KIND } from "./types.ts";
+import { BRAIN_LOG_EVENT_KIND, type DoctorIssue } from "./types.ts";
 import { normaliseWikilinkTarget } from "./wikilink.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
@@ -84,6 +90,13 @@ export const REPAIR_CODE = Object.freeze({
  * Registry: the single home for every issue class this wave surfaces and
  * its next-command hint. Doctor codes, fixer codes, and the O3 snapshot
  * source codes all resolve here so a hint is defined exactly once.
+ *
+ * no-dead-ends (task 5) widened the population from "issue" to "state a
+ * caller can be left in": a verb that succeeded and printed nothing
+ * forward is the same defect from the caller's side, and giving those
+ * states a code here is what stops the command being retyped inside an
+ * `ok()` string. Nothing iterates this map expecting only faults; every
+ * consumer resolves by code.
  */
 export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map(
   (
@@ -181,6 +194,17 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         nextCommand: "o2b brain stale",
         autoRepairable: false,
       },
+      {
+        // Issue #149. The detector has existed since the hygiene lints
+        // shipped; what it never had was an exit. Recording real use is
+        // the only thing that moves a cold-start rule, and the reporter
+        // reached for a synthetic confidence value precisely because no
+        // surface said so.
+        code: "low-evidence-confirmed",
+        issueClass: "confirmed rule with no recorded use",
+        nextCommand: "o2b brain apply-evidence --pref <id> --artifact <artifact> --result=applied",
+        autoRepairable: false,
+      },
       // --- O3 operator-snapshot source classes ---
       {
         code: "doctor-errors",
@@ -224,14 +248,194 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         nextCommand: "o2b brain init",
         autoRepairable: false,
       },
+      // --- Terminal states (no-dead-ends, task 5) ---
+      // A verb that succeeded and left the caller with nowhere to go.
+      // These are not defects, so `issueClass` reads as the STATE the
+      // caller is in rather than a fault; the field is otherwise the
+      // same short label every other entry carries, and the registry
+      // stays the single place a structural command is written down.
+      {
+        code: "brain-empty",
+        issueClass: "Brain with nothing recorded in it",
+        nextCommand: "o2b brain feedback --topic <topic> --signal=positive --principle <principle>",
+        autoRepairable: false,
+      },
+      {
+        code: "signal-clusters-absent",
+        issueClass: "no active signal clusters to review",
+        nextCommand: "o2b brain feedback --topic <topic> --signal=positive --principle <principle>",
+        autoRepairable: false,
+      },
+      {
+        code: "intentions-absent",
+        issueClass: "no active intention chains",
+        nextCommand: "o2b brain intention set --scope <scope> --text <text>",
+        autoRepairable: false,
+      },
+      {
+        code: "search-index-built",
+        issueClass: "search index up to date",
+        nextCommand: "o2b search query <text>",
+        autoRepairable: false,
+      },
+      {
+        code: "search-index-missing",
+        issueClass: "search index not built",
+        nextCommand: "o2b search index",
+        autoRepairable: false,
+      },
+      {
+        code: "git-history-absent",
+        issueClass: "no ingested git history",
+        nextCommand: "o2b brain git ingest <repo-path>",
+        autoRepairable: false,
+      },
+      {
+        code: "bridge-proposals-absent",
+        issueClass: "no bridge-proposal artifact yet",
+        nextCommand: "o2b brain bridges discover",
+        autoRepairable: false,
+      },
+      {
+        code: "cli-config-absent",
+        issueClass: "no machine configuration file",
+        nextCommand: "o2b init --vault <path> --name <name>",
+        autoRepairable: false,
+      },
+      {
+        code: "staged-captures-pending",
+        issueClass: "staged captures previewed but not routed",
+        nextCommand: "o2b brain inbox-drain --apply",
+        autoRepairable: false,
+      },
+      // The five states whose exits used to be retyped inside an `ok()`
+      // string beside the rail rather than resolved through it.
+      {
+        code: "dream-bundles-absent",
+        issueClass: "no staged dream bundles",
+        nextCommand: "o2b brain dream stage",
+        autoRepairable: false,
+      },
+      {
+        code: "cluster-notes-absent",
+        issueClass: "no materialized cluster notes",
+        nextCommand: "o2b brain clusters run",
+        autoRepairable: false,
+      },
+      {
+        code: "recall-tuning-absent",
+        issueClass: "no persisted recall tuning",
+        nextCommand: "o2b brain tune run --dataset <path>",
+        autoRepairable: false,
+      },
+      // One finding, two readings, so two codes rather than one code
+      // carrying two commands: which value is authoritative - the
+      // indexed one or the note's - is the operator's call, and the
+      // rail's batch form prints both exits for the one state.
+      {
+        code: "tier-drift-restore",
+        issueClass: "tier drift, indexed value authoritative",
+        nextCommand: "o2b brain tiers restore <path> --apply",
+        autoRepairable: false,
+      },
+      {
+        code: "tier-drift-accept",
+        issueClass: "tier drift, note value authoritative",
+        nextCommand: "o2b brain tiers accept <path>",
+        autoRepairable: false,
+      },
+      // --- Doctor classes the exit census found unregistered ---
+      // The census (`tests/core/brain/doctor-exit-census.test.ts`) forced
+      // every doctor code into one of two buckets. These three turned out
+      // to have a genuine single command; the other twenty-four are
+      // recorded as having none, with the reason, in `doctor-exits.ts`.
+      {
+        code: "brain-root-absent",
+        issueClass: "resolved root carries no Brain layer",
+        nextCommand: "o2b brain init",
+        autoRepairable: false,
+      },
+      {
+        // The exit is the REVIEW, not the repair: what follows it is
+        // `tier-drift-restore` or `tier-drift-accept`, registered above,
+        // and which of the two applies is per drifted note.
+        code: "tier-drift",
+        issueClass: "identity-field hand-edits staged",
+        nextCommand: "o2b brain tiers check",
+        autoRepairable: false,
+      },
+      {
+        code: "entity-label-malformed",
+        issueClass: "entity label fails the quality gate",
+        nextCommand: "o2b brain entity prune",
+        autoRepairable: false,
+      },
+      // --- Skill-accept transaction refusals (no-dead-ends, phase 3) ---
+      // Both are states the accept transaction itself can leave an
+      // operator in, and both used to refuse without naming a way out.
+      // They are registered here rather than spelled inside the two
+      // error messages so the messages resolve one structural command
+      // from the same registry every other surface reads.
+      {
+        code: "skill-accept-journal-unreadable",
+        issueClass: "unreadable skill-accept journal marker",
+        nextCommand: "o2b brain skill-proposals recover --discard-unreadable",
+        autoRepairable: false,
+      },
+      {
+        // The exit is the INSPECTION, not a repair: nothing breaks a
+        // lock automatically, so what the operator needs first is the
+        // full list of locks under the Brain tree with their paths.
+        // Removing the file stays a human judgement - see the
+        // `stale-lock` refusal in `applier-capability.ts`.
+        code: "skill-accept-locked",
+        issueClass: "skill-accept lock held",
+        nextCommand: "o2b brain doctor",
+        autoRepairable: false,
+      },
+      // --- Runtime-notice conditions (no-dead-ends, task 3) ---
+      // The notice channel pushes a transient condition at the agent
+      // (SessionStart injection, `vault_health`, the onboarding
+      // checklist) rather than waiting to be polled, and it spells its
+      // codes in the snake case its wire records use. Registering them
+      // here is what lets a notice carry a structural command instead of
+      // an English "Run: ..." tail a consumer has to regex.
+      //
+      // `search_index_missing` is the same condition the kebab-cased
+      // `search-index-missing` terminal state reports from `o2b search
+      // check`, and deliberately resolves to the same command: two
+      // emitters, two code vocabularies, one exit. Only the codes with a
+      // genuine single exit are listed - `vault_read_only`,
+      // `vault_marker_absent`, `brain_config_unreadable` and
+      // `reindex_in_progress` have none, each for a reason written down
+      // beside the notice that raises it.
+      {
+        code: "search_index_missing",
+        issueClass: "search index not built",
+        nextCommand: "o2b search index",
+        autoRepairable: false,
+      },
+      {
+        code: "semantic_degraded",
+        issueClass: "semantic search fell back to lexical",
+        nextCommand: "o2b search check",
+        autoRepairable: false,
+      },
     ] satisfies ReadonlyArray<DiagnosticSignal>
   ).map((s) => [s.code, Object.freeze(s)]),
 );
 
 /**
- * Resolve a signal by code. Unknown codes fall back to a generic
- * doctor-run hint so a newly-added lint still renders a next command
- * without a formatter having to invent one.
+ * Resolve a signal by code, LENIENTLY. An unregistered code does not
+ * resolve: this function fabricates a generic `o2b brain doctor` signal
+ * whose `issueClass` is the raw code. That value is invented here, it is
+ * not a registry entry, and it does not mean the code is known.
+ *
+ * Kept for its two existing consumers (the O3 operator snapshot and the
+ * repair planner's unfixable aggregation), whose output shape predates
+ * this release. New consumers MUST use `resolveNextStep` in
+ * `next-step.ts`, which returns an explicit absent result instead of a
+ * guessed command.
  */
 export function resolveSignal(code: string): DiagnosticSignal {
   const known = DIAGNOSTIC_SIGNALS.get(code);
@@ -278,18 +482,54 @@ export interface RepairPlan {
 // ----- Fixers ---------------------------------------------------------------
 
 /**
+ * A doctor finding did not carry the data its fixer needs to plan from.
+ *
+ * Raised, not skipped (no-dead-ends, task 9). A `dangling-workrun` with
+ * no path, or a `broken-wikilink` with no field or target, means the
+ * detector and this module disagree about the finding contract; dropping
+ * the item would report a complete plan that had silently omitted a
+ * detected defect.
+ */
+export class MalformedDoctorFindingError extends Error {
+  readonly code: string;
+  readonly missingField: string;
+
+  constructor(code: string, missingField: string) {
+    super(
+      `doctor finding ${JSON.stringify(code)} carries no ${JSON.stringify(missingField)}, ` +
+        "so the fixer for it cannot derive a repair target",
+    );
+    this.name = "MalformedDoctorFindingError";
+    this.code = code;
+    this.missingField = missingField;
+  }
+}
+
+/**
  * A fixer owns one auto-repairable class. `coversDoctorCode` is the
- * doctor issue code the fixer represents, so the planner can exclude that
- * code from the needs-a-different-tool `unfixable` list without parsing
- * doctor messages.
+ * doctor issue code the fixer represents: the planner hands it exactly
+ * the findings carrying that code, and excludes the code from the
+ * needs-a-different-tool `unfixable` list.
+ *
+ * `plan` receives those findings rather than the vault alone. Both
+ * fixers' classes are reported in FULL by the doctor - `dangling-workrun`
+ * comes from the same `scanDanglingWorkruns` the fixer used to call, and
+ * `broken-wikilink` is a superset of the orphaned-reference population
+ * (it also reports targets outside the Brain id space, which this fixer
+ * skips) - so neither retains an independent scan. `vault` is still
+ * passed because a repair target is vault-relative; it is not a licence
+ * to look for work the findings did not name.
  */
 interface Fixer {
   readonly code: string;
   readonly coversDoctorCode: string;
-  plan(vault: string): RepairItem[];
+  plan(vault: string, findings: ReadonlyArray<DoctorIssue>): RepairItem[];
   /** Apply one applicable item. Returns null on an idempotent no-op. */
   apply(vault: string, item: RepairItem): AppliedFix | null;
 }
+
+/** Doctor field name for the evidence list; its raw key is `_evidenced_by`. */
+const DOCTOR_EVIDENCE_FIELD = "evidenced_by";
 
 /** Separator between the parts of an `orphaned-reference` target id. */
 const TARGET_SEP = "::";
@@ -309,9 +549,10 @@ function isBrokenBrainRef(raw: string, known: ReadonlySet<string>): string | nul
 const walGapFixer: Fixer = {
   code: REPAIR_CODE.walGap,
   coversDoctorCode: "dangling-workrun",
-  plan(vault: string): RepairItem[] {
-    return scanDanglingWorkruns(vault).map((path) => {
-      const rel = vaultRelative(path, vault);
+  plan(vault: string, findings: ReadonlyArray<DoctorIssue>): RepairItem[] {
+    return findings.map((issue) => {
+      if (issue.path === undefined) throw new MalformedDoctorFindingError(issue.code, "path");
+      const rel = vaultRelative(issue.path, vault);
       return {
         code: REPAIR_CODE.walGap,
         target: rel,
@@ -359,39 +600,23 @@ const walGapFixer: Fixer = {
 const orphanedReferenceFixer: Fixer = {
   code: REPAIR_CODE.orphanedReference,
   coversDoctorCode: "broken-wikilink",
-  plan(vault: string): RepairItem[] {
-    const known = collectAllBasenames(vault);
+  plan(vault: string, findings: ReadonlyArray<DoctorIssue>): RepairItem[] {
     const items: RepairItem[] = [];
-    const dirs = brainDirs(vault);
-
-    walkBrainRecords(dirs.preferences, "pref-", (path) => {
-      const pref = parsePreference(path);
-      const rel = vaultRelative(path, vault);
-      for (const raw of pref.evidenced_by) {
-        const dead = isBrokenBrainRef(raw, known);
-        if (dead) items.push(evidencePrune(rel, dead));
-      }
-      if (pref.supersedes) {
-        const dead = isBrokenBrainRef(pref.supersedes, known);
-        if (dead) items.push(structuralReview(rel, "supersedes", dead));
-      }
-    });
-
-    walkBrainRecords(dirs.retired, "ret-", (path) => {
-      const ret = parseRetired(path);
-      const rel = vaultRelative(path, vault);
-      for (const raw of ret.evidenced_by) {
-        const dead = isBrokenBrainRef(raw, known);
-        if (dead) items.push(evidencePrune(rel, dead));
-      }
-      const retiredBy = isBrokenBrainRef(ret.retired_by, known);
-      if (retiredBy) items.push(structuralReview(rel, "retired_by", retiredBy));
-      if (ret.superseded_by) {
-        const dead = isBrokenBrainRef(ret.superseded_by, known);
-        if (dead) items.push(structuralReview(rel, "superseded_by", dead));
-      }
-    });
-
+    for (const issue of findings) {
+      if (issue.path === undefined) throw new MalformedDoctorFindingError(issue.code, "path");
+      if (issue.field === undefined) throw new MalformedDoctorFindingError(issue.code, "field");
+      if (issue.target === undefined) throw new MalformedDoctorFindingError(issue.code, "target");
+      // The doctor reports every unresolvable basename; only Brain-managed
+      // ids are this fixer's business. An external / non-Brain link is
+      // left exactly where it is, as it always was.
+      if (!BRAIN_ID_RE.test(issue.target)) continue;
+      const rel = vaultRelative(issue.path, vault);
+      items.push(
+        issue.field === DOCTOR_EVIDENCE_FIELD
+          ? evidencePrune(rel, issue.target)
+          : structuralReview(rel, issue.field, issue.target),
+      );
+    }
     return items;
   },
   apply(vault: string, item: RepairItem): AppliedFix | null {
@@ -475,37 +700,65 @@ function removeOriginBullet(body: string, dead: string): string {
   return kept.join("\n");
 }
 
-/** Iterate `<prefix>*.md` records under `dir`, skipping unparseable files. */
-function walkBrainRecords(dir: string, prefix: string, cb: (path: string) => void): void {
-  if (!existsSync(dir)) return;
-  for (const name of readdirSync(dir)) {
-    if (!name.endsWith(".md") || !name.startsWith(prefix)) continue;
-    try {
-      cb(join(dir, name));
-    } catch {
-      // schema error - surfaced by the doctor, not this fixer's concern
-    }
-  }
-}
-
 const FIXERS: ReadonlyArray<Fixer> = Object.freeze([walGapFixer, orphanedReferenceFixer]);
 const FIXER_BY_CODE: ReadonlyMap<string, Fixer> = new Map(FIXERS.map((f) => [f.code, f]));
 const COVERED_DOCTOR_CODES: ReadonlySet<string> = new Set(FIXERS.map((f) => f.coversDoctorCode));
 
+/**
+ * The classes this module's fixers repair, as a read-only set. Exported
+ * so the applier capability table can be checked against the registry
+ * that actually decides (no-dead-ends, task 8) rather than against a
+ * hand-maintained copy of it.
+ */
+export const REPAIR_FIXER_CODES: ReadonlySet<string> = Object.freeze(
+  new Set(FIXERS.map((f) => f.code)),
+);
+
 // ----- Planner --------------------------------------------------------------
 
-/**
- * Preview what a repair would do. Pure read: runs the doctor to enumerate
- * detected classes, gathers every fixer's findings, and aggregates the
- * classes no fixer addresses (each with its next-command hint).
- */
-export function planRepair(vault: string): RepairPlan {
-  const fixes: RepairItem[] = [];
-  for (const fixer of FIXERS) fixes.push(...fixer.plan(vault));
+export interface PlanRepairOptions {
+  /**
+   * The doctor findings to derive the plan from. Omitted, `planRepair`
+   * runs the doctor itself, which is what every production caller does.
+   *
+   * Supplying them is how a caller that has ALREADY run the doctor avoids
+   * a second full pass, and it is the seam that makes the derivation
+   * observable: hand in findings that do not match the disk and the plan
+   * follows the findings, which is the property a re-scanning planner
+   * cannot have.
+   */
+  readonly issues?: ReadonlyArray<DoctorIssue>;
+}
 
-  const doctor = runDoctor(vault);
+/**
+ * Preview what a repair would do. Pure read.
+ *
+ * The plan is DERIVED FROM the doctor's findings (no-dead-ends, task 9).
+ * Each fixer is handed exactly the findings carrying the doctor code it
+ * covers and derives its items from those; it does not scan for work of
+ * its own. Before this, every fixer re-scanned the vault independently
+ * while the doctor's findings sat beside them consulted only for counts,
+ * so the applier shared the detector's vocabulary without consuming its
+ * output and nothing forced the two to agree.
+ *
+ * The remaining classes - the ones no fixer covers - are aggregated from
+ * the same findings, each with its next-command hint.
+ */
+export function planRepair(vault: string, opts: PlanRepairOptions = {}): RepairPlan {
+  const issues = opts.issues ?? collectDoctorIssues(vault);
+
+  const fixes: RepairItem[] = [];
+  for (const fixer of FIXERS) {
+    fixes.push(
+      ...fixer.plan(
+        vault,
+        issues.filter((i) => i.code === fixer.coversDoctorCode),
+      ),
+    );
+  }
+
   const counts = new Map<string, number>();
-  for (const issue of [...doctor.errors, ...doctor.warnings]) {
+  for (const issue of issues) {
     if (COVERED_DOCTOR_CODES.has(issue.code)) continue;
     counts.set(issue.code, (counts.get(issue.code) ?? 0) + 1);
   }
@@ -522,6 +775,12 @@ export function planRepair(vault: string): RepairPlan {
     .toSorted((a, b) => a.code.localeCompare(b.code));
 
   return Object.freeze({ fixes: Object.freeze(fixes), unfixable: Object.freeze(unfixable) });
+}
+
+/** The doctor's errors and warnings as one stream, in report order. */
+function collectDoctorIssues(vault: string): ReadonlyArray<DoctorIssue> {
+  const doctor = runDoctor(vault);
+  return [...doctor.errors, ...doctor.warnings];
 }
 
 // ----- Apply ----------------------------------------------------------------
@@ -562,8 +821,11 @@ export interface ApplyRepairOptions {
  * changed disk. Idempotent: a second non-dry-run call finds nothing to do.
  */
 export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutcome {
-  // Vault-identity write guard (context-integrity-gates, Unit J).
-  // A dry run previews and writes nothing, so it stays ungated.
+  // Vault-identity write guard (context-integrity-gates, Unit J), placed
+  // per the one rule the three appliers now share: at the entry point,
+  // before any other work, and only when the call will write. A dry run
+  // previews and writes nothing, so it stays ungated. See the write-guard
+  // section of `applier-capability.ts`.
   if (opts.dryRun !== true) assertVaultIdentityForWrite(vault);
   const plan = planRepair(vault);
   const needsReview = plan.fixes.filter((f) => !f.applicable);
@@ -583,8 +845,15 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
   const timestamp = isoSecond(opts.now ?? new Date());
   const applied: AppliedFix[] = [];
   for (const item of applicable) {
+    // The capability table is the published statement that this code has
+    // a mechanical repair; the registry is the thing that performs it.
+    // Consulting the table first turns a disagreement between the two
+    // into a named error instead of the silent `continue` that used to
+    // stand here - which would have dropped an applicable item on the
+    // floor and still reported success.
+    requireMechanicalRepair(item.code);
     const fixer = FIXER_BY_CODE.get(item.code);
-    if (!fixer) continue;
+    if (fixer === undefined) throw new UnclassifiedRepairCodeError(item.code);
     const result = fixer.apply(vault, item);
     if (!result) continue; // idempotent no-op: nothing changed, no event
     const res = appendLogEvent(vault, {
