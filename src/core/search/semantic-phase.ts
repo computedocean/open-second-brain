@@ -5,11 +5,18 @@
  * to keyword-only with warnings when the lane cannot run).
  */
 
+import {
+  resolveSemanticCapability,
+  SEMANTIC_CAPABILITY_TIER,
+  semanticCapabilityIsBlocked,
+  semanticCapabilityLabel,
+} from "./capability-tier.ts";
 import { classifyEmbeddingError } from "./embeddings/openai-compat.ts";
 import { makeProvider } from "./embeddings/provider.ts";
 import { Store } from "./store.ts";
 import { EMBEDDING_QUOTA_MESSAGE, SearchError } from "./types.ts";
-import type { ResolvedSearchConfig, SearchOptions } from "./types.ts";
+import type { SemanticCapability, SemanticCapabilityTier } from "./capability-tier.ts";
+import type { ResolvedSearchConfig, SearchErrorCode, SearchOptions } from "./types.ts";
 
 export interface SemanticPolicy {
   /** caller asked for semantic on or off (true), or accepted the default (false). */
@@ -44,6 +51,41 @@ export function semanticPoolSize(limit: number): number {
   return Math.max(limit * POOL_OVERFETCH, POOL_FLOOR);
 }
 
+/** The rungs of the capability ladder that BLOCK; `configured` is not one. */
+type BlockedCapabilityTier = Exclude<
+  SemanticCapabilityTier,
+  typeof SEMANTIC_CAPABILITY_TIER.configured
+>;
+
+/**
+ * The typed failure an EXPLICIT semantic request reports per blocked rung.
+ *
+ * One entry per rung, so adding a rung to the ladder is a type error here
+ * rather than a request that silently degrades. `credential-missing` keeps
+ * `EMBEDDING_KEY_MISSING`, the code that arm has always raised; `disabled`
+ * raises `EMBEDDING_DISABLED`, the code the null provider already raises
+ * for the same configuration when the indexer meets it, so one condition
+ * has one code across the tree.
+ */
+const BLOCKED_TIER_ERROR_CODE: Readonly<Record<BlockedCapabilityTier, SearchErrorCode>> =
+  Object.freeze({
+    [SEMANTIC_CAPABILITY_TIER.disabled]: "EMBEDDING_DISABLED",
+    [SEMANTIC_CAPABILITY_TIER.credentialMissing]: "EMBEDDING_KEY_MISSING",
+  });
+
+/**
+ * {@link semanticCapabilityIsBlocked} as a TYPE predicate. The shared
+ * resolver exports it as a plain boolean and lives in a module this lane
+ * does not own, so the narrowing lives here - which lets the table above be
+ * total over exactly the blocked rungs, with no cast and no unreachable
+ * default arm.
+ */
+function isBlockedCapability(
+  capability: SemanticCapability,
+): capability is SemanticCapability & { readonly tier: BlockedCapabilityTier } {
+  return semanticCapabilityIsBlocked(capability);
+}
+
 interface SemanticPhaseOutcome {
   readonly attempted: boolean;
   readonly hits: ReturnType<Store["semanticTopK"]>;
@@ -74,18 +116,26 @@ export async function runSemanticPhase(
     warnings.push("sqlite-vec unavailable, semantic disabled this session");
     return { attempted: false, hits: [], warnings };
   }
-  if (!config.semantic.enabled) {
-    // Defensive: should be handled at policy layer, but in case caller
-    // forced wantSemantic without enabling, treat as implicit warning.
-    warnings.push("semantic not enabled in config; using keyword-only");
-    return { attempted: false, hits: [], warnings };
-  }
-  // The offline local provider needs no key; every remote provider does.
-  if (config.semantic.provider !== "local" && !config.semantic.apiKey) {
-    if (opts.explicit) {
-      throw new SearchError("EMBEDDING_KEY_MISSING", "embedding key not configured");
-    }
-    warnings.push("embedding key not configured; semantic disabled");
+  // What the OPERATOR CONFIGURED, from the one shared resolver
+  // (provenance-at-the-boundary, F1). The two runtime guards above stay
+  // where they are: an empty vector table and a missing extension are
+  // facts about this index and this machine, not about the configuration.
+  //
+  // The explicit arm is the one that ATTEMPTED something and could not,
+  // so it keeps reporting the typed `SearchError`; the implicit arm
+  // refused before attempting and reports the capability. Neither
+  // condition is reported both ways.
+  //
+  // EVERY blocked rung throws on the explicit arm, not just the missing
+  // credential: a caller who asked for semantic recall in so many words and
+  // was served lexical results with exit 0 was told the search succeeded.
+  // Both arms name the condition with the SAME registry sentence, so the
+  // warning and the error message cannot drift apart.
+  const capability = resolveSemanticCapability(config.semantic);
+  if (isBlockedCapability(capability)) {
+    const label = await semanticCapabilityLabel(capability.code);
+    if (opts.explicit) throw new SearchError(BLOCKED_TIER_ERROR_CODE[capability.tier], label);
+    warnings.push(label);
     return { attempted: false, hits: [], warnings };
   }
 

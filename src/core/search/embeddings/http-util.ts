@@ -6,7 +6,9 @@
  * unit-normalisation semantics.
  */
 
+import { SearchError } from "../types.ts";
 import { assertValidVector } from "../vector-guard.ts";
+import { estimateTokens } from "./signature.ts";
 
 /** Statuses that warrant a transient retry with backoff. */
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
@@ -113,10 +115,93 @@ export function unitNormaliseInPlace(v: number[]): number[] {
   return v;
 }
 
-/** Split an array into fixed-size chunks (step >= 1). */
+/**
+ * The two batching caps, named for the operator-facing config key each one
+ * carries, so a refusal says which key to change.
+ */
+const CAP_FIELD = Object.freeze({
+  /** `embedding_batch_size`: how many items one request may carry. */
+  size: "batch size",
+  /** `embedding_batch_tokens`: how many estimated tokens one request may carry. */
+  tokens: "token budget",
+});
+
+/**
+ * Take a batching cap EXACTLY as the caller gave it, or refuse it.
+ *
+ * `Math.max(1, cap | 0)` used to stand at both call sites. `| 0` truncates
+ * to a signed 32-bit int, so a cap above 2^31-1 wrapped NEGATIVE and the
+ * clamp then lifted it to 1: the largest batch an operator can ask for
+ * silently became the smallest one possible - one HTTP request per item,
+ * at full `embedding_concurrency`. Nothing is truncated now, and nothing is
+ * clamped: a cap this packer cannot step by is named rather than quietly
+ * reinterpreted into a different request plan than the one configured.
+ *
+ * Both keys are already refused below 1, at a fraction, and at a
+ * non-finite value by config validation (`search/index.ts`), so a resolved
+ * config never reaches this guard; it holds the line for programmatic
+ * callers that construct a `ResolvedEmbeddingConfig` directly.
+ */
+function requireBatchCap(cap: number, field: string): number {
+  if (!Number.isInteger(cap) || cap < 1) {
+    throw new SearchError("INVALID_INPUT", `${field} must be an integer >= 1, got ${cap}`);
+  }
+  return cap;
+}
+
+/** Split an array into fixed-size chunks. Refuses a step below 1 or fractional. */
 export function chunkArray<T>(arr: ReadonlyArray<T>, size: number): T[][] {
-  const step = Math.max(1, size | 0);
+  const step = requireBatchCap(size, CAP_FIELD.size);
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += step) out.push(arr.slice(i, i + step) as T[]);
+  return out;
+}
+
+/**
+ * Split an array into batches that close on whichever of two caps fills
+ * first: the item count (`size`, i.e. `embedding_batch_size`) or the
+ * accumulated token estimate (`tokenBudget`, i.e. `embedding_batch_tokens`).
+ *
+ * `tokenBudget` of `undefined` - the state of an unset config key - delegates
+ * straight to {@link chunkArray}, so batching is byte-identical to the fixed
+ * stride that preceded the budget.
+ *
+ * The estimate is {@link estimateTokens}, the estimator already resident in
+ * this layer and already governing the indexer's cost gate, so the gate and
+ * the batch budget describe the same texts identically. It deliberately
+ * differs from the chunker's word-count estimator: that one sizes chunks of
+ * a document, this one sizes a request. `textOf` must return the text
+ * exactly as it will be sent, instruction prefix included, because the
+ * provider prepends the prefix before batching and the provider's token
+ * ceiling counts it.
+ *
+ * An item whose own estimate already exceeds the budget cannot be made to fit
+ * by closing the batch around it, so it travels alone. Splitting the text
+ * itself is the chunker's job, not the request packer's; dropping it would be
+ * silent data loss.
+ */
+export function chunkArrayByTokenBudget<T>(
+  arr: ReadonlyArray<T>,
+  size: number,
+  tokenBudget: number | undefined,
+  textOf: (item: T) => string,
+): T[][] {
+  if (tokenBudget === undefined) return chunkArray(arr, size);
+  const step = requireBatchCap(size, CAP_FIELD.size);
+  const budget = requireBatchCap(tokenBudget, CAP_FIELD.tokens);
+  const out: T[][] = [];
+  let current: T[] = [];
+  let currentTokens = 0;
+  for (const item of arr) {
+    const tokens = estimateTokens([textOf(item)]);
+    if (current.length > 0 && (current.length >= step || currentTokens + tokens > budget)) {
+      out.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(item);
+    currentTokens += tokens;
+  }
+  if (current.length > 0) out.push(current);
   return out;
 }

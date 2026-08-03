@@ -17,6 +17,7 @@ import { CliError } from "./argparse.ts";
 import { cmdSearchCheck } from "./search/verbs/check.ts";
 import { cmdSearchExpand } from "./search/verbs/expand.ts";
 import { cmdSearchFocus } from "./search/verbs/focus.ts";
+import { cmdSearchEventAnchorBackfill } from "./search/verbs/event-anchor-backfill.ts";
 import { cmdSearchIndex, cmdSearchReindex } from "./search/verbs/indexing.ts";
 import { cmdSearchFeedback, cmdSearchWeights } from "./search/verbs/learned-weights.ts";
 import { cmdSearchPlan } from "./search/verbs/plan.ts";
@@ -24,6 +25,7 @@ import { cmdSearchProvider, cmdSearchRerankProvider } from "./search/verbs/provi
 import { cmdSearchQuery } from "./search/verbs/query.ts";
 import { cmdSearchRerankFit } from "./search/verbs/rerank-fit.ts";
 import { cmdSearchStatus } from "./search/verbs/status.ts";
+import { cmdSearchVectorBackfill } from "./search/verbs/vector-backfill.ts";
 import { cmdSearchWatch } from "./search/verbs/watch.ts";
 
 const KNOWN_VERBS = new Set([
@@ -41,6 +43,8 @@ const KNOWN_VERBS = new Set([
   "rerank-fit",
   "plan",
   "watch",
+  "vector-backfill",
+  "event-anchor-backfill",
 ]);
 
 export async function handleSearchSubcommand(argv: ReadonlyArray<string>): Promise<number> {
@@ -83,6 +87,10 @@ export async function handleSearchSubcommand(argv: ReadonlyArray<string>): Promi
         return await cmdSearchRerankFit(rest);
       case "plan":
         return await cmdSearchPlan(rest);
+      case "vector-backfill":
+        return await cmdSearchVectorBackfill(rest);
+      case "event-anchor-backfill":
+        return await cmdSearchEventAnchorBackfill(rest);
       default:
         process.stderr.write(`error: unknown search verb: ${verb}\n`);
         return 2;

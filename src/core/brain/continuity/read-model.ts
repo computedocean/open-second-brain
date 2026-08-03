@@ -1,10 +1,9 @@
 /**
  * Continuity read-model (Memory Observability Suite kernel).
  *
- * The single normalization layer between the raw JSONL continuity
- * store and every read-side consumer (ATOF/ATIF export, bench
- * harness). It absorbs three concerns exactly once so consumers
- * cannot disagree on them:
+ * The normalization layer between the raw JSONL continuity store and the
+ * read-side consumers that go through it. It absorbs three concerns
+ * exactly once so those consumers cannot disagree on them:
  *
  *   - schema-version dispatch: records written before the stamp
  *     existed carry no `schema` field and read as v1 (`legacy: true`);
@@ -13,6 +12,13 @@
  *     redaction-masked at write time and is never un-masked here;
  *   - fail-soft reads: malformed rows normalize to null and unknown
  *     kinds stay readable (the evolution rule is additive).
+ *
+ * It is NOT the only door onto the store, and the docblock used to imply
+ * it was. Four modules read through here; twenty call
+ * `listContinuityRecords` directly and see raw records with none of the
+ * above applied. `tests/core/brain/continuity/reader-census.test.ts`
+ * holds both lists and fails when either changes; auditing the direct
+ * readers is a separate task, by design.
  *
  * Read-only by construction - this module never writes to the store.
  */

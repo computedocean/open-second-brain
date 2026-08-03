@@ -43,6 +43,7 @@ export type ContinuityRecordKind =
   | "token_impact"
   | "token_impact_outcome"
   | "context_pack_outcome"
+  | "context_pack_evidence"
   | "host_memory_write"
   | "recall_observed_use"
   | "skill_invoked"

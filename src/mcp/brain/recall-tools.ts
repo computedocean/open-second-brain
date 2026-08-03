@@ -42,11 +42,15 @@ import {
   type TokenImpactOutcome,
 } from "../../core/brain/token-impact.ts";
 import {
-  emitContextPackOutcome,
   listContextPackOutcomes,
+  postContextPackOutcome,
   summarizeContextPackOutcomes,
   type ContextPackOutcomeFilter,
 } from "../../core/brain/context-pack-outcome.ts";
+import {
+  CONTEXT_PACK_EVIDENCE_FIELD,
+  type ContextPackEvidenceClaim,
+} from "../../core/brain/context-pack-evidence.ts";
 import {
   resolveContextPackOutcomeEnabled,
   resolveTokenImpactLedgerEnabled,
@@ -599,11 +603,14 @@ function coerceNonNegativeTokenValue(
 /**
  * Agent-operable context-pack outcome loop. `post` writes one compact
  * outcome row (gated on `context_pack_outcome_enabled`, payload-safe:
- * counters + an opaque sample id only) AND composes the C3 ledger by posting
- * a matching first-pass/repair/retry calibration record. `list`/`summary`
- * read the rows regardless of the gate so historical aggregates stay
- * inspectable. The three token signals (exact/modeled/observed) stay strictly
- * separate; a field the caller omits is never invented.
+ * counters + an opaque sample id only), composes the C3 ledger by posting
+ * a matching first-pass/repair/retry calibration record, and composes the
+ * evidence half by posting the kernel's own reading of the sample beside
+ * the agent's claim. All three rows join on the one sample id and carry
+ * the same acting agent. `list`/`summary` read the rows regardless of the
+ * gate so historical aggregates stay inspectable. The three token signals
+ * (exact/modeled/observed) stay strictly separate; a field the caller omits
+ * is never invented.
  */
 async function toolBrainContextPackOutcome(
   ctx: ServerContext,
@@ -646,8 +653,9 @@ async function toolBrainContextPackOutcome(
       "observed_provider_tokens",
       args["observed_provider_tokens"],
     );
+    const evidenceClaim = contextPackEvidenceClaim(args["evidence_claim"]);
     const enabled = resolveContextPackOutcomeEnabled(ctx.configPath ?? undefined);
-    const record = emitContextPackOutcome(
+    const post = postContextPackOutcome(
       ctx.vault,
       {
         sampleId,
@@ -660,19 +668,25 @@ async function toolBrainContextPackOutcome(
         ...(exact !== undefined ? { exactPromptTokenSavings: exact } : {}),
         ...(modeled !== undefined ? { modeledInferenceAvoidance: modeled } : {}),
         ...(observed !== undefined ? { observedProviderTokens: observed } : {}),
+        ...(evidenceClaim !== undefined ? { evidenceClaim } : {}),
       },
       enabled || undefined,
     );
-    if (record === null) {
+    if (post === null) {
       return { vault_path: ctx.vault, recorded: false, enabled };
     }
     return {
       vault_path: ctx.vault,
       recorded: true,
       enabled,
-      id: record.id,
+      id: post.outcome.id,
       sample_id: sampleId,
       first_pass_success: firstPassSuccess,
+      // The kernel's reading of this sample, surfaced so a contradicted
+      // claim is visible to the poster and not only to a later reader.
+      // Absent when the evidence half fail-opened - reporting a verdict
+      // that was never written would be the fallback this project bans.
+      ...(post.evidence !== null ? { evidence: post.evidence.payload } : {}),
     };
   }
 
@@ -690,18 +704,75 @@ async function toolBrainContextPackOutcome(
   );
 }
 
+/**
+ * The correlation keys a `post` records, read from the caller's arguments.
+ *
+ * `agent_id` is the ACTING agent, and it is an ARGUMENT rather than
+ * `ServerContext.agentName` deliberately. That getter resolves the plugin
+ * config on every access and RAISES on a config that is present but
+ * unreadable - correctly, since the alternative is writing under a guessed
+ * identity - so consulting it here would let one broken line in an
+ * unrelated file turn a working telemetry post into a tool error. The
+ * identity a client asserts is exactly as self-asserted as the one the
+ * config holds and costs nothing when the config is broken, so it is the
+ * one this row carries. Omitted stays omitted: no identity is invented.
+ */
 function contextPackOutcomeCorrelation(args: Record<string, unknown>): {
   host?: string;
   sessionId?: string;
   turnId?: string;
+  agentId?: string;
 } {
   const host = optionalStringArg("brain_context_pack_outcome", args, "host");
   const sessionId = optionalStringArg("brain_context_pack_outcome", args, "session_id");
   const turnId = optionalStringArg("brain_context_pack_outcome", args, "turn_id");
+  const agentId = optionalStringArg("brain_context_pack_outcome", args, "agent_id");
   return {
     ...(host !== undefined ? { host } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(turnId !== undefined ? { turnId } : {}),
+    ...(agentId !== undefined ? { agentId } : {}),
+  };
+}
+
+/**
+ * The acting agent's assertion about the sample, coerced at the tool
+ * boundary. A malformed member is REFUSED here rather than dropped: a
+ * claim silently discarded would land an evidence record reading
+ * `unclaimed`, which asserts the agent said nothing when in fact it said
+ * something unusable.
+ */
+function contextPackEvidenceClaim(raw: unknown): ContextPackEvidenceClaim | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      "brain_context_pack_outcome: evidence_claim must be an object",
+    );
+  }
+  const claim = raw as Record<string, unknown>;
+  const finalTextHash = optionalStringArg(
+    "brain_context_pack_outcome",
+    claim,
+    CONTEXT_PACK_EVIDENCE_FIELD.finalTextHash,
+  );
+  const itemCount = coerceNonNegativeInteger(
+    "brain_context_pack_outcome",
+    CONTEXT_PACK_EVIDENCE_FIELD.itemCount,
+    claim[CONTEXT_PACK_EVIDENCE_FIELD.itemCount],
+  );
+  const finalTextChars = coerceNonNegativeInteger(
+    "brain_context_pack_outcome",
+    CONTEXT_PACK_EVIDENCE_FIELD.finalTextChars,
+    claim[CONTEXT_PACK_EVIDENCE_FIELD.finalTextChars],
+  );
+  if (finalTextHash === undefined && itemCount === undefined && finalTextChars === undefined) {
+    return undefined;
+  }
+  return {
+    ...(finalTextHash !== undefined ? { finalTextHash } : {}),
+    ...(itemCount !== undefined ? { itemCount } : {}),
+    ...(finalTextChars !== undefined ? { finalTextChars } : {}),
   };
 }
 
@@ -1121,7 +1192,7 @@ export const RECALL_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_context_pack_outcome",
     previewBudget: MCP_PREVIEW_BUDGET,
     description:
-      "Agent-operable context-pack outcome loop. `post` records a compact outcome row for a carried sample id — first-pass/repair/retry counters plus three SEPARATE token signals (exact, modeled, observed) — and calibrates the token-impact ledger. `list`/`summary` read rows. Gated, payload-safe.",
+      "Context-pack outcome loop. `post` records an outcome row for a carried sample id — first-pass/repair/retry counters plus three SEPARATE token signals (exact, modeled, observed) — calibrates the token-impact ledger, and records the kernel's on-disk evidence. `list`/`summary` read rows. Gated.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1171,9 +1242,43 @@ export const RECALL_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           description:
             "post (optional): OBSERVED provider-reported token usage. Kept separate from the exact and modeled signals; also calibrates the token-impact ledger.",
         },
+        evidence_claim: {
+          type: "object",
+          // Every client pays for this string on every request (the
+          // registry guard caps it at 160 chars), so the reasoning lives
+          // on `contextPackEvidenceClaim` below and the wire text states
+          // only what a caller must know to use the field correctly: the
+          // FOUR verdicts it can produce, and that a malformed member is
+          // refused rather than downgraded - the earlier "Never rejects"
+          // described the disagreement path and read as covering both.
+          description:
+            "post (optional): what you assert about this sample; kernel reads its receipt off disk, records match|mismatch|unclaimed|unresolved. Malformed = INVALID_PARAMS.",
+          properties: {
+            final_text_hash: {
+              type: "string",
+              description: "Claimed SHA-256 of the assembled pack text.",
+            },
+            item_count: {
+              type: "integer",
+              minimum: 0,
+              description: "Claimed number of artifacts the pack injected.",
+            },
+            final_text_chars: {
+              type: "integer",
+              minimum: 0,
+              description: "Claimed codepoint length of the assembled pack text.",
+            },
+          },
+          additionalProperties: false,
+        },
         host: { type: "string", description: "Optional host/runtime label; also a filter." },
         session_id: { type: "string", description: "Optional session id recorded on the row." },
         turn_id: { type: "string", description: "Optional turn id recorded on the row." },
+        agent_id: {
+          type: "string",
+          description:
+            "post (optional): the ACTING agent, recorded on all three rows this post lands. Self-asserted, never a verifier; omitted records no actor rather than a guess.",
+        },
         since: { type: "string", description: "Optional inclusive lower timestamp bound." },
         until: { type: "string", description: "Optional inclusive upper timestamp bound." },
         limit: {

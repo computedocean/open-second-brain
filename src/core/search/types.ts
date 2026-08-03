@@ -147,6 +147,19 @@ export interface IndexStats {
    */
   readonly frontmatterNotices: ReadonlyArray<DegradationNotice>;
   /**
+   * Indexed documents whose EVENT ANCHOR has never been resolved by an
+   * anchor-aware binary (v11) - the rows a pre-anchor index carried
+   * across the in-place schema migration.
+   *
+   * Not the same as "documents that declare no date": that verdict is
+   * recorded, this is its absence. It cannot fall to zero on its own,
+   * because both content-identity fastpaths correctly decline to
+   * recompute an anchor for content that did not change and those
+   * documents' content never changes. `o2b search event-anchor-backfill
+   * --apply` is what closes it.
+   */
+  readonly eventAnchorsPending: number;
+  /**
    * Typed edges blocked by the schema pack's `link_constraints` during
    * this run's materialization post-pass
    * (write-time-integrity-governance). Empty when no constraints are
@@ -728,6 +741,20 @@ export interface ResolvedEmbeddingConfig {
   readonly timeoutMs: number;
   readonly concurrency: number;
   readonly batchSize: number;
+  /**
+   * Per-request token budget for one embedding batch
+   * (provenance-at-the-boundary E1). When set, a batch closes on whichever
+   * cap fills first - {@link batchSize} items or this many estimated tokens
+   * - so a run of long chunks cannot assemble a request that exceeds the
+   * provider's per-request token ceiling. The estimate is `estimateTokens`
+   * from `embeddings/signature.ts`, the same estimator the indexer's cost
+   * gate uses, applied to the text as it will be sent (instruction prefix
+   * included). Optional: when the `embedding_batch_tokens` key is absent the
+   * field is absent too and batching is byte-identical to the fixed
+   * `batchSize` stride. A single text whose own estimate exceeds the budget
+   * is sent alone rather than dropped or split.
+   */
+  readonly batchTokens?: number;
   /**
    * Per-batch transient-retry budget (attempts, not extra retries) for
    * 429 / 5xx / network errors. Default 6, raised from the former hardcoded

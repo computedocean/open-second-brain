@@ -31,6 +31,7 @@ import {
 
 import { SearchError } from "./types.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
+import type { EventAnchor } from "./event-anchor.ts";
 import { readSchemaVersion } from "./schema.ts";
 
 import * as aliases from "./store/aliases.ts";
@@ -84,6 +85,7 @@ export {
 export { normalizeAlias } from "./store/aliases.ts";
 
 export type { DocumentInput, DocumentSummary } from "./store/documents.ts";
+export type { EventAnchor } from "./event-anchor.ts";
 export type { ChunkInput, ChunkRow, HydratedChunk } from "./store/chunks.ts";
 export type { KeywordHit } from "./store/keyword.ts";
 export type { LinkInput, LinkResolutionCounts } from "./store/links.ts";
@@ -305,6 +307,38 @@ export class Store {
 
   getDocumentIdByPath(path: string): number | null {
     return documents.getDocumentIdByPath(this.db, path);
+  }
+
+  /**
+   * The materialised event anchor of one path (v11), or null when the
+   * document is absent or declared no readable date. The query-side
+   * event-time resolver consults this instead of re-scanning the note's
+   * body on every query.
+   */
+  eventAnchorForPath(path: string): EventAnchor | null {
+    return documents.eventAnchorForPath(this.db, path);
+  }
+
+  /**
+   * Vault-relative paths of documents no anchor-aware binary has ever
+   * examined (v11) - the rows a pre-anchor index carried across the
+   * migration, which are NOT the same as documents that declare no date.
+   */
+  unexaminedEventAnchorPaths(): string[] {
+    return documents.unexaminedEventAnchorPaths(this.db);
+  }
+
+  /** How many documents no anchor-aware binary has ever examined (v11). */
+  countUnexaminedEventAnchors(): number {
+    return documents.countUnexaminedEventAnchors(this.db);
+  }
+
+  /**
+   * Record one already-indexed document's event anchor and mark it
+   * examined, touching nothing else on the row. The backfill's only write.
+   */
+  setEventAnchor(path: string, anchor: EventAnchor | null): void {
+    documents.setEventAnchor(this.db, path, anchor);
   }
 
   upsertDocument(doc: documents.DocumentInput): number {

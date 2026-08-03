@@ -20,12 +20,23 @@
  * authoritative cross-source citation list, so an entity page cites the
  * source that first introduced it without being clobbered on every later
  * mention.
+ *
+ * Trust: the caller may declare where the material came from
+ * ({@link IntakeOptions.trust}); when it does not, the trust is DERIVED from
+ * the sources the provenance cites, through the same structural classifier
+ * both callers use (see {@link resolveIntakeTrust} for why the undeclared
+ * case cannot simply read as trusted). An untrusted intake writes in the
+ * registry's quarantine lane: the entities it introduces land quarantined and
+ * marked, and they are records of what an untrusted source claimed rather
+ * than edits to what the operator already holds.
  */
 
 import { isKnownRelation, normalizeRelation } from "../../graph/relation-vocab.ts";
 import { validateEntityCategory, normalizeEntityName } from "../entities/canonical.ts";
-import { getEntity, relateEntities, upsertEntity } from "../entities/registry.ts";
+import { relateEntities, upsertEntity } from "../entities/registry.ts";
 import { renderProvenanceSection, type Provenance } from "../provenance/provenance.ts";
+import { INTAKE_TRUST, type IntakeTrust } from "../trust/untrusted-provenance.ts";
+import { classifySourceTrust } from "./source-trust.ts";
 
 /** One entity the agent extracted from a source. */
 export interface IntakeEntity {
@@ -58,6 +69,13 @@ export interface IntakeOptions {
   readonly now: Date;
   /** When set, its Sources section is stamped into newly created entity bodies. */
   readonly provenance?: Provenance;
+  /**
+   * Whether the material this extraction came from carries the vault's own
+   * authority. Both in-repo callers declare it, deriving it from the source
+   * identity through `classifySourceTrust`. Absent → derived here from the
+   * cited provenance; see {@link resolveIntakeTrust}.
+   */
+  readonly trust?: IntakeTrust;
 }
 
 export interface IntakeResult {
@@ -119,6 +137,35 @@ function validateIntake(intake: ExtractionIntake): void {
 }
 
 /**
+ * The trust this intake commits under.
+ *
+ * A declared trust wins: the caller classified the identity it actually read
+ * from, which is more than this primitive can see. When nothing is declared,
+ * the CITED sources decide, through the one structural classifier - reading
+ * an undeclared trust as trusted would have made "the caller forgot" and "the
+ * operator wrote it" the same answer, and a hostile page is exactly the input
+ * that arrives with a source cited and no classification done. Several
+ * sources resolve conservatively: an extraction drawn from a mixed batch
+ * cannot be split back apart afterwards, so one source outside the vault
+ * makes the whole intake untrusted.
+ *
+ * An intake that cites NO source and declares no trust is the one case this
+ * function cannot decide, and it keeps the pre-change verdict so a caller
+ * that never knew about trust behaves identically. That is deliberately not
+ * where the question is answered: nothing here can ask the caller what it
+ * read, so the MCP boundary - which can - refuses an intake that names no
+ * source at all rather than routing an unanswerable one down either lane.
+ */
+function resolveIntakeTrust(vault: string, opts: IntakeOptions): IntakeTrust {
+  if (opts.trust !== undefined) return opts.trust;
+  const sources = opts.provenance?.sources ?? [];
+  if (sources.length === 0) return INTAKE_TRUST.trusted;
+  return sources.every((source) => classifySourceTrust(vault, source) === INTAKE_TRUST.trusted)
+    ? INTAKE_TRUST.trusted
+    : INTAKE_TRUST.untrusted;
+}
+
+/**
  * Intake a typed extraction into the entity registry. Validates the full
  * payload first (throwing {@link IntakeValidationError} with no write on
  * failure), then upserts entities and applies relations idempotently.
@@ -131,19 +178,20 @@ export function intakeExtraction(
   validateIntake(intake);
 
   const provenanceSection = opts.provenance ? renderProvenanceSection(opts.provenance) : "";
+  const untrustedOrigin = resolveIntakeTrust(vault, opts) === INTAKE_TRUST.untrusted;
 
   const entitiesCreated: string[] = [];
   const entitiesUpdated: string[] = [];
 
   for (const entity of intake.entities) {
     const category = validateEntityCategory(entity.category);
-    const existing = getEntity(vault, { category, query: entity.name });
     // Stamp provenance into the body only when creating the page, so a later
-    // mention of the same entity does not overwrite its first citation.
-    const body =
-      existing === null && provenanceSection
-        ? `# ${entity.name.trim()}\n\n${provenanceSection}`
-        : undefined;
+    // mention of the same entity does not overwrite its first citation. The
+    // registry decides whether this is a creation, in the lane it writes in;
+    // asking here would answer for the canonical lane only.
+    const bodyOnCreate = provenanceSection
+      ? `# ${entity.name.trim()}\n\n${provenanceSection}`
+      : undefined;
     const res = upsertEntity(vault, {
       category,
       name: entity.name,
@@ -151,7 +199,8 @@ export function intakeExtraction(
       agent: opts.agent,
       now: opts.now,
       ...(entity.confidence !== undefined ? { confidence: entity.confidence } : {}),
-      ...(body !== undefined ? { body } : {}),
+      ...(bodyOnCreate !== undefined ? { bodyOnCreate } : {}),
+      ...(untrustedOrigin ? { untrustedOrigin } : {}),
     });
     if (res.created) entitiesCreated.push(res.entity.id);
     else entitiesUpdated.push(res.entity.id);
@@ -167,6 +216,10 @@ export function intakeExtraction(
       relation: rel.relation,
       to: { query: rel.to, ...(rel.toCategory !== undefined ? { category: rel.toCategory } : {}) },
       now: opts.now,
+      // Same lane as the entities this intake just wrote, so an untrusted
+      // extraction links its own quarantined records instead of reaching the
+      // operator's records that happen to carry those names.
+      ...(untrustedOrigin ? { untrustedOrigin } : {}),
     });
     relationsApplied += 1;
   }
