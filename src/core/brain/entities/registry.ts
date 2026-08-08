@@ -31,10 +31,18 @@ import {
   assertValidEntityLabel,
   entityIdentityKey,
   normalizeEntityName,
+  quoteVariantCollisionTail,
   validateEntityCategory,
 } from "./canonical.ts";
 import { resolveEntityLabelDenylist } from "./label-hygiene.ts";
-import { buildEntityIndex, parseEntityFile, type EntityIndex } from "./index-builder.ts";
+import {
+  buildEntityIndex,
+  conflictClaimants,
+  ENTITY_CONFLICT_KIND,
+  findEntityConflict,
+  parseEntityFile,
+  type EntityIndex,
+} from "./index-builder.ts";
 import { ENTITY_STATUS_SCOPE, entityStatusInScope } from "./status-scope.ts";
 import {
   INTAKE_TRUST,
@@ -129,12 +137,47 @@ export interface ArchiveEntityOptions {
 
 // ----- Lookup ----------------------------------------------------------------
 
-/** A category-less reference matched entities in several categories. */
+/**
+ * The label of `entity` that a normalized `query` actually matched: its
+ * canonical name when that is what matched, otherwise the alias that did.
+ *
+ * A collision message must compare the forms that COLLIDED. Falling back
+ * to the canonical name when an alias matched would compare the wrong
+ * pair, and the quote-variant cause would then be named on a collision it
+ * does not explain, or omitted from one it does.
+ */
+function matchedLabel(entity: BrainEntity, query: string): string {
+  if (normalizeEntityName(entity.name) === query) return entity.name;
+  return entity.aliases.find((a) => normalizeEntityName(a) === query) ?? entity.name;
+}
+
+/**
+ * A reference matched more than one record.
+ *
+ * Two readings, and the message must not offer the wrong one. Across
+ * categories the reference is under-specified and the exit is the
+ * category - the message this error has always carried. WITHIN one
+ * category it is not under-specified at all: two canonical records claim
+ * one identity key, no category can separate them, and telling the
+ * operator to pass one would name an exit that cannot work. The quote
+ * fold is one way a vault arrives there, and when it is the cause the
+ * message says so and names the command that ends it.
+ */
 export class EntityAmbiguityError extends Error {
-  constructor(query: string, ids: ReadonlyArray<string>) {
-    super(
-      `entity reference '${query}' is ambiguous across categories: ${ids.join(", ")} - pass a category`,
-    );
+  constructor(query: string, matches: ReadonlyArray<BrainEntity>) {
+    const ids = matches.map((m) => m.id).join(", ");
+    const categories = new Set(matches.map((m) => m.category));
+    if (categories.size > 1) {
+      super(`entity reference '${query}' is ambiguous across categories: ${ids} - pass a category`);
+    } else {
+      const normalized = normalizeEntityName(query);
+      const tail = quoteVariantCollisionTail(...matches.map((m) => matchedLabel(m, normalized)));
+      super(
+        `entity reference '${query}' is claimed by ${matches.length} canonical records in one ` +
+          `category (${[...categories][0]}): ${ids} - no category separates them, so one must be ` +
+          `archived or merged${tail}`,
+      );
+    }
     this.name = "EntityAmbiguityError";
   }
 }
@@ -160,12 +203,7 @@ function resolveActive(index: EntityIndex, ref: EntityRef): BrainEntity | null {
       (normalizeEntityName(e.name) === query ||
         e.aliases.some((a) => normalizeEntityName(a) === query)),
   );
-  if (matches.length > 1) {
-    throw new EntityAmbiguityError(
-      ref.query,
-      matches.map((m) => m.id),
-    );
-  }
+  if (matches.length > 1) throw new EntityAmbiguityError(ref.query, matches);
   return matches[0] ?? null;
 }
 
@@ -186,12 +224,7 @@ function resolveQuarantined(index: EntityIndex, ref: EntityRef): BrainEntity | n
       (normalizeEntityName(e.name) === query ||
         e.aliases.some((a) => normalizeEntityName(a) === query)),
   );
-  if (matches.length > 1) {
-    throw new EntityAmbiguityError(
-      ref.query,
-      matches.map((m) => m.id),
-    );
-  }
+  if (matches.length > 1) throw new EntityAmbiguityError(ref.query, matches);
   return matches[0] ?? null;
 }
 
@@ -319,14 +352,22 @@ function checkAliasClaims(
     seen.add(normalized);
     const aliasHolder = index.byAlias.get(normalized);
     if (aliasHolder && aliasHolder.id !== selfId) {
+      // The holder's own spelling of the claimed form, so the collision
+      // message can say whether the two labels differ by anything other
+      // than quote shape. Falling back to its canonical name would compare
+      // the wrong pair, so the alias that actually matched is found first.
+      const heldForm =
+        aliasHolder.aliases.find((a) => normalizeEntityName(a) === normalized) ?? aliasHolder.name;
       throw new Error(
-        `alias '${alias}' is already claimed by ${aliasHolder.id} (${aliasHolder.path})`,
+        `alias '${alias}' is already claimed by ${aliasHolder.id} (${aliasHolder.path})` +
+          quoteVariantCollisionTail(alias, heldForm),
       );
     }
     const nameHolder = index.byKey.get(`${category}:${normalized}`);
     if (nameHolder && nameHolder.id !== selfId) {
       throw new Error(
-        `alias '${alias}' collides with the canonical name of ${nameHolder.id} (${nameHolder.path})`,
+        `alias '${alias}' collides with the canonical name of ${nameHolder.id} (${nameHolder.path})` +
+          quoteVariantCollisionTail(alias, nameHolder.name),
       );
     }
     kept.push(alias);
@@ -343,6 +384,42 @@ function allocateEntityId(index: EntityIndex, category: string, name: string): s
     const candidate = `${base}-${i}`;
     if (!taken.has(candidate)) return candidate;
   }
+}
+
+/**
+ * Refuse a write onto an identity key more than one canonical record
+ * already claims.
+ *
+ * The index keeps the walk's FIRST claimant in `byKey` so reads stay
+ * deterministic, which is right for a read and wrong for a write: the
+ * update arm would rewrite that record's `source_agent`, `updated_at` and
+ * body, keep its label rather than the caller's, leave every other
+ * claimant untouched, and report `created: false` - which reads as
+ * "already there". A caller cannot tell that from a successful update,
+ * and the record it did not mean to write was chosen by directory order.
+ *
+ * Refused for ANY contested key, not only the quote-variant one: the
+ * silent wrong-record write does not depend on how the vault arrived at
+ * two claimants. When the fold IS how it arrived, the message adds the
+ * cause and the registered command, because that is the collision an
+ * operator meets for the first time straight after an upgrade.
+ *
+ * Only the canonical lane is checked. `conflicts` is built at the
+ * canonical status scope, so a quarantined namesake is not a claimant of
+ * this key; the untrusted lane's own multiple-match case is the ambiguity
+ * error in {@link resolveQuarantined}.
+ */
+function assertIdentityKeyUncontested(index: EntityIndex, key: string, category: string): void {
+  const conflict = findEntityConflict(index, ENTITY_CONFLICT_KIND.duplicateName, key);
+  if (conflict === null) return;
+  const claimants = conflictClaimants(index, conflict);
+  const listed = claimants.map((c) => `${c.id} (${c.path})`).join(", ");
+  const tail = quoteVariantCollisionTail(...claimants.map((c) => c.name));
+  throw new Error(
+    `identity '${key}' (${category}) is claimed by ${conflict.paths.length} canonical entity ` +
+      `records: ${listed} - a write would land on the first of them and leave the rest, so it ` +
+      `is refused. Archive or merge the duplicates first${tail}.`,
+  );
 }
 
 // ----- Operations ------------------------------------------------------------
@@ -365,6 +442,7 @@ export function upsertEntity(vault: string, input: UpsertEntityInput): UpsertEnt
   // first, alias second, and never across the trusted/untrusted boundary.
   const untrusted = input.untrustedOrigin === true;
   const key = entityIdentityKey(category, name);
+  if (!untrusted) assertIdentityKeyUncontested(index, key, category);
   const target = resolveWriteTarget(index, { category, query: name }, untrusted);
 
   if (target === null) {
@@ -586,7 +664,8 @@ export function archiveEntity(
     if (holder) {
       throw new Error(
         `cannot restore ${target.id}: ${holder.id} already holds '${target.name}' ` +
-          `(${target.category}). Archive or rename ${holder.id} first, or merge the two.`,
+          `(${target.category}). Archive or rename ${holder.id} first, or merge the two` +
+          `${quoteVariantCollisionTail(target.name, holder.name)}.`,
       );
     }
   }

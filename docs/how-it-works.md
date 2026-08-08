@@ -776,10 +776,16 @@ Key behaviours, all driven from `Brain/_brain.yaml`-free `search_*` /
   unless `--force-cost`, and the local / unlisted-model price is 0.
 - **Fusion modes (v0.36.0).** `search_fusion_mode` is `linear` (default,
   the weighted sum below) or `rrf` - Reciprocal Rank Fusion, which scores
-  each candidate `Σ 1/(search_rrf_k + rank_in_lane)` across the keyword
-  and semantic lanes, min-max-normalised to `[0,1]`. RRF is weightless
-  and replaces only the relevance term; every boost below still applies,
-  and `linear` is bit-identical to pre-v0.36.0 ranking.
+  each candidate `Σ w_lane/(search_rrf_k + rank_in_lane)` across the
+  keyword and semantic lanes, min-max-normalised to `[0,1]`. RRF ignores
+  the configured `search_keyword_weight` / `search_semantic_weight` -
+  those calibrate two score magnitudes and this fusion reads none - but
+  `w_lane` does carry the per-query intent profile (and the learned
+  recall weights), so a quoted phrase favours the lexical lane in both
+  fusion modes. A query that declares no intent weights both lanes 1,
+  which is the classic weightless term. RRF replaces only the relevance
+  term; every boost below still applies, and `linear` is bit-identical to
+  pre-v0.36.0 ranking.
 - **Ranking.** `final_score = clamp01(keyword_weight·norm_BM25 +
 semantic_weight·cosine + link_boost + recency_boost + entity_boost)`
   (linear mode; in `rrf` mode the first two terms are replaced by the
@@ -850,7 +856,10 @@ semantic_weight·cosine + link_boost + recency_boost + entity_boost)`
   vectors.
 
 The MCP `brain_search` tool returns at most 50 results with each
-chunk's `content` truncated to 600 characters; diagnostic score
+chunk's `content` capped at 600 characters - a window centred on the
+first significant query term the chunk contains, marked with an ellipsis
+on whichever side was cut, and the head of the chunk when it contains
+none; diagnostic score
 components (`keywordScore`, `semanticScore`, `linkBoost`,
 `recencyBoost`) are intentionally absent from the MCP shape — they
 live in the CLI's `--verbose` output only, to keep the agent context

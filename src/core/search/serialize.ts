@@ -5,7 +5,7 @@
  */
 
 import type { StampMismatch } from "../integrity/stamp.ts";
-import type { IndexStatusSnapshot, SearchCard } from "./types.ts";
+import type { ChunkWindowCensus, IndexStatusSnapshot, SearchCard } from "./types.ts";
 
 /**
  * Wire shape for a stamp comparison. `recorded` is what the index
@@ -36,6 +36,51 @@ export function serializeSearchCard(c: SearchCard): Record<string, unknown> {
     document_id: c.documentId,
     chunk_id: c.chunkId,
     ...(c.origin !== undefined ? { origin: c.origin } : {}),
+    // Exact-duplicate merge (task D): the `path:Lstart-Lend` pointers the
+    // surviving card was folded from. Absent, never null, when nothing
+    // was merged - the card carries the key only in that case.
+    ...(c.duplicatePointers !== undefined ? { duplicate_pointers: c.duplicatePointers } : {}),
+  };
+}
+
+/**
+ * Wire shape of an oversize-chunk census verdict, shared by the index
+ * run's report and the status snapshot so the two cannot describe one
+ * verdict with different field names.
+ *
+ * No `next_command` here: whether a surface names an exit beside a
+ * verdict is that surface's decision, and the index run spreads its own
+ * on top. Baking one in would put a command on the status field the
+ * ruling deliberately keeps out of the warning channel.
+ */
+export function serializeChunkWindowCensus(census: ChunkWindowCensus): Record<string, unknown> {
+  if (census.verdict === "window-undeclared") {
+    return {
+      verdict: census.verdict,
+      model: census.model,
+      chunks_measured: census.chunksMeasured,
+    };
+  }
+  if (census.verdict === "estimate-undecided") {
+    // No `chunks_over_window` here on the same terms the undeclared
+    // verdict carries no window: nothing was proved over it.
+    return {
+      verdict: census.verdict,
+      model: census.model,
+      window_tokens: census.windowTokens,
+      chunks_undecided: census.chunksUndecided,
+      chunks_measured: census.chunksMeasured,
+    };
+  }
+  return {
+    verdict: census.verdict,
+    model: census.model,
+    window_tokens: census.windowTokens,
+    chunks_over_window: census.chunksOverWindow,
+    // Absent, never zero - an index the estimate decided in full emits
+    // the record it emitted before the undecided band existed.
+    ...(census.chunksUndecided === undefined ? {} : { chunks_undecided: census.chunksUndecided }),
+    chunks_measured: census.chunksMeasured,
   };
 }
 
@@ -67,6 +112,15 @@ export function serializeIndexStatus(s: IndexStatusSnapshot): Record<string, unk
     ...(s.embeddingAbi.length > 0
       ? { embedding_abi: serializeStampMismatches(s.embeddingAbi) }
       : {}),
+    // Emitted only when the oversize-chunk census could NOT run, on the
+    // same terms and for the same reason: a status over a model with a
+    // declared window is byte-identical to the pre-census output. The
+    // two verdicts the census reaches by measuring - overflow, and the
+    // band its estimate cannot decide - are not here; both are warnings,
+    // because both name a command.
+    ...(s.chunkWindowUndeclared === undefined
+      ? {}
+      : { chunk_window_undeclared: serializeChunkWindowCensus(s.chunkWindowUndeclared) }),
     warnings: s.warnings,
   };
 }

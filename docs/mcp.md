@@ -101,7 +101,9 @@ alias-to-replacement table lives in `docs/updating.md`.
 `vec:`, and `hyde:` lanes; `focus_query` / `focus_path_prefix` to steer a
 single call; `since` / `until` time ranges (ISO date/datetime, `today`,
 `yesterday`, `last week`, `last month`, or `<n>h`/`<n>d`/`<n>w` shorthand,
-filtered on document mtime); `include_superseded: true` to keep superseded
+filtered on event time - frontmatter validity first, then the
+body-derived anchor, with document mtime only as the last rung);
+`include_superseded: true` to keep superseded
 predecessors undemoted (history mode); and `evidence_pack: true` to return
 significant/matched/missing terms, abstention text, terminal-state downrank
 reasons, per-result `why_retrieved`, IDF-weighted coverage with rare-term
@@ -109,6 +111,21 @@ classification, per-token `union_records` for uncovered terms, and a
 `completeness` verdict whose `uncovered_but_present_in_corpus` list is the
 false-absence guard. It can also emit opt-in recall telemetry with
 `telemetry: true`.
+Since v1.44.0 `explain: true` adds two top-level receipts alongside the
+per-result `score_breakdown`: `retrieval_decision_trace` (evaluated /
+surfaced / excluded counts plus every excluded candidate as a compact
+reference with its structural reasons) and `memory_trust_assessment` (the
+same exclusion set as a reason histogram). Both are by-products of the
+retrieval trust gate; with the gate off the response carries
+`retrieval_trace_unavailable` naming the switch that produces them
+(`search_trust_gate_enabled`) instead of going quiet. Without `explain` no
+key appears at all. In the same release `total` stopped echoing the row
+count: it is the ranked candidate pool the `limit` sliced the returned rows
+from, so `total > results.length` means the ranker had more candidates
+than it handed you. Read it as candidates ranked, not as a corpus
+statistic: the pool is capped at roughly three times the requested
+`limit`, so it moves with `limit` and saturates on a large vault, and
+link traversal can add a document that matched no term at all.
 A deterministic summary-search router (t_7b96f242) inspects each query for
 structural summary signals - a source-targeted `source:<path>` token, or a
 `kind:<t>`/`type:<t>` token whose value is a declared artifact kind in the

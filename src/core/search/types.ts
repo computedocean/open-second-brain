@@ -114,6 +114,112 @@ export interface QueryPlan {
   readonly temporalIntent?: TemporalIntent;
 }
 
+/**
+ * Result of the oversize-chunk census: what the configured chunk size
+ * actually produced, measured against the configured embedding model's
+ * DECLARED input window.
+ *
+ * The census owns a token ESTIMATE, not a tokenizer, so it answers with a
+ * two-sided bound and three reportable states rather than a boolean:
+ *
+ *   - `over-window`  - the low estimate already exceeds the window, so
+ *     the request is over it whatever the real tokenizer does;
+ *   - `estimate-undecided` - the low estimate fits and the high estimate
+ *     does not. Characters-over-four is a Latin-script rule of thumb; on
+ *     Han text a BERT-family tokenizer is roughly character-level, and on
+ *     supplementary-plane text SQLite and JavaScript disagree about what
+ *     a "character" is. In that band the census cannot tell, and says so;
+ *   - `window-undeclared` - the model is outside the curated preset
+ *     table, so there is no window to compare against at all.
+ *
+ * "The census ran and every chunk fits under BOTH bounds" is the ABSENCE
+ * of this value - a check with nothing to report has nothing to say, and
+ * a field that is present-and-zero is a field every consumer has to
+ * interpret. Absence is only ever produced when the bound the code can
+ * actually back was cleared; the two states it cannot back are the two
+ * verdicts above, which is what stops silence from meaning a pass the
+ * estimate never earned.
+ *
+ * The census is not taken at all when there is no model whose window
+ * could be exceeded - semantic search disabled, or the offline local
+ * embedder, which hashes features over the whole text and has no input
+ * window by construction.
+ */
+export type ChunkWindowCensus =
+  | {
+      /** Chunks were measured and some exceed the declared window. */
+      readonly verdict: "over-window";
+      /** The active embedding model the window was declared for. */
+      readonly model: string;
+      /** The model's declared window, in the model's own tokens. */
+      readonly windowTokens: number;
+      /** Chunks whose LOW estimate exceeds `windowTokens`. */
+      readonly chunksOverWindow: number;
+      /**
+       * Chunks in the undecided band beside them. Absent, never zero,
+       * when the estimate decided every remaining chunk - an all-ASCII
+       * index has no band, and its record carries the bytes it carried
+       * before this field existed.
+       */
+      readonly chunksUndecided?: number;
+      /** Chunks the census looked at. */
+      readonly chunksMeasured: number;
+    }
+  | {
+      /**
+       * Every chunk clears the low estimate, but some do not clear the
+       * high one: the census measured them and cannot say.
+       */
+      readonly verdict: "estimate-undecided";
+      /** The active embedding model the window was declared for. */
+      readonly model: string;
+      /** The model's declared window, in the model's own tokens. */
+      readonly windowTokens: number;
+      /** Chunks the estimate cannot place on either side of the window. */
+      readonly chunksUndecided: number;
+      /** Chunks the census looked at. */
+      readonly chunksMeasured: number;
+    }
+  | {
+      /** No window is declared for this model, so nothing was measured. */
+      readonly verdict: "window-undeclared";
+      /** The active model, or null when none is configured. */
+      readonly model: string | null;
+      /** Chunks the census WOULD have looked at. */
+      readonly chunksMeasured: number;
+    };
+
+/**
+ * The census member that reports a check which could not run. Narrowed
+ * out of {@link ChunkWindowCensus} rather than redeclared, so the two
+ * surfaces that carry it cannot drift on its fields.
+ */
+export type ChunkWindowUndeclared = Extract<ChunkWindowCensus, { verdict: "window-undeclared" }>;
+
+/**
+ * Registered diagnostic codes for the two census verdicts, resolved
+ * through `core/brain/next-step.ts`. Declared beside the verdict they
+ * belong to so the core surface that formats the warning and the CLI
+ * surface that serializes the record cannot drift on which code names
+ * which state.
+ */
+export const CHUNK_WINDOW_CODE = Object.freeze({
+  "over-window": "search-chunk-window-overflow",
+  // The same exit as measured overflow, and deliberately: the two states
+  // differ in what the census KNOWS, not in what an operator does about
+  // it. Chunks the estimate cannot place inside the window are fixed by
+  // the one lever that fixes chunks known to be outside it - lower
+  // `search_chunk_size` and rebuild - so pointing somewhere else would
+  // invent a second remedy for one cause.
+  "estimate-undecided": "search-chunk-window-overflow",
+  "window-undeclared": "search-chunk-window-undeclared",
+} as const);
+
+/** The registered diagnostic code for a census verdict. */
+export function chunkWindowDiagnosticCode(census: ChunkWindowCensus): string {
+  return CHUNK_WINDOW_CODE[census.verdict];
+}
+
 export interface IndexStats {
   readonly added: number;
   readonly updated: number;
@@ -207,6 +313,17 @@ export interface IndexStats {
    * backend ran (`backend === "semantic"`).
    */
   readonly deferredReason: string | null;
+  /**
+   * Oversize-chunk census over the index this run left behind. Present
+   * ONLY when it has something to report: chunks that exceed the
+   * configured model's declared input window, chunks the estimate cannot
+   * place inside it, or a model for which no window is declared and the
+   * check therefore did not run. Absent when the census cleared BOTH of
+   * its bounds, and absent when there is no model whose window could be
+   * exceeded - so a run that has nothing to say about it emits the bytes
+   * it emitted before this field existed.
+   */
+  readonly chunkWindow?: ChunkWindowCensus;
   readonly durationMs: number;
 }
 
@@ -261,6 +378,26 @@ export interface IndexStatusSnapshot {
    * emitted only when there is drift.
    */
   readonly embeddingAbi: ReadonlyArray<StampMismatch>;
+  /**
+   * The oversize-chunk census's UNMEASURABLE state: the configured
+   * embedding model is outside the curated preset table, so it declares
+   * no input window and no chunk could be compared against one. Present
+   * only in that state, which makes this surface distinguish four things
+   * a single boolean could not - measured clean under both bounds
+   * (absent, and no warning), measured overflow and measured-undecidable
+   * (absent here, one line each in {@link warnings}), and not measurable
+   * at all (this field).
+   *
+   * Deliberately NOT a warning, unlike the overflow it sits beside. The
+   * convention this snapshot already follows is that the structured
+   * field says WHAT is true and the warning says what to run; there is
+   * no command that declares a window for someone else's model, and a
+   * line repeated on every status call for the majority of real
+   * configurations is what teaches operators to stop reading warnings.
+   * Reporting it as a field keeps the statement - nothing here claims
+   * the check passed - without spending the warning channel on it.
+   */
+  readonly chunkWindowUndeclared?: ChunkWindowUndeclared;
   readonly warnings: ReadonlyArray<string>;
 }
 
@@ -330,6 +467,22 @@ export interface SearchCard {
   readonly pointer: string;
   /** Cross-vault origin label, mirrored from the source result when set. */
   readonly origin?: string;
+  /**
+   * Locations of the exact duplicates folded into this row
+   * (what-the-index-already-knew, task D), as `path:Lstart-Lend`
+   * pointers in the same grammar as {@link SearchCard.pointer}.
+   *
+   * Pointers rather than the full {@link DuplicatePassageLocation}
+   * records the ranked row carries: a folded passage is byte-identical to
+   * the surviving one, so the caller never needs to expand a copy — it
+   * needs to know where else the same bytes live, and a card exists to be
+   * small.
+   *
+   * Present ONLY when at least one byte-identical passage was merged
+   * away, so a corpus that holds no duplicate passages produces cards
+   * byte-identical to pre-merge ones. Never empty when present.
+   */
+  readonly duplicatePointers?: ReadonlyArray<string>;
 }
 
 export interface ExpandHitInput {
@@ -657,12 +810,30 @@ export interface SearchOptions {
 export interface SearchOutcome {
   readonly results: ReadonlyArray<BrainSearchResult>;
   readonly warnings: ReadonlyArray<string>;
+  /**
+   * Size of the ranked candidate pool the `limit` window was sliced out
+   * of (what-the-index-already-knew, task F) - NOT the number of returned
+   * rows, which is `results.length` (or `cards.length`). It answers the
+   * one question the row count cannot: how many candidates were ranked
+   * and then dropped. Always >= the returned row count, since those rows
+   * are the pool's prefix; equal to it only when the pool fit inside the
+   * limit. Zero when nothing matched.
+   *
+   * It is the pool retrieval actually ranked, not a corpus COUNT: the
+   * lanes fetch a widened but bounded candidate set, so on a large vault
+   * this is a lower bound on the number of matching chunks, never an
+   * over-count.
+   *
+   * The pool is the post-rank set, so gate-excluded candidates are not
+   * counted here - they are reported, with their reasons, on
+   * {@link SearchOutcome.retrievalDecisionTrace}.
+   */
   readonly total: number;
   /**
    * Layer-1 compact cards (progressive disclosure). Present only when the
    * caller set `disclosure: "cards"`; in that mode `results` is empty and
-   * `total` counts the cards. Absent on the default `full` path, keeping
-   * the legacy outcome shape byte-identical.
+   * the cards carry the surfaced rows. Absent on the default `full` path,
+   * keeping the legacy outcome shape byte-identical.
    */
   readonly cards?: ReadonlyArray<SearchCard>;
   readonly evidencePack?: EvidencePack;
@@ -724,9 +895,19 @@ export interface SearchOutcome {
   readonly surface?: QuerySurface;
 }
 
+/**
+ * The closed set of embedding backends `makeProvider` can build.
+ *
+ * Named rather than written inline because a second reader now has to
+ * exhaust it: the oversize-chunk census asks which backend prepends an
+ * instruction prefix to the text it sends, and that question has to fail
+ * to COMPILE when a backend is added rather than silently answer "none".
+ */
+export type EmbeddingProviderName = "openai-compat" | "disabled" | "local" | "zeroentropy";
+
 export interface ResolvedEmbeddingConfig {
   readonly enabled: boolean;
-  readonly provider: "openai-compat" | "disabled" | "local" | "zeroentropy";
+  readonly provider: EmbeddingProviderName;
   readonly baseUrl: string | null;
   readonly model: string | null;
   readonly apiKey: string | null;
