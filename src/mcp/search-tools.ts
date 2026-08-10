@@ -15,6 +15,7 @@ import {
   EMBEDDING_QUOTA_MESSAGE,
   evaluateSurfacingGate,
   expandHit,
+  indexRootCoverage,
   indexStatus,
   resolveSearchConfig,
   search,
@@ -36,6 +37,16 @@ import {
   resolveRecallGateTelemetry,
 } from "../core/config.ts";
 import { assessRecallAdequacy } from "../core/brain/recall-adequacy.ts";
+import {
+  classifyNegativeRecall,
+  NEGATIVE_RECALL_STATE,
+  NEGATIVE_RECALL_UNKNOWN_REASONS,
+  type CoverageIndexSnapshot,
+  type CoverageScope,
+  type NegativeRecallState,
+  type NegativeRecallVerdict,
+} from "../core/brain/negative-recall.ts";
+import { resolveNoteRoots } from "../core/brain/notes/note-walk.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "./protocol.ts";
 import type { ServerContext, ToolDefinition } from "./tool-contract.ts";
 import {
@@ -66,7 +77,7 @@ import {
   type RecallQualitySignals,
   type RecallSignalsUnmeasured,
 } from "../core/brain/recall-telemetry.ts";
-import { emitGateTelemetry } from "../core/brain/gate-telemetry.ts";
+import { emitGateTelemetry, emitNegativeRecallTelemetry } from "../core/brain/gate-telemetry.ts";
 import { emitGatedTelemetry } from "../core/brain/continuity/emit.ts";
 import { recordQueryDemand, recordRecallAdequacyDemand } from "../core/brain/query-demand.ts";
 
@@ -398,12 +409,35 @@ const RECALL_GATE_INPUT_SCHEMA: Record<string, unknown> = {
       maxItems: 200,
       items: { type: "number" },
       description:
-        "Optional top-k recall relevance scores. When given, the gate adds an adequacy verdict: sufficient/proceed, weak/re_recall, or insufficient/abstain.",
+        "Optional top-k recall scores. Adds an adequacy verdict: sufficient/proceed, weak/re_recall, insufficient/abstain. An empty array adds the negative verdict.",
     },
   },
   required: ["prompt"],
   additionalProperties: false,
 };
+
+/**
+ * The negative-recall states `brain_recall_gate` can actually produce.
+ *
+ * The vocabulary is three states wide (`NEGATIVE_RECALL_STATES` in
+ * `core/brain/negative-recall.ts`); this surface reaches two of them. `did_not_happen` is missing because
+ * {@link assessNegativeRecall} supplies neither of the two things that
+ * state requires - stored retraction evidence and the caller's assertion
+ * of non-occurrence - and it reads no claim graph to find any. Declaring
+ * the full vocabulary here would leave a client unable to tell "this
+ * surface cannot say that" from "it did not happen this time", which is
+ * the same conflation between an unanswerable check and a passing one
+ * that the negative-recall unit exists to remove.
+ *
+ * Enforced, not documentary: the server validates every response against
+ * this schema, so wiring an evidence read into the gate without widening
+ * this list fails the contract loudly instead of emitting an undeclared
+ * value. Order follows the vocabulary's weakest-to-strongest ordering.
+ */
+export const RECALL_GATE_NEGATIVE_STATES: ReadonlyArray<NegativeRecallState> = Object.freeze([
+  NEGATIVE_RECALL_STATE.notFound,
+  NEGATIVE_RECALL_STATE.unknown,
+]);
 
 const RECALL_GATE_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
   type: "object",
@@ -430,6 +464,43 @@ const RECALL_GATE_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
         top_score: { type: "number" },
         mean_score: { type: "number" },
         reason: { type: "string" },
+      },
+    },
+    // Typed negative recall (silence-is-not-an-answer, U2). Present only
+    // when the caller reported no usable result, mirroring `adequacy`
+    // above: absent - never null - when it does not apply.
+    negative: {
+      type: "object",
+      required: ["state", "complete", "reason"],
+      properties: {
+        state: { type: "string", enum: [...RECALL_GATE_NEGATIVE_STATES] },
+        complete: { type: "boolean" },
+        reason: { type: "string" },
+        unknown_reason: { type: "string", enum: [...NEGATIVE_RECALL_UNKNOWN_REASONS] },
+        coverage: {
+          type: "object",
+          required: ["digest", "documents", "chunks", "embeddings", "scope", "unindexed_roots"],
+          properties: {
+            digest: { type: "string" },
+            documents: { type: "integer" },
+            chunks: { type: "integer" },
+            // Declared beside `chunks` because the pair is the claim: a
+            // count below the chunk count is an index a semantic query
+            // could not read out in full.
+            embeddings: { type: "integer" },
+            index_path: { type: "string" },
+            // Three fields whose value is an integer/string OR null.
+            // The output-schema vocabulary declares one type per node
+            // and has no union, so they are declared untyped rather
+            // than declared wrongly: a `string` here would make the
+            // never-indexed case fail its own contract.
+            schema_version: {},
+            embedding_signature: {},
+            last_indexed_at: {},
+            scope: { type: "array", items: { type: "string" } },
+            unindexed_roots: { type: "array", items: { type: "string" } },
+          },
+        },
       },
     },
   },
@@ -932,6 +1003,22 @@ async function toolBrainRecallGate(
   emitGatedTelemetry(resolveRecallGateTelemetry(ctx.configPath ?? undefined), () =>
     recordRecallAdequacyDemand(ctx.vault, { query: prompt, verdict }),
   );
+  // Typed negative recall (silence-is-not-an-answer, U2). The adequacy
+  // verdict above judges the HITS; this judges the CORPUS they were drawn
+  // from, and only a zero-usable-result attempt has a corpus statement to
+  // make. Persisted behind the same `recall_gate_telemetry` opt-in and the
+  // same fail-open kernel as everything else this handler writes.
+  const negative = verdict.resultCount === 0 ? await assessNegativeRecall(ctx) : null;
+  if (negative !== null) {
+    emitGatedTelemetry(resolveRecallGateTelemetry(ctx.configPath ?? undefined), () => {
+      const sessionId = coerceStringOptional(args, "session_id", 512);
+      return emitNegativeRecallTelemetry(ctx.vault, {
+        prompt,
+        verdict: negative,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      });
+    });
+  }
   return {
     ...decision,
     adequacy: {
@@ -943,7 +1030,66 @@ async function toolBrainRecallGate(
       mean_score: verdict.meanScore,
       reason: verdict.reason,
     },
+    // Absent, never null, when the attempt had usable results - the
+    // convention the `explain` trace and the `adequacy` block above set.
+    ...(negative !== null ? { negative } : {}),
   };
+}
+
+/**
+ * Both root sets unresolved. Handed to the classifier when the index
+ * facts could not be read at all, which it reports as
+ * `unknown`/`coverage-unavailable` - deliberately not as an absent index
+ * and never as an exhaustively searched one.
+ */
+const UNRESOLVED_COVERAGE_SCOPE: CoverageScope = Object.freeze({
+  authorizedRoots: Object.freeze([]),
+  indexedRoots: Object.freeze([]),
+});
+
+/**
+ * The corpus statement behind a zero-result recall attempt.
+ *
+ * Gathers the two universes the verdict is judged against - what the
+ * index holds (`indexStatus`) and which authorized note roots it actually
+ * reached (`indexRootCoverage` over `resolveNoteRoots`) - and hands them
+ * to the pure classifier.
+ *
+ * It supplies no retraction evidence and asserts nothing, which is why
+ * this surface declares only {@link RECALL_GATE_NEGATIVE_STATES}: a gate
+ * that reads no claim graph has no grounds for `did_not_happen`, and
+ * inventing grounds on the zero-result path is a design decision taken
+ * separately from this wiring.
+ *
+ * Every read is attempted before anything is committed to, so a failure
+ * anywhere leaves BOTH inputs unresolved rather than half-resolved: a
+ * partially gathered picture is exactly the material a misleading
+ * `not_found` would be built from. The failure is not swallowed either;
+ * it surfaces as the named `coverage-unavailable` reason, which is the
+ * whole point of the unit.
+ */
+async function assessNegativeRecall(ctx: ServerContext): Promise<NegativeRecallVerdict> {
+  let snapshot: CoverageIndexSnapshot | null = null;
+  let scope: CoverageScope = UNRESOLVED_COVERAGE_SCOPE;
+  try {
+    const config = resolveSearchConfig({
+      vault: ctx.vault,
+      configPath: ctx.configPath ?? undefined,
+    });
+    const status = await indexStatus(config);
+    const authorizedRoots = resolveNoteRoots(ctx.vault);
+    // Skip the second open when there is nothing it could answer: no
+    // index to read, or no note root the operator authorized.
+    const indexedRoots =
+      status.exists && authorizedRoots.length > 0
+        ? (await indexRootCoverage(config, authorizedRoots)).rootsWithDocuments
+        : [];
+    snapshot = status;
+    scope = { authorizedRoots, indexedRoots };
+  } catch {
+    // Deliberately empty: the unresolved defaults above ARE the report.
+  }
+  return classifyNegativeRecall({ snapshot, scope });
 }
 
 /**

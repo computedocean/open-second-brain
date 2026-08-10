@@ -62,6 +62,7 @@ import {
   BRAIN_SKILL_PROPOSALS_REJECTED_REL,
   BRAIN_SNAPSHOTS_REL,
   BRAIN_SOURCES_REL,
+  BRAIN_STANDING_RULES_FILE,
   BRAIN_STATE_REL,
   BRAIN_TENSIONS_REL,
   BRAIN_THESES_REL,
@@ -205,6 +206,21 @@ export function brainActivePath(vault: string): string {
  */
 export function brainLessonsPath(vault: string): string {
   return ensureInsideVault(join(brainDirs(vault).brain, BRAIN_LESSONS_FILE), vault);
+}
+
+/**
+ * Path of the operator-authored standing-rules file
+ * (`Brain/standing-rules.md`, silence-is-not-an-answer U8).
+ *
+ * Unlike every other artefact at this level it is written by hand and
+ * never by this system: `dream` does not generate it, no CLI verb
+ * rewrites it, and the note-target resolver refuses it to every
+ * caller-named write tool because its first path segment is `Brain`.
+ * Read by the `SessionStart` hook ahead of the memory layer and by
+ * `brain_context`.
+ */
+export function brainStandingRulesPath(vault: string): string {
+  return ensureInsideVault(join(brainDirs(vault).brain, BRAIN_STANDING_RULES_FILE), vault);
 }
 
 /** Path of the transient current-task scratchpad read by `brain_context`. */
@@ -537,10 +553,49 @@ export function snapshotsDir(vault: string): string {
   return brainDirs(vault).snapshots;
 }
 
+/**
+ * Filename suffix of the Markdown-tree archive. The extension stays
+ * `.zst` even when the host only has gzip: the restore probes the magic
+ * bytes rather than the name, and one suffix keeps the listing filter a
+ * single comparison.
+ */
+export const SNAPSHOT_ARCHIVE_SUFFIX = ".tar.zst";
+
+/**
+ * Filename suffix of the derived-store archive that may sit BESIDE the
+ * tar for the same run id.
+ *
+ * Beside, not inside: the extractor requires a `Brain/` root and the
+ * restore is defined as "live `Brain/` equals archive `Brain/` minus the
+ * excluded entries", so a second top-level member in the tar would break
+ * both invariants. Keeping the file in the SAME `.snapshots/` directory
+ * keeps listing and retention one family with one loop.
+ */
+export const SNAPSHOT_STORE_ARCHIVE_SUFFIX = ".store.sqlite.zst";
+
 /** Snapshot archive path: `Brain/.snapshots/<run_id>.tar.zst`. */
 export function snapshotPath(vault: string, runId: string): string {
   const id = validateRunId(runId);
-  return ensureInsideVault(join(brainDirs(vault).snapshots, `${id}.tar.zst`), vault);
+  return ensureInsideVault(
+    join(brainDirs(vault).snapshots, `${id}${SNAPSHOT_ARCHIVE_SUFFIX}`),
+    vault,
+  );
+}
+
+/**
+ * Derived-store archive path:
+ * `Brain/.snapshots/<run_id>.store.sqlite.zst`.
+ *
+ * Built through the same run-id validation and vault containment as
+ * {@link snapshotPath}, because it is written into the same directory
+ * from the same caller-supplied id and deserves no weaker guard.
+ */
+export function snapshotStorePath(vault: string, runId: string): string {
+  const id = validateRunId(runId);
+  return ensureInsideVault(
+    join(brainDirs(vault).snapshots, `${id}${SNAPSHOT_STORE_ARCHIVE_SUFFIX}`),
+    vault,
+  );
 }
 
 /** Artifacts root: `Brain/.artifacts/`. */

@@ -8,9 +8,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { aggregateUnmetRecall } from "../../src/core/brain/query-demand.ts";
+import {
+  NEGATIVE_RECALL_STATE,
+  NEGATIVE_RECALL_STATES,
+} from "../../src/core/brain/negative-recall.ts";
+import { assertOutputContract } from "../../src/mcp/output-contract.ts";
+import { RECALL_GATE_NEGATIVE_STATES } from "../../src/mcp/search-tools.ts";
+import { resolveSearchConfig } from "../../src/core/search/index.ts";
+import { indexVault } from "../../src/core/search/indexer.ts";
 import { buildToolTable, findTool } from "../../src/mcp/tools.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
 
@@ -82,6 +90,124 @@ test("gate honours configurable thresholds", async () => {
   })) as { adequacy: Record<string, unknown> };
   // 0.7 would be sufficient at the default 0.6 floor, but not at 0.9.
   expect(out.adequacy["level"]).toBe("weak");
+});
+
+// ----- typed negative recall (U2) -------------------------------------------
+//
+// The adequacy verdict says the hits were too weak; the negative block
+// says what the corpus behind them was. It rides only on the
+// zero-usable-result path, where a "no" is otherwise indistinguishable
+// from a "no" over an index that was never built.
+
+test("gate attaches a negative block when the query yields no usable result", async () => {
+  const gate = tool("brain_recall_gate");
+  const out = (await gate.handler(ctx(), {
+    prompt: "reactor coolant",
+    scores: [],
+  })) as { negative?: Record<string, unknown> };
+  // The server enforces the declared output schema on every call, so the
+  // block and its declaration have to agree here rather than in
+  // production. Handler-level tests otherwise never see that check.
+  assertOutputContract(gate.name, gate.outputSchema, out);
+  expect(out.negative).toBeDefined();
+  // No index exists in this temp vault, so the honest answer is that
+  // nothing is known about the corpus - never a silent not_found.
+  expect(out.negative!["state"]).toBe("unknown");
+  expect(out.negative!["unknown_reason"]).toBe("index-absent");
+  expect(out.negative!["complete"]).toBe(false);
+  expect(out.negative!["coverage"]).toBeUndefined();
+});
+
+test("gate omits the negative block entirely when scores are usable", async () => {
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "reactor coolant",
+    scores: [0.83],
+  })) as Record<string, unknown>;
+  expect(out["adequacy"]).toBeDefined();
+  // Absent, never null - the convention the explain trace already sets.
+  expect("negative" in out).toBe(false);
+});
+
+test("gate omits the negative block when no scores are supplied at all", async () => {
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "reactor coolant",
+  })) as Record<string, unknown>;
+  expect("negative" in out).toBe(false);
+});
+
+function writeMd(rel: string, body: string): void {
+  const abs = join(vault, rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, body);
+}
+
+async function buildIndex(): Promise<void> {
+  await indexVault(resolveSearchConfig({ vault, configPath }));
+}
+
+test("over a keyword-only index a zero-result attempt is a not_found the receipt qualifies", async () => {
+  writeMd("notes/coolant.md", "# Coolant\n\nThe reactor coolant loop was replaced in March.\n");
+  await buildIndex();
+  const gate = tool("brain_recall_gate");
+  const out = (await gate.handler(ctx(), {
+    prompt: "reactor coolant",
+    scores: [],
+  })) as { negative: Record<string, unknown> };
+  // The populated-receipt shape has to clear the contract too.
+  assertOutputContract(gate.name, gate.outputSchema, out);
+  // No embedding provider is configured here, so the run built chunks and
+  // recorded no model. That is a supported way to run this system, not an
+  // unfinished job, so the negative is admitted rather than refused - a
+  // vault without an embedding key would otherwise never be able to
+  // receive this answer at all.
+  expect(out.negative["state"]).toBe("not_found");
+  expect(out.negative["complete"]).toBe(true);
+  // What makes admitting it honest: the receipt says the search was
+  // keyword-only, and the digest binds that, so the narrower claim is
+  // visible to whoever reads the negative rather than implied by silence.
+  const coverage = out.negative["coverage"] as Record<string, unknown>;
+  expect(coverage["digest"]).toMatch(/^[0-9a-f]{64}$/);
+  expect(coverage["documents"]).toBe(1);
+  expect(coverage["embeddings"]).toBe(0);
+  expect(coverage["embedding_signature"]).toBeNull();
+  expect(coverage["chunks"]).toBeGreaterThan(0);
+  expect(coverage["unindexed_roots"]).toEqual([]);
+});
+
+test("the gate declares only the negative states its handler can produce", async () => {
+  // The gate reads no claim graph, so it supplies neither retraction
+  // evidence nor the assertion, so `did_not_happen` is unreachable here.
+  // Advertising it would leave a client unable to tell "this surface
+  // cannot say that" from "it did not happen this time".
+  const gate = tool("brain_recall_gate");
+  const negative = gate.outputSchema?.properties?.["negative"];
+  const declared = negative?.properties?.["state"]?.enum;
+  expect(declared).toEqual([...RECALL_GATE_NEGATIVE_STATES]);
+  expect(declared).not.toContain(NEGATIVE_RECALL_STATE.didNotHappen);
+  // Not merely documentary: the server validates every response against
+  // this schema, so a future producer of the third state fails loudly
+  // here rather than emitting an undeclared value.
+  expect([...NEGATIVE_RECALL_STATES]).toContain(NEGATIVE_RECALL_STATE.didNotHappen);
+});
+
+test("an authorized note root the index never reached forces unknown and names it", async () => {
+  writeMd("notes/coolant.md", "# Coolant\n\nThe reactor coolant loop was replaced in March.\n");
+  await buildIndex();
+  // Declared AFTER the index run and holding no indexed document: the
+  // authorized universe and the searched universe now disagree.
+  writeFileSync(
+    join(vault, "Brain", "_brain.yaml"),
+    "schema_version: 1\nnotes:\n  read_paths:\n    - notes\n    - archive\n",
+  );
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "reactor coolant",
+    scores: [],
+  })) as { negative: Record<string, unknown> };
+  expect(out.negative["state"]).toBe("unknown");
+  expect(out.negative["unknown_reason"]).toBe("coverage-divergent");
+  const coverage = out.negative["coverage"] as Record<string, unknown>;
+  expect(coverage["scope"]).toEqual(["notes"]);
+  expect(coverage["unindexed_roots"]).toEqual(["archive"]);
 });
 
 test("gate rejects a malformed scores argument", async () => {

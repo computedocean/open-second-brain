@@ -160,8 +160,9 @@ export type BrainApplyOutcome = (typeof BRAIN_APPLY_OUTCOME)[keyof typeof BRAIN_
  * `reject` / `promote` / `retire` record the corresponding state
  * transitions; `noted-redundant` records same-sign signals collapsed onto
  * an active pref; `skip-corrupted-frontmatter` records files dream
- * skipped; `pin` / `unpin` record protected-set changes; `rollback`
- * records a snapshot restore. See §5.5 and §7.4 of the design doc.
+ * skipped; `pin` / `unpin` record protected-set changes; `snapshot` and
+ * `rollback` record the two ends of one recovery: the point being taken
+ * and the restore back to it. See §5.5 and §7.4 of the design doc.
  */
 export const BRAIN_LOG_EVENT_KIND = {
   dream: "dream",
@@ -176,6 +177,19 @@ export const BRAIN_LOG_EVENT_KIND = {
   pin: "pin",
   unpin: "unpin",
   rollback: "rollback",
+  /**
+   * `snapshot` (silence-is-not-an-answer, U7) - a recovery point was
+   * written to `Brain/.snapshots/`. This is the counterpart the log has
+   * been missing since `rollback` shipped: the restore was recorded and
+   * the point it restores to was not, so the only trace a recovery point
+   * left was a file with an opaque name and an mtime. Payload carries the
+   * `run_id`, the {@link BRAIN_SNAPSHOT_REASON} member that explains why
+   * the point was taken, and the archive `size_bytes`. Emitted
+   * best-effort: a log-append failure never fails the snapshot, because
+   * the archive is the load-bearing artifact and the destructive
+   * operation it guards must not be aborted over an audit line.
+   */
+  snapshot: "snapshot",
   /**
    * `signal-suppressed` — a fresh signal landed on a topic that the
    * user explicitly retired via `o2b brain reject <pref> --reason`.
@@ -507,6 +521,89 @@ export const BRAIN_LOG_EVENT_KIND_SET: ReadonlySet<string> = new Set(
  */
 export function isBrainLogEventKind(value: string): value is BrainLogEventKind {
   return BRAIN_LOG_EVENT_KIND_SET.has(value);
+}
+
+/**
+ * Why a recovery point was taken (silence-is-not-an-answer, U7).
+ *
+ * The snapshot family is the only revertible history this project has,
+ * and until now every entry in it was an opaque run id plus an mtime. The
+ * reasons existed de facto - as run-id PREFIXES at five call sites, three
+ * of them inline string literals - and nothing parsed them back, so an
+ * operator could not ask which recovery point covers a given boundary or
+ * filter the revertible history by why it happened. This is that axis,
+ * made first-class: written into the manifest sidecar, read back by the
+ * listing, and never inferred from the run id.
+ *
+ * ## Why members nothing writes yet are not dead code
+ *
+ * FOUR MEMBERS HAVE NO PRODUCER IN THIS RELEASE: `session-boundary`,
+ * `plan-boundary`, `decision-boundary` and `manual`. Snapshots at those
+ * three seams are DEFERRED on purpose - it changes how often snapshots
+ * happen, which interacts with retention and with the optional
+ * derived-store archive, and that is a frequency change worth measuring
+ * before it ships. `manual` is deferred for a different reason: nothing
+ * takes a recovery point on demand. No CLI verb and no MCP tool does, and
+ * `takeSnapshot` is reached only by the destructive-operation gate, so
+ * `manual` is a reason a later release (or a peer already running one)
+ * may write, not one this build can produce.
+ *
+ * All four are declared here anyway because `.snapshots/` rides the same
+ * peer-to-peer replication as the rest of the vault: a later release
+ * writing one of these reasons produces sidecars that THIS build must
+ * still read, and a guard that rejected them would fail the manifest
+ * closed and lose drift detection on exactly those snapshots. The read
+ * side is the whole point, and it is why `snapshot log --reason` accepts
+ * a producer-less member and honestly lists nothing for it rather than
+ * rejecting the filter.
+ *
+ * The strings are the run-id prefixes already on disk, deliberately: an
+ * operator reading `.snapshots/` and an operator reading the log see one
+ * vocabulary rather than two spellings of it.
+ */
+export const BRAIN_SNAPSHOT_REASON = Object.freeze({
+  /** Pre-consolidation point taken by the dream pass. */
+  dream: "dream",
+  /** Pre-apply point taken before release-owned files are rewritten. */
+  upgrade: "upgrade",
+  /** Pre-write point taken before Claude Code memory is imported. */
+  importClaudeMemory: "import-claude-memory",
+  /** Pre-deletion point taken before a source's derived material is removed. */
+  deleteBySource: "delete-by-source",
+  /** Pre-prune point taken before malformed entity notes are deleted. */
+  entityPrune: "entity-prune",
+  /** Deferred: a session boundary. No producer in this release. */
+  sessionBoundary: "session-boundary",
+  /** Deferred: a plan boundary. No producer in this release. */
+  planBoundary: "plan-boundary",
+  /** Deferred: a decision boundary. No producer in this release. */
+  decisionBoundary: "decision-boundary",
+  /**
+   * Deferred: an operator asking for a recovery point with no operation
+   * behind it. No producer in this release - nothing takes a snapshot on
+   * demand.
+   */
+  manual: "manual",
+} as const);
+
+/** Closed union over {@link BRAIN_SNAPSHOT_REASON}. */
+export type BrainSnapshotReason =
+  (typeof BRAIN_SNAPSHOT_REASON)[keyof typeof BRAIN_SNAPSHOT_REASON];
+
+/** Membership list, in declaration order (producers first, deferred after). */
+export const BRAIN_SNAPSHOT_REASONS: ReadonlyArray<BrainSnapshotReason> = Object.freeze(
+  Object.values(BRAIN_SNAPSHOT_REASON),
+);
+
+/**
+ * Narrow a string read back off a manifest sidecar written by any peer, or
+ * supplied as a CLI filter value. `unknown` rather than `string` because
+ * both of those inputs arrive as parsed JSON or an unvalidated flag.
+ */
+export function isBrainSnapshotReason(value: unknown): value is BrainSnapshotReason {
+  return (
+    typeof value === "string" && (BRAIN_SNAPSHOT_REASONS as ReadonlyArray<string>).includes(value)
+  );
 }
 
 /**
@@ -991,6 +1088,19 @@ export interface BrainRollbackLogEvent extends BrainLogEventBase {
 }
 
 /**
+ * `snapshot` entry — a recovery point was written. The counterpart of
+ * {@link BrainRollbackLogEvent}: the two together are what let an
+ * operator walk from a logged event to the archive that would undo it.
+ */
+export interface BrainSnapshotLogEvent extends BrainLogEventBase {
+  readonly kind: typeof BRAIN_LOG_EVENT_KIND.snapshot;
+  readonly run_id: string;
+  readonly reason: BrainSnapshotReason;
+  /** Byte length of the archive as written. */
+  readonly size_bytes: string;
+}
+
+/**
  * `scan-inline` entry — operator ran `o2b brain scan-inline`. Payload
  * keys are counters: `scanned`, `found`, `created`, `deduped`,
  * `malformed`, `facts`, `skills`, `errors`, plus the agent identity.
@@ -1078,6 +1188,7 @@ export type BrainLogEvent =
   | BrainSkipCorruptedLogEvent
   | BrainPinLogEvent
   | BrainRollbackLogEvent
+  | BrainSnapshotLogEvent
   | BrainScanInlineLogEvent
   | BrainImportSessionLogEvent
   | BrainMergeLogEvent
@@ -1189,6 +1300,19 @@ export interface BrainConfidenceConfig {
 export interface BrainSnapshotsConfig {
   /** Keep this many newest `.snapshots/*.tar.zst`. Positive integer. */
   readonly retention_count: number;
+  /**
+   * Cover the derived SQLite store as well as the Markdown tree.
+   * Default OFF: what coverage protects is the embedding spend, not
+   * information, and every retained archive is replicated to every peer.
+   * See the `snapshot.ts` module header for the full cost argument.
+   */
+  readonly include_derived_store: boolean;
+  /**
+   * Refuse - never truncate - when the live derived store exceeds this
+   * many bytes. Positive integer. Read together with `retention_count`:
+   * the worst case on every peer is the two multiplied.
+   */
+  readonly derived_store_max_bytes: number;
 }
 
 /**
@@ -1244,6 +1368,15 @@ export interface BrainActiveConfig {
    * policy.ts applies.
    */
   readonly inject_budget_chars?: number;
+  /**
+   * Character cap for the operator-authored `Brain/standing-rules.md`
+   * block. Separate from `inject_budget_chars` because the standing
+   * block is EXEMPT from that budget: it is injected ahead of the memory
+   * layer and never passes through the section budgeter, so the two
+   * numbers govern different lanes. Absent means the
+   * STANDING_RULES_MAX_CHARS_DEFAULT from standing-rules.ts applies.
+   */
+  readonly standing_rules_max_chars?: number;
 }
 
 /**
@@ -1836,12 +1969,19 @@ export interface DoctorIssue {
    * byte-identical to what it was.
    */
   readonly field?: string;
-  /** Wikilink target that resolves to nothing (`broken-wikilink`, `broken-backlinks`). */
+  /**
+   * The artifact a reference points at (`broken-wikilink`,
+   * `broken-backlinks`), or the folded key of the state that changed
+   * under its consumers (`stale-dependency`). In both readings it is
+   * what the sources below name.
+   */
   readonly target?: string;
   /**
-   * Basenames of the artifacts that reference {@link target}
-   * (`broken-backlinks`). The dangling target has no file, so the issue
-   * carries no `path`; these sources are what an operator can act on.
+   * The things that reference {@link target}: artifact basenames for
+   * `broken-backlinks`, where the dangling target has no file so the
+   * issue carries no `path` and these are all an operator can act on;
+   * consumer identities for `stale-dependency`, capped at that check's
+   * per-state limit while the message carries the true total.
    */
   readonly sources?: ReadonlyArray<string>;
 }

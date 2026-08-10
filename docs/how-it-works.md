@@ -441,6 +441,25 @@ flowchart LR
   net-negative). Rendered top-N (`lessons.limit`, default 20), ranked
   by decayed salience. Regenerated at the tail of every `dream` pass
   alongside `active.md`, with the same idempotent write.
+- **`Brain/standing-rules.md`** is the one preamble lane the operator
+  writes by hand. It is injected **first**, ahead of the runtime
+  notices and every recalled body, under a header stating that it takes
+  precedence over them. It is **exempt** from the injection budget and
+  capped by its own `active.standing_rules_max_chars` (default 4,000);
+  a capped block says how many lines and characters survived out of how
+  many, and names the file. Because it is read outside the fail-open
+  memory load it survives a memory-layer failure and is never written to
+  the inject cache, so a stale copy can never be served in its place. If
+  the file cannot be read, the block says so and states that no standing
+  rules are in force - it never degrades to silence. Two mechanisms, not
+  one, keep it out of an agent's reach, and the claim is exactly as wide
+  as they are: the file sits under `Brain/`, whose first path segment the
+  note-target resolver refuses for the four caller-named note-write tools
+  (`brain_create_note`, `brain_update_note`, `brain_append_note`,
+  `brain_write_batch`), and `brain_labels` - which takes a caller-named
+  path but resolves it through the weaker containment-only resolver - is
+  refused by a named guard that knows this one file. Nothing generates or
+  rewrites it.
 - **SessionStart hook** (`startup | resume | clear | compact`) injects
   the body as `additionalContext` so the agent sees current rules at
   the start of every session and again after `/compact` - the
@@ -448,11 +467,18 @@ flowchart LR
   event no longer exists in current Claude Code. The injected body is
   budgeted (`active.inject_budget_chars`, default 8,000 chars):
   sections drop deterministically (recently retired first, then
-  quarantine, then most-applied) and a one-line notice points the
-  agent at `brain_context` for the full set. When `Brain/lessons.md`
+  quarantine, then most-applied) and a one-line notice names the
+  sections that were dropped, how many characters survived out of how
+  many, and points the agent at `brain_context` for the full set. When `Brain/lessons.md`
   exists, its (separately budgeted) body is appended so the unified
-  lessons corpus loads on the same surface. Fails closed - any error
-  path exits 0 with no output so the runtime proceeds unaffected.
+  lessons corpus loads on the same surface. Fails soft - every error
+  path in the memory lane exits 0 and the runtime proceeds unaffected,
+  emitting no memory context. The standing-rules block is the one
+  exception, by design: it is read outside that boundary, so a vault
+  with an operator rules file still speaks even when the memory layer
+  is down, and a rules file that cannot be read is stated rather than
+  skipped. The hook emits nothing at all only when there are NEITHER
+  standing rules NOR memory.
 - **MCP Resources** expose the same content for hosts that prefer
   pull access (`osb://preferences/active` and friends in the table
   above). The MCP `initialize` reply advertises the `resources`
@@ -461,7 +487,9 @@ flowchart LR
   writer-scope MCP server. Runtimes that lack a `SessionStart` hook
   _and_ do not auto-load MCP resources (Cursor, Aider, raw Claude
   API) can fetch the same `active.md` body, pinned current-task context,
-  and active-preference counts with a single tool call.
+  and active-preference counts with a single tool call. The standing-rules
+  block leads that content too, and rides an optional `standing_rules`
+  key (path, content, truncated) omitted when the file is absent.
 - **`Brain/pinned.md`** is a transient scratchpad for current-task facts.
   Agents update it through `brain_pinned_context` when a fact should survive
   context rotation but should not become a durable preference. Clearing it
@@ -550,12 +578,18 @@ flowchart TD
 ```
 
 A snapshot captures every file under `Brain/` **except** `.snapshots/`
-itself — otherwise rollback would erase any snapshots taken after
-this one. Retention defaults to ten newest archives.
+and `.artifacts/` — the first because rollback would otherwise erase
+any snapshots taken after this one, the second because it is TTL'd MCP
+tool output documented as never backed up (archiving and hashing it
+made unrelated cache churn trip the drift gate). Retention defaults to
+ten newest archives.
 
 From v0.10.6 every snapshot ships with a SHA-256 sidecar manifest
 (`Brain/.snapshots/<run_id>.manifest.json`) listing every regular
-file under `Brain/` and its hash. `o2b brain rollback` reads the
+file the snapshot **covers** — the same tree, minus the two excluded
+entries named above — and its hash. Hashing a file the archive does
+not contain and the restore does not replace would fire the drift
+gate on churn no rollback could ever undo. `o2b brain rollback` reads the
 sidecar back, rebuilds a fresh manifest from the live tree, and
 compares: any added / removed / changed entry aborts the rollback
 with exit code 2 and a compact drift report on stderr. The intent
@@ -570,9 +604,147 @@ archives still recover cleanly. The same sidecar primitive backs
 `src/core/brain/manifest.ts` as the single source of truth for
 "what does `Brain/` look like right now".
 
+### Derived-store coverage
+
+The derived SQLite store (`<vault>/.open-second-brain/brain.sqlite`)
+is a sibling of `Brain/`, not a member of it, and it used to be in no
+snapshot, no manifest and no rollback — with nothing saying so, so a
+pre-restore diff rendered a complete-looking picture while the
+embeddings silently stayed at whatever the live store held.
+
+What coverage protects is **spend, not information**. Feedback,
+activation and tuning are replayable JSON folds inside `Brain/`; only
+the embeddings and a tier baseline are database-only, so a lost store
+costs an embedding bill and a reindex, never a fact. Against that:
+retention keeps ten archives and `.snapshots/` rides the same
+peer-to-peer replication as the rest of the vault, so every retained
+copy lands on every device. Hence the three-part answer:
+
+- **Opt-in.** `snapshots.include_derived_store` defaults to `false`.
+- **A ceiling that refuses.** `snapshots.derived_store_max_bytes`
+  (256 MiB by default) is compared against the live store and the
+  snapshot **throws** when it is exceeded, naming the measured size.
+  Half a database is not a recovery point, so it is never truncated.
+- **The live store size in every manifest**, included or not, so an
+  operator who has never enabled coverage still sees what it would
+  cost.
+
+When coverage is on, `createSnapshot` resolves the store path through
+the search layer's resolver, refuses when the file is absent, takes the
+**same writer lock** every indexer serialises on, runs the structural
+integrity scanner and refuses a condemned store rather than archiving
+it over a good snapshot, checks the ceiling, then `VACUUM INTO`s a
+temporary file and compresses it to
+`Brain/.snapshots/<run_id>.store.sqlite.zst`. `VACUUM INTO` rather than
+a file copy because the store runs in WAL mode and the runtime exposes
+no online-backup API. The archive sits **beside** the tar rather than
+inside it: the extractor requires a `Brain/` root and the restore is
+defined as "live `Brain/` equals archive `Brain/` minus the excluded
+entries", so a second top-level tar member would break both contracts.
+Keeping it in the same directory keeps listing and retention one
+family with one loop.
+
+Any of those steps failing is a **refusal**, not a skip: `createSnapshot`
+throws and leaves no tar behind, so the destructive-snapshot gate —
+which already aborts before the operation when the snapshot throws —
+simply does not run the mutation it could not fully protect.
+
+The manifest records what happened under an additive `derived_store`
+key **at the existing schema version** (bumping it would make every
+older peer silently lose drift detection on new snapshots): whether it
+was included, the resolved source path, the archive name, the digest
+over the archived bytes, the compressed size, the live store size
+always, and one of four named exclusion reasons —
+`not-requested`, `absent`, `integrity-fault`, `over-size-ceiling`.
+A sidecar with **no** `derived_store` key predates the feature and
+renders as `unknown`, never as excluded.
+
+Retention deletes the store archive alongside the tar and the sidecar.
+`rollback` replaces the store only when the manifest says it was
+included, decompressing to a sibling temp file and renaming it into
+place under the writer lock — the same swap discipline the indexer
+uses — and prints in every case which answer applied: **replaced**,
+**not restored** with the recorded reason, **record missing** when there
+is no record but a store archive is sitting beside the tar (the sidecar
+write is non-fatal, so coverage can run and leave nothing behind saying
+so), or **unknown** when there is neither a record nor an archive. The
+third and fourth used to share one sentence that named the feature as
+absent while the feature's own archive was on disk.
+
+### Why a recovery point was taken
+
+Two histories existed here and did not join. The Brain event log is
+richly typed, per-device sharded and machine-primary, and it recorded a
+`rollback`; the snapshot family is the only **revertible** history, and
+every entry in it was an opaque run id plus an mtime. The reasons existed
+de facto — as run-id **prefixes** at five call sites, three of them inline
+string literals — and nothing parsed them back, so an operator could not
+ask which recovery point covers a given boundary, could not filter the
+revertible history by why it happened, and could not walk from a logged
+event to the archive that would undo it.
+
+Every snapshot now carries a typed reason from one closed vocabulary
+(`BRAIN_SNAPSHOT_REASON`): `dream`, `upgrade`, `import-claude-memory`,
+`delete-by-source`, `entity-prune` for the five destructive call sites,
+plus four members with **no producer in this release** —
+`session-boundary`, `plan-boundary`, `decision-boundary` for boundaries a
+later release may snapshot at, and `manual`, because nothing takes a
+recovery point on demand: no CLI verb and no MCP tool does, and the
+take-snapshot entry point is reached only by the destructive-operation
+gate. The reason is required by
+`createSnapshot`, doubles as the run-id prefix so the filename and the
+recorded provenance can never disagree, and is stamped into the manifest
+sidecar as an additive `snapshot_reason` key **at the existing schema
+version** — same reasoning as the derived-store key: bumping it would make
+every older peer silently lose drift detection on new snapshots.
+
+A sidecar with **no** reason reads as `unknown` and the reason is **never**
+reconstructed from the run-id prefix that happens to spell it. That
+inference would look correct on almost every archive this project writes,
+and would manufacture provenance for an unstamped, hand-named or
+third-party archive at exactly the moment an operator is deciding whether
+to overwrite their live tree with it. An unregistered reason fails the
+whole manifest closed, as one malformed file entry already does.
+
+Each created recovery point also emits one `snapshot` log event carrying
+the run id, the reason and the archive size — the counterpart the log has
+been missing since `rollback` shipped, which recorded the restore while
+the point it restores to left no trace but a filename. The append is
+best-effort: `createSnapshot` runs before the mutation the
+destructive-snapshot gate protects, so a throw would turn a lost audit
+line into a refused mutation.
+
+Taking snapshots **at** session, plan and decision boundaries is
+deliberately **not** shipped. That changes how often snapshots happen,
+which interacts with retention and with the optional derived-store
+archive. An **on-demand** snapshot verb is not shipped either, for its
+own reasons: every recovery point this build takes exists to protect a
+specific mutation that is about to run, and an operator-triggered
+snapshot is a separate decision about retention pressure and about what
+an operator does with a point nothing was going to overwrite. The
+vocabulary carries all four members anyway so this build can read a
+sidecar a later release writes and replicates back — which also means
+`snapshot log --reason manual` is a valid filter over a history that,
+in this release, no local operation can add to.
+
 ### Read-only inspectors over the snapshot family
 
-Two CLI surfaces share the same diff renderer over the snapshot
+With `snapshot log` the family is complete: **log / diff / revert**.
+
+- **`o2b brain snapshot log`** — newest-first listing of every recovery
+  point (by archive mtime, because a hand-named run id carries no
+  timestamp to sort on): run id, created-at, reason, archive size,
+  whether a drift manifest is present, and the derived-store record.
+  `--reason <reason>` filters by why it happened and rejects an
+  unregistered value with a usage exit (2) rather than an empty listing,
+  which would say "you have no such snapshots" when the truth is "that is
+  not a reason". `--limit <n>` caps the listing, `--json` yields the
+  structured rows. An empty snapshots directory exits 0; a snapshots
+  directory that exists and **cannot be read** exits non-zero naming the
+  path, because "no snapshots available" over an unenumerable directory is
+  the same substitution one line up.
+
+Two further surfaces share the same diff renderer over the snapshot
 extraction primitive (`extractSnapshotToTemp`), so previewing and
 auditing stay byte-equal:
 
@@ -585,6 +757,10 @@ auditing stay byte-equal:
   supplied (and snapshot ↔ live when only one is). `--json` yields
   the structured `BrainTreeDiff` payload for scripting.
 
+`rollback --list`, the confirmation prompt and the `--json` result all
+name the reason too — it is the one fact that distinguishes two archives
+minted seconds apart.
+
 The diff classifies every file under each root into six artifact
 kinds (preference, retired, signal, log, config, other). Preference
 and retired files receive a typed field-level diff for the derived
@@ -592,6 +768,17 @@ counters (`_status`, `_applied_count`, `_violated_count`,
 `_confidence`, `_confidence_value`, `pinned`, and a few identity
 adjuncts); other kinds compare by byte equality and surface as
 `(body changed)`.
+
+The `log` kind covers every shape the log path helpers write —
+`<date>.md`, `<date>.jsonl` and their per-device `<date>.<deviceId>.…`
+shards — and it decides that through the recogniser in `log-jsonl.ts`,
+the module whose contract is that the shard layout lives in exactly one
+place. The differ used to carry a pattern of its own, which is how it
+came to predate sharding and classify both the per-device markdown and
+the machine-primary JSONL as `other`, mislabelling the surface a
+`rollback --dry-run` is most likely to be showing. Ledgers and
+subdirectories under `log/` (`capture-decisions.jsonl`, `dream-runs/`,
+`pref-audit/`) are not days of the log and stay in the catch-all class.
 
 ## Primary agent declaration
 
@@ -893,11 +1080,44 @@ a compact `Brain/profile.md` digest plus a `.o2bfs` root marker, and
 Proactive insight: `o2b brain trigger scan` converts semantic-health
 and retention findings into Markdown trigger records under
 `Brain/triggers/` with a strict lifecycle (pending, delivered,
-acknowledged, acted, dismissed, expired). Stable cooldown keys make
-scans idempotent, and the morning brief delivers pending triggers at
-most once per cooldown window - the Brain remembers what the operator
-already saw, dismissed, or acted on instead of rediscovering it every
-run. `o2b brain deep-synthesis <topic>` builds a deterministic topic
+acknowledged, acted, dismissed, expired, suppressed). Stable cooldown
+keys make scans idempotent, and the morning brief delivers pending
+triggers at most once per cooldown window - the Brain remembers what
+the operator already saw, dismissed, or acted on instead of
+rediscovering it every run.
+
+`dismissed` and `acted` carry a clock: after `trigger_cooldown_days`
+the same finding may return. `suppressed` carries none, and it is the
+answer for a finding the operator has judged structurally benign -
+`o2b brain trigger suppress <id>` silences that cooldown key
+indefinitely, from any state including an expired or already-acted
+one. It is reversible: suppressing stamps the status it interrupted
+and leaves the delivery and resolution instants untouched, so
+`unsuppress` restores the original state together with its original
+cooldown arithmetic rather than reconstructing them. A suppressed
+trigger is terminal, so it is hidden from `list`, shown in `history`,
+and never reaches the morning brief; `list` prints how many triggers
+are currently suppressed so silence is always accounted for. Silence
+is also audited: a scan whose candidate an existing record silenced -
+suppressed, cooling down, still open, or dropped by the per-kind cap -
+increments `occurrences` and stamps `last_seen_at` on that record, so a
+suppressed finding that keeps firing is distinguishable from one that
+never fired again. The count is per scan, not per candidate: one scan
+seeing the same finding twice counts once, and a candidate silenced
+before any record for its cooldown key existed has no ledger to write to
+and is reported in the scan's skipped list instead.
+
+A record nobody can parse is confined to itself. A hand-edited field is
+still refused rather than degraded, but the refusal now names the file
+and the field and stops there, so `list`, `history`, the brief, delivery,
+a new scan and the transitions all keep working on the records that read
+cleanly - the operator can still dismiss or suppress a healthy trigger
+while a sibling is broken. Every read reports the records it could not
+read next to the ones it could, and the morning brief says the queue is
+unreadable rather than rendering the pending-trigger section as absent,
+which used to be indistinguishable from an empty queue.
+
+`o2b brain deep-synthesis <topic>` builds a deterministic topic
 dossier (agreements, contradictions, stale claims, knowledge gaps)
 and `o2b brain ideas` ranks next directions from open loops; both can
 enqueue their findings as triggers. Opt-in recall-gate telemetry

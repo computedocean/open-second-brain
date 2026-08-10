@@ -45,8 +45,9 @@ o2b brain pin / unpin         (CLI-only) Toggle pinned: true on a preference (ex
 o2b brain set-primary         (CLI-only) Declare or clear primary_agent in Brain/_brain.yaml (--clear)
 o2b brain protect             (CLI-only) Emit / apply native deny rules for Brain/ (--target {claudecode|codex} [--apply])
 o2b brain unprotect           (CLI-only) Remove the Open-Second-Brain-managed deny rules for the chosen target
+o2b brain snapshot log        (CLI-only) Newest-first listing of every recovery point: run id, created_at, typed reason, size, manifest presence, derived-store coverage; --reason filters (unregistered value exits 2), --limit caps, --json
 o2b brain snapshot diff       (CLI-only) Read-only diff between two snapshots, or snapshot vs live Brain/
-o2b brain rollback            (CLI-only) Restore Brain/ from a pre-dream snapshot (--dry-run previews; drift abort vs --force-rollback)
+o2b brain rollback            (CLI-only) Restore Brain/ from a snapshot (--dry-run previews; drift abort vs --force-rollback); --list, the prompt and --json name the snapshot reason ('unknown' when the sidecar records none)
 o2b brain upgrade             (CLI-only) Migrate release-owned files forward (_brain.yaml, _BRAIN.md, _OPEN_SECOND_BRAIN.md); --dry-run / --check / --apply --yes
 o2b brain export              Read-only dump of active preferences (--format json|llms-txt [--out <path>] [--force])
 o2b brain explorer            (CLI-only) Force-directed HTML graph of Brain/preferences + retired; live HTTP on 127.0.0.1 or --export <path> single-file. Keyboard-accessible listbox + localStorage layout persistence. Double-click a node to open it in Obsidian (live mode).
@@ -58,6 +59,8 @@ o2b brain morning-brief       Read-only session-start summary (since v0.21.0): t
 o2b brain codec               Deterministic lossless session codec (since v0.22.0): --compress | --expand over stdin or --in <file>; structured content preserved byte-for-byte
 o2b brain sources             Read-only dashboard of signals by (agent, source_type) (since v0.22.0): active/processed + distinct-topic counts; --json
 o2b brain schema              Runtime schema report/admin (since v0.26.0): report|stats|lint|graph|explain|orphans|apply|sync; mutation writes are locked and audited
+                              report names the pack's integrity: `ok` (digests to what the newest audited apply recorded), `modified` (with both digests), or `unverified` with the reason - `no-apply-recorded`, `audit-unreadable`, or `config-absent`. The digest is over the rendered `schema:` block, so comment and whitespace churn elsewhere in `_brain.yaml` never moves it
+                              sync is NOT implemented and exits non-zero. It previously returned `{updated: 0, skipped: 0}` with a "no backfill was required" note without reading the vault at all, so a caller could not tell "nothing needed doing" from "nothing was done"
 o2b brain schema apply        --mutation '<json>' (repeatable) applies audited, locked mutations to Brain/_brain.yaml; --actor NAME --reason TEXT annotate the audit record
                               --dry-run previews instead (since v1.43.0): it returns the pack that would result plus its leaf-level diff and writes nothing at all - no config write, no audit record, no lock file. Before v1.43.0 `apply` parsed the flag and mutated anyway. The preview runs the same pack validator the apply runs, but NOT the two checks that exist only because the apply writes (the vault-identity write guard, and the atomic writer's re-parse of the rendered YAML), so a batch that renders to unparseable YAML previews clean and fails on apply
 o2b brain watchdog            Probe Brain config/dirs/search index and plan safe recovery (since v0.26.0): --remediate [--dry-run], --restore <run_id> [--force-restore], --json
@@ -156,7 +159,7 @@ o2b brain source              add <vault> --alias <name> | list | remove <alias>
 o2b brain links               normalize [path-prefix] [--mode preserve|full|short] [--write] [--json] - wikilink path format rewrite; dry-run by default; config key wiki_link_format
 o2b brain profile             [--stale-seconds N] [--force] [--json] - materialize Brain/profile.md digest + .o2bfs root marker (age-gated)
 o2b brain sgrep               <query> [path-prefix] [--limit N] [--keyword-only] [--json] - grep-shaped semantic search; path:line: lines; exit 1 on no matches
-o2b brain trigger             scan | list [--status S] | ack <id> | dismiss <id> | act <id> | history [--json] - grounded trigger queue; cooldown via trigger_cooldown_days (default 7)
+o2b brain trigger             scan | list [--status S] | ack <id> | dismiss <id> | act <id> | suppress <id> | unsuppress <id> | history [--json] - grounded trigger queue; cooldown via trigger_cooldown_days (default 7); suppress silences a finding indefinitely and unsuppress restores the status it interrupted; list reports the suppressed count; scan, list and history all print `unreadable: <n>` followed by one line per record the store could not parse - printed at zero too, so an omitted line can never read as a clean queue, and printed BEFORE "no open triggers" so that line is never the only thing said about a queue holding something unparseable
 o2b brain deep-synthesis      <topic> [--limit N] [--triggers] [--json] - deterministic topic dossier: agreements, contradictions, stale claims, knowledge gaps, plus a strongest-objection steelman
 o2b brain ideas               [--cap N] [--triggers] [--json] - ranked next-direction candidates from open questions, orphan notes, aging signals
 o2b brain recall-telemetry    gate-list | gate-summary [--host <name>] [--since <iso>] [--until <iso>] [--limit <n>] [--json] - recall-gate decision telemetry (recall_gate_telemetry, default off)
@@ -567,8 +570,15 @@ See [`hermes-cron.md`](hermes-cron.md) for the cron envelope and Telegram delive
 Reports on external code-project partners. Strictly read-only: never installs, initializes, extracts, or mutates a partner index or the vault.
 
 ```text
-o2b partner codegraph report  Resolve the in-scope code project and report the codegraph index state (no_project | absent | not_indexed | indexed with node/file/edge counts | error) plus a structural Cargo.toml workspace-member list. When indexed, runs a read-only, non-blocking graph-health gate (index.health) that flags empty-graph, collapsed-edges, dangling-references, self-loops, and cache-root-mismatch before labeling/import/recall trust the graph. Non-Rust projects report cargo_workspace: null with a reason. --vault sharpens the scan scope; --json emits the schema-versioned report
+o2b partner codegraph report  Resolve the in-scope code project and report the codegraph index state (no_project | absent | not_indexed | indexed with node/file/edge counts | error) plus a structural Cargo.toml workspace-member list. When indexed, runs a read-only, non-blocking graph-health gate (index.health) that flags empty-graph, collapsed-edges, dangling-references, self-loops, and cache-root-mismatch before labeling/import/recall trust the graph. Non-Rust projects report cargo_workspace: null with a reason. --vault sharpens the scan scope; --json emits the schema-versioned report; --fail-on-health exits 1 unless the index is present AND its health gate is clean, so a scheduled job can branch on it (without the flag the exit stays 0 whatever the report says)
+o2b partner codegraph resync  Print a cron recipe that re-indexes the in-scope code project whenever its commit moves. --cron-template is REQUIRED (there is nothing else this verb does, and it never runs an indexer); --interval accepts <N>m|h|d and defaults to 6h; --project names the repository instead of resolving it from the scan; --vault sharpens that scan. Output is text on stdout and nothing else: the emitted script aborts on a cache-root-mismatch health warning, aborts when jq is missing rather than matching the report loosely, skips quietly when the commit is unchanged, invokes codegraph itself, and records the commit in a stamp under ${XDG_STATE_HOME:-$HOME/.local/state}/open-second-brain only after a --fail-on-health check passes
 ```
+
+Every write in the resync recipe is a shell command the operator's own
+crontab runs on the operator's own host. Open Second Brain never installs,
+initializes, or writes data for codegraph, and rendering the recipe creates
+nothing - which is also why there is no maintenance-lane task that re-indexes
+on its own.
 
 ## Search
 
@@ -603,6 +613,12 @@ o2b search focus clear        Clear the persisted focus file next to the search 
 o2b search reindex            Rebuild the SQLite + FTS5 index from scratch
                               (required after upgrading to v0.13.0 recall schema or v0.26.0 CJK FTS content)
                               --force-cost bypasses the embedding cost gate for this run (since v0.36.0)
+                              --embeddings computes vectors; --concurrency N, --db PATH, --verbose
+                              --cron-template prints a periodic-reindex cron recipe on stdout and
+                              writes nothing at all (no index run, no file, no scheduler entry)
+                              --interval <N>m|h|d sets that recipe's cadence, default 30m; an interval
+                              cron cannot express (seconds, 60m+, 24h+, 28d+) is refused with the
+                              reason rather than rendered as a schedule that means something else
 o2b search index              Incrementally update the index; --embeddings computes vectors
                               --force-cost bypasses the embedding cost gate (since v0.36.0)
 o2b search vector-backfill    Run the vector phase ALONE for indexed chunks that have no vector -

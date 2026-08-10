@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,8 +16,25 @@ import {
   CronTemplateError,
   parseInterval,
   renderCronTemplate,
+  SEARCH_REINDEX_RECIPE,
 } from "../../src/cli/search-cron-template.ts";
 import { runCli } from "../helpers/run-cli.ts";
+
+/**
+ * The rendered template, captured BEFORE the shared cron-recipe kernel was
+ * extracted out of this module. Operators already have this script saved and
+ * scheduled, so a byte of drift here is a byte of drift in their crontab: the
+ * extraction is only correct if it changed nothing at all, and a fixture is
+ * the only assertion that can say so. Anchor assertions cannot - they pass
+ * over any output that still happens to contain the anchors.
+ */
+const PINNED_FIXTURE = join(
+  import.meta.dir,
+  "..",
+  "fixtures",
+  "cron-recipe",
+  "search-reindex-30m.txt",
+);
 
 describe("parseInterval", () => {
   test("30m → */30 * * * *", () => {
@@ -52,6 +69,36 @@ describe("parseInterval", () => {
     expect(() => parseInterval("30s")).toThrow(CronTemplateError);
   });
 
+  test("a day step below the shortest month still renders", () => {
+    // Inside a month the step is the cadence it claims to be, which is the
+    // same bargain the minute and hour fields already make.
+    expect(parseInterval("27d").cron).toBe("0 0 */27 * *");
+  });
+
+  test("28d rejected: the day-of-month field restarts before the step lands", () => {
+    // `*/28` in the day-of-month field means "the 1st, then every 28th day
+    // WITHIN each month", and no month is long enough for a second firing
+    // - so the expression is a monthly schedule wearing a 28-day label.
+    expect(() => parseInterval("28d")).toThrow(CronTemplateError);
+    try {
+      parseInterval("28d");
+    } catch (e) {
+      expect((e as Error).message).toContain("day-of-month");
+    }
+  });
+
+  test("90d rejected rather than silently rendered as a monthly schedule", () => {
+    // The defect this closes: `0 0 */90 * *` fires on the 1st of every
+    // month. Refusing is the same discipline the m and h units already
+    // apply, rather than reinterpreting the operator's cadence.
+    expect(() => parseInterval("90d")).toThrow(CronTemplateError);
+    try {
+      parseInterval("90d");
+    } catch (e) {
+      expect((e as Error).message).toContain("90");
+    }
+  });
+
   test("zero rejected", () => {
     expect(() => parseInterval("0m")).toThrow(CronTemplateError);
   });
@@ -66,6 +113,18 @@ describe("parseInterval", () => {
 });
 
 describe("renderCronTemplate", () => {
+  test("the rendered template is byte-identical to the pinned fixture", () => {
+    expect(renderCronTemplate("30m")).toBe(readFileSync(PINNED_FIXTURE, "utf8"));
+  });
+
+  test("the recipe spec is the one this module still owns", () => {
+    // The fixture would also pass if the module delegated to some OTHER
+    // recipe that happened to render the same text, so pin the identity of
+    // the spec the delegation goes through as well.
+    expect(SEARCH_REINDEX_RECIPE.cronName).toBe("osb-reindex");
+    expect(SEARCH_REINDEX_RECIPE.scriptPath).toBe("~/.local/bin/osb-reindex.sh");
+  });
+
   test("body contains every expected anchor", () => {
     const body = renderCronTemplate("30m");
     expect(body).toContain("Open Second Brain");

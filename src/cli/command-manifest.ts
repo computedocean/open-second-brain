@@ -147,7 +147,21 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("set-primary", "Set primary Brain agent"),
         command("protect", "Emit runtime deny rules for Brain"),
         command("unprotect", "Remove managed runtime deny rules"),
-        command("snapshot", "Inspect Brain snapshots"),
+        command(
+          "snapshot",
+          "Inspect Brain snapshots",
+          [],
+          [
+            command("log", "Newest-first listing of every recovery point with its reason", [
+              flag("vault", "string"),
+              flag("reason", "string"),
+              flag("limit", "string"),
+            ]),
+            command("diff", "Read-only diff between two snapshots, or snapshot vs live", [
+              flag("vault", "string"),
+            ]),
+          ],
+        ),
         command("rollback", "Restore Brain from a snapshot"),
         command("upgrade", "Migrate release-owned Brain files"),
         command("export", "Export active preferences"),
@@ -207,7 +221,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
               flag("actor", "string"),
               flag("reason", "string"),
             ]),
-            command("sync", "Preview Brain schema sync", [
+            command("sync", "Brain schema sync (not implemented; refuses)", [
               flag("vault", "string"),
               flag("dry-run", "boolean"),
               flag("batch-size", "string"),
@@ -281,7 +295,10 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "Agent write sessions: open, submit, approve, abandon, status, list, sweep",
         ),
         command("panel", "Multi-persona decision panel riding the write-session kernel"),
-        command("trigger", "Grounded proactive trigger queue (scan/list/ack/dismiss/act/history)"),
+        command(
+          "trigger",
+          "Grounded proactive trigger queue (scan/list/ack/dismiss/act/suppress/unsuppress/history)",
+        ),
         command("deep-synthesis", "Topic dossier: agreements, contradictions, stale claims, gaps"),
         command("ideas", "Ranked next-direction candidates from open loops"),
         command("entity", "Canonical entity registry: set, get, list, relate, archive"),
@@ -479,8 +496,32 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("verbose", "boolean"),
           flag("explain", "boolean"),
         ]),
-        command("index", "Incrementally update the search index"),
-        command("reindex", "Rebuild the search index"),
+        // Both builders declare their whole `parseFlags` schema for the
+        // same reason `query` does, and `tests/cli/search-query-flag-manifest.test.ts`
+        // holds all three to it: `--cron-template` and `--interval` were
+        // parsed by `reindex` and advertised nowhere, so neither help nor
+        // completions could offer the recipe this CLI knows how to print.
+        command("index", "Incrementally update the search index", [
+          flag("vault", "string"),
+          flag("config", "string"),
+          flag("db", "string"),
+          flag("embeddings", "boolean"),
+          flag("force", "boolean"),
+          flag("force-cost", "boolean"),
+          flag("concurrency", "string"),
+          flag("verbose", "boolean"),
+        ]),
+        command("reindex", "Rebuild the search index", [
+          flag("vault", "string"),
+          flag("config", "string"),
+          flag("db", "string"),
+          flag("embeddings", "boolean"),
+          flag("force-cost", "boolean"),
+          flag("concurrency", "string"),
+          flag("verbose", "boolean"),
+          flag("cron-template", "boolean"),
+          flag("interval", "string"),
+        ]),
         command("watch", "Watch the vault and incrementally sync the index on .md edits"),
         command("status", "Print search index status"),
         command(
@@ -539,7 +580,18 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           [
             command("report", "Report codegraph index status and workspace members", [
               flag("vault", "string"),
+              flag("fail-on-health", "boolean"),
             ]),
+            command(
+              "resync",
+              "Print a cron recipe that re-indexes the code project when its commit moves (requires --cron-template; writes nothing)",
+              [
+                flag("cron-template", "boolean"),
+                flag("interval", "string"),
+                flag("project", "string"),
+                flag("vault", "string"),
+              ],
+            ),
           ],
         ),
       ],
@@ -558,6 +610,38 @@ export function commandNames(manifest: CliRootManifest = CLI_COMMAND_MANIFEST): 
 export function nestedCommandNames(parent: string): string[] {
   const node = CLI_COMMAND_MANIFEST.commands.find((item) => item.name === parent);
   return node?.commands?.map((item) => item.name) ?? [];
+}
+
+/**
+ * Every root command that models nested subcommands, paired with them.
+ *
+ * The completion renderer used to hand-list the three roots it knew about,
+ * so a fourth that grew subcommands was offered by no shell and nothing
+ * anywhere said so. Deriving the groups from the manifest is what makes
+ * the completion surface follow the manifest rather than trail it.
+ */
+export function nestedCommandGroups(
+  manifest: CliRootManifest = CLI_COMMAND_MANIFEST,
+): Array<{ parent: string; children: string[] }> {
+  // Every depth, not only the first. Shell completion keys off the word
+  // immediately before the cursor, so a verb two levels down is reachable
+  // by its own parent's name and needs no path context - which is what
+  // makes a flat, recursively-collected map the right shape here.
+  const byParent = new Map<string, string[]>();
+  const visit = (items: ReadonlyArray<CliCommandManifest>): void => {
+    for (const item of items) {
+      const children = item.commands ?? [];
+      if (children.length === 0) continue;
+      const merged = byParent.get(item.name) ?? [];
+      for (const child of children) {
+        if (!merged.includes(child.name)) merged.push(child.name);
+      }
+      byParent.set(item.name, merged);
+      visit(children);
+    }
+  };
+  visit(manifest.commands);
+  return [...byParent].map(([parent, children]) => ({ parent, children }));
 }
 
 /** One modelled subcommand, e.g. `nestedCommand("search", "query")`. */

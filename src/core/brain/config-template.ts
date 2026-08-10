@@ -56,6 +56,7 @@ import {
   LESSONS_LIMIT_DEFAULT,
   MOST_APPLIED_LIMIT_DEFAULT,
   MOST_APPLIED_WINDOW_DAYS_DEFAULT,
+  STANDING_RULES_MAX_CHARS_DEFAULT,
 } from "./policy.ts";
 import {
   DEFAULT_ANTICIPATORY_MAX_TOKENS,
@@ -224,7 +225,24 @@ export const BRAIN_CONFIG_TEMPLATE: ReadonlyArray<BrainTemplateBlock> = Object.f
     key: "snapshots",
     doc: [],
     emit: "live",
-    keys: [live("retention_count", DEFAULT_BRAIN_CONFIG.snapshots.retention_count)],
+    keys: [
+      live("retention_count", DEFAULT_BRAIN_CONFIG.snapshots.retention_count),
+      def("include_derived_store", DEFAULT_BRAIN_CONFIG.snapshots.include_derived_store === true, [
+        "Also archive the derived SQLite store next to each snapshot.",
+        "Off by default: the store holds embeddings and a tier baseline,",
+        "which cost money to rebuild but carry no information the",
+        "Markdown tree cannot replay - and every retained archive is",
+        "replicated to every peer. The live store size is recorded in",
+        "each snapshot manifest whether or not this is on, so the cost",
+        "of turning it on is visible before you do.",
+      ]),
+      def("derived_store_max_bytes", DEFAULT_BRAIN_CONFIG.snapshots.derived_store_max_bytes, [
+        "Refuse the snapshot when the live store is larger than this.",
+        "A refusal, never a truncation: half a database is not a recovery",
+        "point. Worst case on disk is this times retention_count, on every",
+        "device the vault replicates to.",
+      ]),
+    ],
   },
   {
     key: "vault",
@@ -245,12 +263,18 @@ export const BRAIN_CONFIG_TEMPLATE: ReadonlyArray<BrainTemplateBlock> = Object.f
 
   {
     key: "active",
-    doc: ["Tuning for the active.md body injected at SessionStart."],
+    doc: [
+      "Tuning for the active.md body injected at SessionStart.",
+      "standing_rules_max_chars caps the operator-authored",
+      "Brain/standing-rules.md block, which is injected first and is",
+      "exempt from inject_budget_chars - hence its own number.",
+    ],
     emit: "commented-default",
     keys: [
       def("most_applied_window_days", MOST_APPLIED_WINDOW_DAYS_DEFAULT),
       def("most_applied_limit", MOST_APPLIED_LIMIT_DEFAULT),
       def("inject_budget_chars", INJECT_BUDGET_CHARS_DEFAULT),
+      def("standing_rules_max_chars", STANDING_RULES_MAX_CHARS_DEFAULT),
     ],
   },
   {

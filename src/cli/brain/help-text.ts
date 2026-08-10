@@ -1,11 +1,16 @@
 /**
  * Help text for `o2b brain` and each of its verbs.
  *
- * Pure data: no runtime imports beyond what the dispatcher needs.
+ * Pure data plus one imported constant: the release the sidecar manifest
+ * shipped in. That version used to be a literal here, a second literal
+ * in the rollback warning and a third in the operating manual, so it is
+ * imported from the module that owns the format rather than re-typed.
  * Split out of `./helpers.ts` so the verb-handler bundle does not
  * have to load this ~200-line string table when it only needs
  * `parse` / `resolveBrainVault`.
  */
+
+import { BRAIN_MANIFEST_SIDECAR_SINCE_VERSION } from "../../core/brain/manifest.ts";
 
 export const BRAIN_HELP = `usage: o2b brain <verb> [args...]
 
@@ -39,7 +44,8 @@ Brain verbs (observing memory):
   okf-export       Write a portable Open Knowledge Format bundle (--out <dir> [--force])
   okf-import       Import an OKF bundle (<dir>; staged as review candidates, --trusted writes direct)
   explorer         Launch the loopback HTML explorer; --export <path> writes a single offline file
-  snapshot diff    Read-only diff between two snapshots, or snapshot vs live
+  snapshot         Inspect recovery points: log (newest-first, --reason filter),
+                   diff (two snapshots, or a snapshot vs live)
   rollback         Restore Brain/ from a snapshot (--list or <run_id>; --yes;
                    --dry-run previews via the same diff renderer)
   doctor              Validate Brain invariants (--strict; --remediate/--repair [--apply])
@@ -132,7 +138,7 @@ Brain verbs (observing memory):
   links               Normalize wikilink path format (preserve/full/short); dry-run by default
   profile             Materialize Brain/profile.md digest + .o2bfs root marker (age-gated)
   sgrep               Grep-shaped semantic search: o2b brain sgrep <query> [path]
-  trigger             Proactive trigger queue with anti-nag lifecycle (scan/list/ack/dismiss/act/history)
+  trigger             Proactive trigger queue with anti-nag lifecycle (scan/list/ack/dismiss/act/suppress/unsuppress/history)
   deep-synthesis      Topic dossier: notes, agreements, contradictions, stale claims, gaps
   diarize             Subject profile: document set, stated-vs-evidenced gap, needs-llm-step skeleton
   ideas               Ranked next-direction candidates from open loops (--triggers to enqueue)
@@ -284,20 +290,37 @@ export const VERB_HELP: Record<string, string> = {
     "Restore Brain/ from a snapshot. Interactive prompt unless --yes.\n" +
     "--dry-run prints the would-be restore plan as live → snapshot\n" +
     "diff and exits 0 without writing.\n" +
-    "From v0.10.6 each snapshot carries a sidecar sha256 manifest of\n" +
+    `From ${BRAIN_MANIFEST_SIDECAR_SINCE_VERSION} each snapshot carries a sidecar sha256 manifest of\n` +
     "the Brain/ tree captured at snapshot time. rollback compares it\n" +
     "against the current Brain/ and aborts with exit 2 if they\n" +
     "differ — typically because another device (Syncthing) edited the\n" +
     "vault between snapshot and rollback. Pass --force-rollback to\n" +
     "overwrite anyway; the log entry records `drift_overridden: true`.\n" +
-    "Snapshots produced before v0.10.6 have no sidecar; rollback emits\n" +
+    `Snapshots produced before ${BRAIN_MANIFEST_SIDECAR_SINCE_VERSION} have no sidecar; rollback emits\n` +
     "a stderr warning and falls through to the legacy direct-restore\n" +
-    "path.\n",
+    "path.\n" +
+    "The derived SQLite store is covered only when\n" +
+    "snapshots.include_derived_store is on (off by default). Every\n" +
+    "rollback reports what it did about it: replaced, not restored with\n" +
+    "the manifest's named reason, or unknown for a snapshot taken before\n" +
+    "coverage existed. --list carries the same answer per snapshot.\n" +
+    "--list, the confirmation prompt and the --json result all name the\n" +
+    "reason the snapshot was taken; 'unknown' means the snapshot carries\n" +
+    "no sidecar reason and is never inferred from its run id. Filter the\n" +
+    "history by reason with `o2b brain snapshot log --reason <reason>`.\n",
   snapshot:
-    "usage: o2b brain snapshot diff <run_id_a> [<run_id_b>]\n" +
+    "usage: o2b brain snapshot log  [--reason <reason>] [--limit <n>]\n" +
     "                              [--vault <path>] [--json]\n" +
-    "Read-only diff between two snapshots, or between a snapshot and\n" +
-    "the live Brain/ tree (when <run_id_b> is omitted).\n",
+    "       o2b brain snapshot diff <run_id_a> [<run_id_b>]\n" +
+    "                              [--vault <path>] [--json]\n" +
+    "log lists every recovery point newest first: run id, created_at, the\n" +
+    "reason it was taken, archive size, whether a drift manifest is present,\n" +
+    "and what it did about the derived store. --reason filters by why it\n" +
+    "happened and rejects an unregistered value with exit 2. A snapshot with\n" +
+    "no sidecar reads as reason 'unknown' - never as its run-id prefix.\n" +
+    "diff is a read-only diff between two snapshots, or between a snapshot\n" +
+    "and the live Brain/ tree (when <run_id_b> is omitted).\n" +
+    "Together with rollback, the family is log / diff / revert.\n",
   hygiene:
     "usage: o2b brain hygiene <scan|apply> [--vault <path>] [--json]\n" +
     "                          [--detectors conflicts,dedup,freshness,usefulness]\n" +
@@ -504,7 +527,9 @@ export const VERB_HELP: Record<string, string> = {
     "with active/processed and distinct-topic counts.\n",
   schema:
     "usage: o2b brain schema [report|stats|lint|graph|explain|orphans|apply|sync] [--vault <path>] [--json]\n" +
-    "Inspect and mutate the active runtime schema vocabulary through locked, audited writes.\n",
+    "Inspect and mutate the active runtime schema vocabulary through locked, audited writes.\n" +
+    "report names the pack's integrity: ok, modified, or unverified with the reason.\n" +
+    "sync is not implemented and refuses; it never reported real work.\n",
   "session-hook":
     "usage: o2b brain session-hook [--vault <path>] [--agent <name>] [--dry-run] [--json]\n" +
     "Read one runtime hook JSON payload from stdin, capture inline @osb markers / brain_feedback tool calls,\n" +
@@ -959,11 +984,15 @@ export const VERB_HELP: Record<string, string> = {
     "Grep-shaped semantic Brain search: path:line: output lines, path\n" +
     "scoping, exit 1 on no matches (also in --json mode).\n",
   trigger:
-    "usage: o2b brain trigger <scan|list|ack|dismiss|act|history> [id] [--status <s>] [--vault <path>] [--json]\n" +
+    "usage: o2b brain trigger <scan|list|ack|dismiss|act|suppress|unsuppress|history> [id] [--status <s>] [--vault <path>] [--json]\n" +
     "Grounded proactive trigger queue under Brain/triggers/. scan generates\n" +
     "deduped triggers from health/retention data (cooldown via\n" +
     "trigger_cooldown_days, default 7); ack/dismiss/act transition one\n" +
-    "trigger; history lists terminal ones.\n",
+    "trigger; history lists terminal ones. suppress silences a finding\n" +
+    "indefinitely - no cooldown clock, so it never re-nags - and unsuppress\n" +
+    "restores the status it interrupted along with its original cooldown.\n" +
+    "list prints how many triggers are currently suppressed; every silenced\n" +
+    "recurrence is counted on the record (occurrences, last_seen_at).\n",
   "deep-synthesis":
     "usage: o2b brain deep-synthesis <topic> [--limit <n>] [--triggers] [--vault <path>] [--json]\n" +
     "Deterministic topic dossier: matched notes, agreements, contradictions,\n" +

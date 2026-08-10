@@ -24,9 +24,11 @@ import {
   manifestDiffHasDrift,
   manifestSidecarPath,
   readManifestSidecar,
+  SNAPSHOT_STORE_EXCLUSION,
   writeManifestSidecar,
   type BrainManifest,
 } from "../../../src/core/brain/manifest.ts";
+import { BRAIN_SNAPSHOT_REASON, BRAIN_SNAPSHOT_REASONS } from "../../../src/core/brain/types.ts";
 
 let vault: string;
 let brain: string;
@@ -69,6 +71,18 @@ describe("buildManifest", () => {
   test(".snapshots/ is excluded from the walk", () => {
     writeFileSync(join(brain, ".snapshots", "phantom.tar.zst"), "binary");
     writeFileSync(join(brain, ".snapshots", "phantom.manifest.json"), "{}");
+    mkdirSync(join(brain, "preferences"));
+    writeFileSync(join(brain, "preferences", "pref-x.md"), "x");
+    const m = buildManifest(brain);
+    expect(Object.keys(m.files)).toEqual(["preferences/pref-x.md"]);
+  });
+
+  test(".artifacts/ is excluded from the walk", () => {
+    // Documented as never backed up, yet hashed into every manifest -
+    // so TTL'd tool output churning between a snapshot and a rollback
+    // tripped the drift gate on a directory no restore ever touches.
+    mkdirSync(join(brain, ".artifacts", "run-1"), { recursive: true });
+    writeFileSync(join(brain, ".artifacts", "run-1", "a.json"), "{}");
     mkdirSync(join(brain, "preferences"));
     writeFileSync(join(brain, "preferences", "pref-x.md"), "x");
     const m = buildManifest(brain);
@@ -257,6 +271,309 @@ describe("sidecar I/O", () => {
     expect(Object.keys(back!.files)).toEqual(Object.keys(original.files));
     expect(back!.files["preferences/pref-rt.md"]!.sha256).toBe(
       original.files["preferences/pref-rt.md"]!.sha256,
+    );
+  });
+});
+
+/**
+ * The derived-store record travels on the same distribution channel as
+ * the rest of the sidecar - Syncthing, a manual copy, an operator who
+ * lost their nerves - so every field is validated on read and a single
+ * malformation fails the WHOLE manifest closed, exactly as one bad file
+ * entry already does. Anything looser would let a half-written record
+ * claim a coverage the archive does not have, and the restore acts on
+ * that claim.
+ */
+describe("the derived-store field on the sidecar", () => {
+  /** A sidecar carrying `derived_store` verbatim, written to disk. */
+  function writeSidecarWithStore(runId: string, derivedStore: unknown): void {
+    writeFileSync(
+      manifestSidecarPath(vault, runId),
+      JSON.stringify({
+        schema_version: 1,
+        generated_at: "2026-05-18T00:00:00Z",
+        brain_root: "Brain",
+        files: {},
+        derived_store: derivedStore,
+      }),
+    );
+  }
+
+  const INCLUDED = Object.freeze({
+    included: true,
+    source_path: "/vault/.open-second-brain/brain.sqlite",
+    archive_name: "run.store.sqlite.zst",
+    archive_sha256: "a".repeat(64),
+    archive_size: 4096,
+    live_size: 8192,
+    exclusion_reason: null,
+  });
+
+  const EXCLUDED = Object.freeze({
+    included: false,
+    source_path: "/vault/.open-second-brain/brain.sqlite",
+    archive_name: null,
+    archive_sha256: null,
+    archive_size: null,
+    live_size: 8192,
+    exclusion_reason: SNAPSHOT_STORE_EXCLUSION.not_requested,
+  });
+
+  test("an absent key parses and reads as unknown, never as excluded", () => {
+    writeFileSync(
+      manifestSidecarPath(vault, "pre-feature"),
+      JSON.stringify({
+        schema_version: 1,
+        generated_at: "2026-05-18T00:00:00Z",
+        brain_root: "Brain",
+        files: {},
+      }),
+    );
+    const back = readManifestSidecar(vault, "pre-feature");
+    // The manifest itself is valid - an older peer's sidecar must keep
+    // its drift guarantee, which is why the schema version was not
+    // bumped for this field.
+    expect(back).not.toBeNull();
+    expect(back!.derived_store).toBeUndefined();
+  });
+
+  test("a well-formed inclusion record roundtrips", () => {
+    writeSidecarWithStore("included", INCLUDED);
+    expect(readManifestSidecar(vault, "included")!.derived_store).toEqual(INCLUDED);
+  });
+
+  test("a well-formed exclusion record roundtrips", () => {
+    writeSidecarWithStore("excluded", EXCLUDED);
+    expect(readManifestSidecar(vault, "excluded")!.derived_store).toEqual(EXCLUDED);
+  });
+
+  test("a live size of zero is kept, because zero is a real size", () => {
+    writeSidecarWithStore("zero-size", { ...EXCLUDED, live_size: 0 });
+    expect(readManifestSidecar(vault, "zero-size")!.derived_store!.live_size).toBe(0);
+  });
+
+  test("an explicit null record is contained to the field, not the record", () => {
+    writeSidecarWithStore("null-record", null);
+    const contained = readManifestSidecar(vault, "null-record");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("a non-object record is contained to the field, not the record", () => {
+    writeSidecarWithStore("scalar-record", "included");
+    const contained = readManifestSidecar(vault, "scalar-record");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("a missing `included` flag is contained to the field, not the record", () => {
+    const { included: _drop, ...rest } = INCLUDED;
+    writeSidecarWithStore("no-flag", rest);
+    const contained = readManifestSidecar(vault, "no-flag");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("a non-integer archive size is contained to the field, not the record", () => {
+    writeSidecarWithStore("fractional", { ...INCLUDED, archive_size: 4096.5 });
+    const contained = readManifestSidecar(vault, "fractional");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("an unregistered exclusion reason is contained to the field, not the record", () => {
+    writeSidecarWithStore("unknown-reason", { ...EXCLUDED, exclusion_reason: "ran-out-of-disk" });
+    const contained = readManifestSidecar(vault, "unknown-reason");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("inclusion without a digest is contained to the field, not the record", () => {
+    // Not a weaker record - a false one. Nothing could verify the
+    // archive it claims to have written.
+    writeSidecarWithStore("no-digest", { ...INCLUDED, archive_sha256: null });
+    const contained = readManifestSidecar(vault, "no-digest");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("inclusion that also names an exclusion reason is contained to the field, not the record", () => {
+    writeSidecarWithStore("both", {
+      ...INCLUDED,
+      exclusion_reason: SNAPSHOT_STORE_EXCLUSION.absent,
+    });
+    const contained = readManifestSidecar(vault, "both");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+
+  test("an exclusion that names no reason is contained to the field, not the record", () => {
+    writeSidecarWithStore("reasonless", { ...EXCLUDED, exclusion_reason: null });
+    const contained = readManifestSidecar(vault, "reasonless");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.derived_store).toBeUndefined();
+    expect(contained!.derived_store_unreadable).toBe(true);
+  });
+});
+
+/**
+ * U7: the snapshot-reason field on the sidecar.
+ *
+ * Additive at the existing schema version for the same reason the
+ * derived-store field is, and validated through the same closed guard.
+ * The load-bearing negative is the last case here: the reason is also a
+ * run-id PREFIX at every call site that writes one, so guessing it from
+ * the run id would look right in almost every test and would manufacture
+ * provenance for a hand-named archive the code never stamped.
+ */
+describe("the snapshot-reason field on the sidecar", () => {
+  /** A sidecar carrying `snapshot_reason` verbatim, written to disk. */
+  function writeSidecarWithReason(runId: string, reason: unknown): void {
+    writeFileSync(
+      manifestSidecarPath(vault, runId),
+      JSON.stringify({
+        schema_version: 1,
+        generated_at: "2026-05-18T00:00:00Z",
+        brain_root: "Brain",
+        files: {},
+        snapshot_reason: reason,
+      }),
+    );
+  }
+
+  test("buildManifest stamps the reason it was given", () => {
+    const m = buildManifest(brain, { snapshotReason: BRAIN_SNAPSHOT_REASON.entityPrune });
+    expect(m.snapshot_reason).toBe(BRAIN_SNAPSHOT_REASON.entityPrune);
+    // Still the same schema version: an older peer ignores the key and
+    // keeps its own drift detection, which is why it was not bumped.
+    expect(m.schema_version).toBe(BRAIN_MANIFEST_SCHEMA_VERSION);
+  });
+
+  test("buildManifest omits the key entirely when given no reason", () => {
+    const m = buildManifest(brain);
+    expect("snapshot_reason" in m).toBe(false);
+  });
+
+  test("every registered reason roundtrips through the sidecar", () => {
+    for (const reason of BRAIN_SNAPSHOT_REASONS) {
+      writeSidecarWithReason(`roundtrip-${reason}`, reason);
+      expect(readManifestSidecar(vault, `roundtrip-${reason}`)?.snapshot_reason).toBe(reason);
+    }
+  });
+
+  test("a sidecar written before the feature reads as no reason at all", () => {
+    writeFileSync(
+      manifestSidecarPath(vault, "dream-2026-05-18-070000"),
+      JSON.stringify({
+        schema_version: 1,
+        generated_at: "2026-05-18T00:00:00Z",
+        brain_root: "Brain",
+        files: {},
+      }),
+    );
+    const back = readManifestSidecar(vault, "dream-2026-05-18-070000");
+    expect(back).not.toBeNull();
+    // The run id begins with a registered reason. It is NOT read back as
+    // one: the archive does not carry that provenance, and inventing it
+    // would make an unstamped snapshot indistinguishable from a stamped
+    // one.
+    expect(back!.snapshot_reason).toBeUndefined();
+  });
+
+  test("an unregistered reason is contained to the field, not the record", () => {
+    writeSidecarWithReason("bogus", "spring-cleaning");
+    const contained = readManifestSidecar(vault, "bogus");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.snapshot_reason).toBeUndefined();
+    expect(contained!.snapshot_reason_unreadable).toBe(true);
+  });
+
+  test("an explicit null reason is contained to the field, not the record", () => {
+    // Absence is spelled by omitting the key. A null is a present field
+    // that names nothing, which no writer here produces.
+    writeSidecarWithReason("null-reason", null);
+    const contained = readManifestSidecar(vault, "null-reason");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.snapshot_reason).toBeUndefined();
+    expect(contained!.snapshot_reason_unreadable).toBe(true);
+  });
+
+  test("a non-string reason is contained to the field, not the record", () => {
+    writeSidecarWithReason("numeric", 3);
+    const contained = readManifestSidecar(vault, "numeric");
+    // Drift detection runs on the mandatory part, so an unreadable
+    // optional field must not take it down: discarding the record
+    // here reports no sidecar at all and skips the gate, which is
+    // the silent-overwrite path this field was added beside.
+    expect(contained).not.toBeNull();
+    expect(contained!.generated_at).toBe("2026-05-18T00:00:00Z");
+    expect(contained!.snapshot_reason).toBeUndefined();
+    expect(contained!.snapshot_reason_unreadable).toBe(true);
+  });
+
+  test("write then read roundtrip preserves the reason", () => {
+    writeFileSync(join(brain, "_brain.yaml"), "schema_version: 1\n");
+    const original = buildManifest(brain, { snapshotReason: BRAIN_SNAPSHOT_REASON.manual });
+    writeManifestSidecar(vault, "reason-rt", original);
+    expect(readManifestSidecar(vault, "reason-rt")!.snapshot_reason).toBe(
+      BRAIN_SNAPSHOT_REASON.manual,
     );
   });
 });

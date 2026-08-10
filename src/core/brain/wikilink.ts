@@ -140,6 +140,63 @@ export function isBrainArtifactId(target: string): boolean {
 }
 
 /**
+ * The prefix a rule wears on each side of its retirement.
+ *
+ * Deliberately narrower than {@link BRAIN_ID_RE}. `sig-` is a different
+ * artifact, not a second spelling of the same one, so folding it away
+ * would merge a signal into whatever rule happens to share its slug.
+ * `pref-<slug>` and `ret-<slug>` are the SAME record before and after
+ * `moveToRetired` renamed it, which is the only reason a strip is
+ * correct here at all.
+ */
+const BRAIN_ID_PREFIX_RE = /^(?:pref-|ret-)/;
+
+/**
+ * Drop the `pref-` / `ret-` prefix from a bare Brain id, leaving the slug
+ * both spellings share.
+ *
+ * Two call sites had grown their own copy of this pattern - the `brain
+ * audit` CLI verb and its MCP twin, both resolving a caller-supplied id
+ * onto the one audit trail that is keyed by the ORIGINAL `pref-<slug>`.
+ * One grammar in two files is one prefix away from disagreeing, and this
+ * module is where the grammar already lives.
+ *
+ * Trims before matching as well as after, so a padded argument yields the
+ * slug rather than falling through the pattern with its prefix intact.
+ */
+export function stripBrainIdPrefix(id: string): string {
+  return id.trim().replace(BRAIN_ID_PREFIX_RE, "").trim();
+}
+
+/**
+ * Fold any spelling of a Brain artifact reference onto one key.
+ *
+ * `[[pref-foo]]`, `pref-foo`, `ret-foo`, `Brain/retired/ret-foo.md` and
+ * `[[Brain/preferences/pref-foo.md|Foo]]` all reduce to `foo`. The
+ * composition is {@link normaliseWikilinkTarget} (brackets, alias,
+ * anchor, folder, `.md`) followed by {@link stripBrainIdPrefix} (the
+ * rename), which is exactly the pair a reverse lookup across a
+ * retirement needs on BOTH sides of the join.
+ *
+ * The prefix strip is unconditional, and that has a consequence worth
+ * naming rather than discovering: a basename that merely begins with one
+ * of the two prefixes is folded like an id, so a note called
+ * `ret-rospective.md` keys as `rospective`, and `pref-foo` shares a key
+ * with a note called `foo.md`. Both collisions are between a preference
+ * slug and an ordinary note basename, which is a namespace this project
+ * does not otherwise keep apart.
+ *
+ * A caller that cannot tolerate that must match on exact ids plus the
+ * `aliases:` a retirement records, rather than on a fold. This function
+ * is for the reverse-lookup join, where the cost of a collision is one
+ * extra advisory row naming a consumer that does not consume - not a
+ * mutation, and visible to whoever reads it.
+ */
+export function brainArtifactSlug(value: string): string {
+  return stripBrainIdPrefix(normaliseWikilinkTarget(value));
+}
+
+/**
  * Return the bare target id if `value` is exactly a wikilink form
  * (`^\[\[…\]\]$` modulo surrounding whitespace), otherwise `null`.
  *

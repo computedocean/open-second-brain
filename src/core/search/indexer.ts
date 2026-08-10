@@ -6,14 +6,14 @@
  * rebuild: write to `brain.sqlite.new`, then a same-file rename swap
  * with `.bak` retention.
  *
- * `indexStatus` and `indexCheck` are the read-side diagnostics that
- * power `o2b search status|check` and the MCP status enrichment.
+ * `indexStatus`, `indexCheck` and `indexRootCoverage` are the read-side
+ * diagnostics that power `o2b search status|check`, the MCP status
+ * enrichment and the recall gate's coverage receipt.
  *
  * Anchored in docs/plans/2026-05-16-brain-search-design.md §6, §8,
  * §13, §15.
  */
 
-import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
@@ -34,6 +34,7 @@ import {
   semanticCapabilityLabel,
   SEMANTIC_VECTOR_CODE,
 } from "./capability-tier.ts";
+import { sha256Hex } from "../integrity/digest.ts";
 import { chunkMarkdown } from "./chunker.ts";
 import { expandTextForCjkFts } from "./cjk-tokenizer.ts";
 import { declaredInputWindowTokens, passagePrefixSentByProvider } from "./embeddings/presets.ts";
@@ -214,10 +215,6 @@ async function offlineDeferredReason(config: ResolvedSearchConfig): Promise<stri
   );
 }
 
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
-
 /** Deep-ish equality for frontmatter scalar/array values. */
 function tierValueEquals(left: unknown, right: unknown): boolean {
   if (Array.isArray(left) && Array.isArray(right)) {
@@ -338,7 +335,7 @@ async function indexInto(
         }
 
         const content = readUtf8(file.absPath);
-        const contentHash = sha256(content);
+        const contentHash = sha256Hex(content);
 
         // Fallback: fastpath missed (mtime or size changed). If
         // the content hash still matches, the file is logically
@@ -407,7 +404,7 @@ async function indexInto(
           chunkIndex: c.chunkIndex,
           content: c.content,
           ftsContent: expandTextForCjkFts(c.content),
-          contentHash: sha256(c.content),
+          contentHash: sha256Hex(c.content),
           startLine: c.startLine,
           endLine: c.endLine,
           tokenCount: c.tokenCount,
@@ -891,7 +888,7 @@ export async function runEmbeddingPhase(
     for (let j = 0; j < batch.length; j++) {
       const chunkId = batch[j]!.chunkId;
       const vec = vectors[j]!;
-      const embHash = sha256(vec.map((x) => x.toFixed(8)).join(","));
+      const embHash = sha256Hex(vec.map((x) => x.toFixed(8)).join(","));
       store.vecUpsert(chunkId, vec, model, dim, embHash);
       stats.embeddingsComputed++;
     }
@@ -1205,6 +1202,77 @@ export async function indexStatus(config: ResolvedSearchConfig): Promise<IndexSt
       // over a curated model serializes the bytes it always has.
       ...(chunkWindowUndeclared === null ? {} : { chunkWindowUndeclared }),
       warnings: Object.freeze(warnings),
+    });
+  } finally {
+    await store.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// indexRootCoverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Which authorized note roots the index REACHED, and how far.
+ *
+ * The field names say presence rather than coverage on purpose. "Covered"
+ * would claim the root was read out; what the index can show is that at
+ * least one document under it was indexed, which is a strictly weaker
+ * statement - see {@link indexRootCoverage}.
+ */
+export interface IndexRootCoverage {
+  /** Roots carrying at least one indexed document. */
+  readonly rootsWithDocuments: ReadonlyArray<string>;
+  /** Roots the index holds no document under at all. */
+  readonly rootsWithoutDocuments: ReadonlyArray<string>;
+}
+
+/**
+ * Partition note roots by whether the index carries any document under
+ * them (silence-is-not-an-answer, U2).
+ *
+ * `indexStatus` says how much was indexed in total; this says WHICH of
+ * the folders the operator authorized were reached at all. A negative
+ * recall needs both: the totals make the receipt, and the partition names
+ * the roots that were never touched.
+ *
+ * The guarantee is deliberately named as presence, not coverage, and the
+ * field names say so: a root lands in `rootsWithDocuments` on the
+ * strength of ONE indexed document, so one note out of a thousand puts it
+ * there. The index knows what it was given and never what it was not, so
+ * it cannot tell that case from a folder that holds exactly one note;
+ * deciding between them needs a filesystem census of the root, which is a
+ * different measurement with a different cost. Until something needs that
+ * census, the honest move is to promise only what this scan sees - the
+ * document TOTAL rides on the receipt beside the root list, so a reader
+ * weighing a negative is never left with the root list alone.
+ *
+ * Throws `SearchError` `INDEX_MISSING` when there is no index, rather
+ * than reporting every root absent. The caller must establish that the
+ * index exists first, and an all-absent answer over a missing index would
+ * read like a measurement.
+ *
+ * Cost: one read-mode open and one full document-path scan. It runs only
+ * on the recall gate's zero-result path, where a search has already
+ * failed to produce anything, and the alternative - a per-root prefix
+ * query - would buy microseconds for a new store surface.
+ */
+export async function indexRootCoverage(
+  config: ResolvedSearchConfig,
+  roots: ReadonlyArray<string>,
+): Promise<IndexRootCoverage> {
+  const store = await Store.open(config, { mode: "read" });
+  try {
+    const paths = [...store.listDocuments().keys()];
+    const withDocuments: string[] = [];
+    const withoutDocuments: string[] = [];
+    for (const root of roots) {
+      const reached = paths.some((path) => path === root || path.startsWith(`${root}/`));
+      (reached ? withDocuments : withoutDocuments).push(root);
+    }
+    return Object.freeze({
+      rootsWithDocuments: Object.freeze(withDocuments),
+      rootsWithoutDocuments: Object.freeze(withoutDocuments),
     });
   } finally {
     await store.close();

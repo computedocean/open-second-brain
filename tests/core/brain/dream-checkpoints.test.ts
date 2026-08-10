@@ -119,6 +119,29 @@ const DIGEST_EXCLUSIONS: ReadonlyArray<string> = Object.freeze([
   join("Brain", "vault-id.json"),
 ]);
 
+/**
+ * The one value in the log that the comparison cannot ask to be
+ * reproducible: the `snapshot` audit line records the archive's byte
+ * length, and the archive is the artifact {@link DIGEST_EXCLUSIONS}
+ * deliberately drops - tar embeds per-entry mtimes, so two identically
+ * seeded vaults compress to near-identical but not byte-identical
+ * archives. Only the digits are normalised, so the audit line's reason,
+ * run id, key order and very presence all stay under byte comparison.
+ */
+const ARCHIVE_SIZE_RE = /(size_bytes"?:\s*"?)\d+/g;
+
+/**
+ * Where that normalisation is allowed to apply.
+ *
+ * Confining it matters because the substitution needs the file as text,
+ * and a utf8 decode is lossy: two different byte sequences can decode to
+ * the same string through replacement characters, so decoding the whole
+ * tree would quietly weaken the comparison it exists to make. The log is
+ * JSONL by construction, so decoding is exact there; everything else is
+ * hashed as raw bytes.
+ */
+const NORMALISED_SUBTREE = join("Brain", "log");
+
 /** Recursive `<relative path>:<sha256>` digest of a tree, sorted. */
 function treeDigest(root: string): string {
   const lines: string[] = [];
@@ -127,8 +150,14 @@ function treeDigest(root: string): string {
       const full = join(dir, name);
       const rel = relative(root, full);
       if (DIGEST_EXCLUSIONS.some((v) => rel === v || rel.startsWith(`${v}/`))) continue;
-      if (statSync(full).isDirectory()) walk(full);
-      else lines.push(`${rel}:${createHash("sha256").update(readFileSync(full)).digest("hex")}`);
+      if (statSync(full).isDirectory()) {
+        walk(full);
+        continue;
+      }
+      const content = rel.startsWith(`${NORMALISED_SUBTREE}/`)
+        ? readFileSync(full, "utf8").replaceAll(ARCHIVE_SIZE_RE, "$1<archive-size>")
+        : readFileSync(full);
+      lines.push(`${rel}:${createHash("sha256").update(content).digest("hex")}`);
     }
   };
   walk(root);

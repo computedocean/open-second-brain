@@ -1,20 +1,56 @@
 /**
- * `o2b brain trigger <scan|list|ack|dismiss|act|history>` (Workspace
- * Insight Suite, t_cd1fee79): the grounded proactive trigger queue
- * with its anti-nag lifecycle.
+ * `o2b brain trigger <scan|list|ack|dismiss|act|suppress|unsuppress|history>`
+ * (Workspace Insight Suite, t_cd1fee79): the grounded proactive trigger
+ * queue with its anti-nag lifecycle.
  */
 
 import { defaultConfigPath, resolveTriggerCooldownDays } from "../../../core/config.ts";
 import { scanTriggers } from "../../../core/brain/triggers/scan.ts";
 import {
-  listTriggers,
+  readTriggers,
   transitionTrigger,
+  unreadableTriggerJson,
   type TriggerAction,
+  type UnreadableTrigger,
 } from "../../../core/brain/triggers/store.ts";
-import { isTriggerStatus, type TriggerRecord } from "../../../core/brain/triggers/types.ts";
+import {
+  isTriggerStatus,
+  TRIGGER_STATUS,
+  TRIGGER_TERMINAL_STATUSES,
+  type TriggerRecord,
+} from "../../../core/brain/triggers/types.ts";
 import { fail, normalizeFlagString, ok, okJson, parse, resolveBrainVault } from "../helpers.ts";
 
-const TERMINAL = new Set(["acted", "dismissed", "expired"]);
+/**
+ * Verb to lifecycle action, stated exhaustively.
+ *
+ * This was a nested ternary whose final arm was `act`, so every verb
+ * that was not `ack` or `dismiss` acted on the trigger - safe only for
+ * as long as nobody added a verb to the accepted list without also
+ * amending the ternary. An explicit map has no fallback arm to route
+ * into: a verb missing from here is not a transition verb at all.
+ */
+const VERB_TO_ACTION: Readonly<Record<string, TriggerAction>> = Object.freeze({
+  ack: "acknowledge",
+  dismiss: "dismiss",
+  act: "act",
+  suppress: "suppress",
+  unsuppress: "unsuppress",
+});
+
+/**
+ * Every accepted verb, in the order the usage string lists them: the
+ * read verbs around the transition verbs, which are taken from
+ * {@link VERB_TO_ACTION} so the two can never disagree.
+ */
+const TRIGGER_VERBS: ReadonlyArray<string> = Object.freeze([
+  "scan",
+  "list",
+  ...Object.keys(VERB_TO_ACTION),
+  "history",
+]);
+
+const USAGE = `usage: o2b brain trigger <${TRIGGER_VERBS.join("|")}> [id] [--status S] [--json]`;
 
 function triggerJson(record: TriggerRecord): Record<string, unknown> {
   return {
@@ -30,6 +66,10 @@ function triggerJson(record: TriggerRecord): Record<string, unknown> {
     expires_at: record.expiresAt,
     delivered_at: record.deliveredAt,
     resolved_at: record.resolvedAt,
+    suppressed_at: record.suppressedAt,
+    suppressed_from: record.suppressedFrom,
+    occurrences: record.occurrences,
+    last_seen_at: record.lastSeenAt,
   };
 }
 
@@ -37,14 +77,21 @@ function printTrigger(record: TriggerRecord): void {
   ok(`${record.id} [${record.effectiveStatus}] (${record.urgency}) ${record.reason}`);
 }
 
+/**
+ * Report the records the store could not read.
+ *
+ * The count prints whether or not any exist, exactly like the suppressed
+ * total: "unreadable: 0" is the surface stating that it looked, which is
+ * what stops an omitted line from reading as a clean queue.
+ */
+function printUnreadable(unreadable: ReadonlyArray<UnreadableTrigger>): void {
+  ok(`unreadable: ${unreadable.length}`);
+  for (const entry of unreadable) ok(entry.error.message);
+}
+
 export async function cmdBrainTrigger(argv: string[]): Promise<number> {
   const action = argv[0];
-  const actions = ["scan", "list", "ack", "dismiss", "act", "history"];
-  if (!action || !actions.includes(action)) {
-    return fail(
-      "usage: o2b brain trigger <scan|list|ack|dismiss|act|history> [id] [--status S] [--json]",
-    );
-  }
+  if (!action || !TRIGGER_VERBS.includes(action)) return fail(USAGE);
   const { flags, positional } = parse(argv.slice(1), {
     vault: { type: "string" },
     status: { type: "string" },
@@ -66,6 +113,7 @@ export async function cmdBrainTrigger(argv: string[]): Promise<number> {
           candidates: result.candidates,
           created: result.created.map(triggerJson),
           skipped: result.skipped.map((s) => ({ cooldown_key: s.cooldownKey, reason: s.reason })),
+          unreadable: result.unreadable.map(unreadableTriggerJson),
         });
         return 0;
       }
@@ -73,6 +121,8 @@ export async function cmdBrainTrigger(argv: string[]): Promise<number> {
         `candidates: ${result.candidates}, created: ${result.created.length}, skipped: ${result.skipped.length}`,
       );
       for (const record of result.created) printTrigger(record);
+      // A scan that walked around a broken record is not a clean scan.
+      printUnreadable(result.unreadable);
       return 0;
     }
 
@@ -81,20 +131,33 @@ export async function cmdBrainTrigger(argv: string[]): Promise<number> {
       if (statusFlag !== null && !isTriggerStatus(statusFlag)) {
         return fail(`unknown trigger status: ${statusFlag}`);
       }
-      let records = listTriggers(vault, {
-        now,
-        ...(statusFlag !== null ? { status: statusFlag } : {}),
-      });
+      // One unfiltered pass: `list` reports the suppressed total from it
+      // so the operator sees what is silenced without having to ask, and
+      // the status filter is then applied to the same records.
+      const scan = readTriggers(vault, { now });
+      const all = scan.records;
+      const suppressed = all.filter((r) => r.effectiveStatus === TRIGGER_STATUS.suppressed).length;
+      let records = statusFlag !== null ? all.filter((r) => r.effectiveStatus === statusFlag) : all;
       if (action === "history") {
-        records = records.filter((r) => TERMINAL.has(r.effectiveStatus));
+        records = records.filter((r) => TRIGGER_TERMINAL_STATUSES.has(r.effectiveStatus));
       } else if (statusFlag === null) {
-        records = records.filter((r) => !TERMINAL.has(r.effectiveStatus));
+        records = records.filter((r) => !TRIGGER_TERMINAL_STATUSES.has(r.effectiveStatus));
       }
       if (json) {
-        okJson({ ok: true, triggers: records.map(triggerJson) });
+        okJson({
+          ok: true,
+          triggers: records.map(triggerJson),
+          ...(action === "list" ? { suppressed } : {}),
+          unreadable: scan.unreadable.map(unreadableTriggerJson),
+        });
         return 0;
       }
+      if (action === "list") ok(`suppressed: ${suppressed}`);
+      printUnreadable(scan.unreadable);
       if (records.length === 0) {
+        // Said AFTER the unreadable report, so "no open triggers" can
+        // never be the only thing an operator reads about a queue that
+        // held something nobody could parse.
         ok(action === "history" ? "no trigger history" : "no open triggers");
         return 0;
       }
@@ -102,11 +165,13 @@ export async function cmdBrainTrigger(argv: string[]): Promise<number> {
       return 0;
     }
 
-    // ack / dismiss / act
+    const verb = VERB_TO_ACTION[action];
+    // Unreachable while TRIGGER_VERBS is the union of the read verbs and
+    // this map's keys, and stated rather than assumed so that adding a
+    // verb to one without the other is a usage error, not a transition.
+    if (verb === undefined) return fail(USAGE);
     const id = positional[0];
     if (!id) return fail(`brain trigger ${action} requires a trigger id`);
-    const verb: TriggerAction =
-      action === "ack" ? "acknowledge" : action === "dismiss" ? "dismiss" : "act";
     const record = transitionTrigger(vault, id, verb, { now });
     if (json) okJson({ ok: true, trigger: triggerJson(record) });
     else printTrigger(record);

@@ -12,7 +12,8 @@
  * Preferences and retired files get a typed field-level diff for the
  * canonical set of derived/identity fields; everything else compares
  * by byte equality so the renderer can flag "log file body changed"
- * without listing every byte.
+ * without listing every byte. The log bucket covers every shape a log
+ * file takes — see {@link isBrainLogDay}.
  *
  * Inputs are expected to be Brain/ root directories (not vault
  * roots). Callers feed `extractSnapshotToTemp(...).brainRoot` for
@@ -22,6 +23,8 @@
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 
+import { parseLogFileName } from "./log-jsonl.ts";
+import { BRAIN_LOG_DIR, BRAIN_SNAPSHOTS_DIR } from "./path-constants.ts";
 import { parsePreference, parseRetired } from "./preference.ts";
 import type { BrainPreference, BrainRetired } from "./types.ts";
 
@@ -145,6 +148,36 @@ export function diffBrainTrees(rootA: string, rootB: string): BrainTreeDiff {
   });
 }
 
+/**
+ * True for one day of the Brain log: `log/<date>.md`, `log/<date>.jsonl`,
+ * or the per-device shards `log/<date>.<device-id>.{md,jsonl}`.
+ *
+ * The classifier predated per-device sharding and matched only the
+ * unsharded markdown, so on any vault with a `device_id` configured — the
+ * normal case, and the only case where a rollback diff is interesting,
+ * because sharding exists for multi-device replication — every log file
+ * fell through to `other`. The machine-primary `.jsonl` surface, which is
+ * what `readLogDay` actually reads, was misclassified on every vault.
+ *
+ * The shape comes from {@link parseLogFileName} in `log-jsonl.ts`, the
+ * module whose contract is that the shard layout lives in exactly one
+ * place. This module previously carried a pattern of its own, and that
+ * copy IS the defect above: a duplicated shape does not stay in step with
+ * the builders, and a third copy written to repair the second would be a
+ * third chance to fall behind them.
+ *
+ * The depth check keeps the bucket honest in the other direction. The log
+ * directory also holds ledgers (`capture-decisions.jsonl`,
+ * `recurrence-support.jsonl`) and subdirectories (`dream-runs/`,
+ * `pref-audit/`) that are not days of the log, so the class is "a log day
+ * directly under `log/`" rather than "anything below `log/`".
+ */
+function isBrainLogDay(rel: string): boolean {
+  const segments = rel.split("/");
+  if (segments.length !== 2 || segments[0] !== BRAIN_LOG_DIR) return false;
+  return parseLogFileName(segments[1]!) !== null;
+}
+
 // ----- Walker + classifier -------------------------------------------------
 
 interface ScannedFile {
@@ -186,7 +219,7 @@ function walkBrain(root: string): ReadonlyArray<ScannedFile> {
       // `.snapshots/` is the snapshot family itself — comparing
       // archives across snapshots is not meaningful (each snapshot
       // owns its own archive set). Skip the tree entirely.
-      if (rel === ".snapshots" || rel.startsWith(".snapshots/")) continue;
+      if (rel === BRAIN_SNAPSHOTS_DIR || rel.startsWith(`${BRAIN_SNAPSHOTS_DIR}/`)) continue;
       // Defense-in-depth: an entry whose relative path escapes the
       // walker root (`..` segment) cannot legitimately be inside
       // a Brain snapshot — drop it rather than classify under a
@@ -272,7 +305,7 @@ function scanFile(_root: string, abs: string, rel: string): ScannedFile {
       bytes: readFileSafe(abs),
     };
   }
-  if (rel.startsWith("log/") && /^log\/\d{4}-\d{2}-\d{2}\.md$/.test(rel)) {
+  if (isBrainLogDay(rel)) {
     return {
       entry: {
         path: `Brain/${rel}`,
