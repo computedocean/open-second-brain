@@ -46,7 +46,11 @@ async function toolBrainIngestSource(
   const summary = coerceStr(args, "summary", true)!;
   const planId = coerceStr(args, "plan_id", false) ?? undefined;
   const preExtract = coerceBoolOptional(args, "pre_extract") ?? false;
-  const parsed = parseExtractionIntakeArgs(args, TOOL);
+  // This tool names its source as `source_path` and hands it to the pipeline
+  // itself, so `source` is not part of its contract. Declaring that stops the
+  // shared parser building a provenance out of an argument this schema never
+  // declared and this handler never read.
+  const parsed = parseExtractionIntakeArgs(args, TOOL, "absent");
   const agent =
     parsed.agent && parsed.agent.trim().length > 0
       ? parsed.agent
@@ -301,8 +305,15 @@ export const INGEST_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
             properties: {
               category: { type: "string", description: "Entity category slug." },
               name: { type: "string", description: "Canonical display name." },
-              aliases: { type: "array", items: { type: "string" } },
-              confidence: { type: "string" },
+              aliases: {
+                type: "array",
+                items: { type: "string" },
+                description: "Optional alternate names.",
+              },
+              confidence: {
+                type: "string",
+                description: "Optional confidence label passed through verbatim.",
+              },
             },
             required: ["category", "name"],
             additionalProperties: false,
@@ -314,11 +325,14 @@ export const INGEST_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           items: {
             type: "object",
             properties: {
-              from: { type: "string" },
-              from_category: { type: "string" },
-              relation: { type: "string" },
-              to: { type: "string" },
-              to_category: { type: "string" },
+              from: { type: "string", description: "Source entity name." },
+              from_category: { type: "string", description: "Optional source category." },
+              relation: {
+                type: "string",
+                description: "Relation token from the relation vocabulary (e.g. `related`).",
+              },
+              to: { type: "string", description: "Target entity name." },
+              to_category: { type: "string", description: "Optional target category." },
             },
             required: ["from", "relation", "to"],
             additionalProperties: false,

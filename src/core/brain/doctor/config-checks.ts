@@ -1,7 +1,7 @@
 /**
  * Operator-declared configuration that cannot do what it says.
  *
- * `_brain.yaml` itself, the `vault.ignore_paths` block, and the capture
+ * `_brain.yaml` itself, the `vault:` scope block, and the capture
  * boundary's message patterns are all things the operator wrote down and
  * the runtime then has to honour. When one of them is unreadable, names a
  * schema this build does not know, points at nothing, or fails to
@@ -12,7 +12,7 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { resolveVaultScope } from "../../vault-scope/index.ts";
+import { resolveVaultScope, walkVaultScope } from "../../vault-scope/index.ts";
 import { buildCaptureBoundary } from "../capture-boundary.ts";
 import { brainConfigPath } from "../paths.ts";
 import {
@@ -110,11 +110,23 @@ function configAbsence(cfgPath: string): DoctorIssue | null {
 }
 
 /**
- * v0.10.9 hygiene lint: surface path-style entries in
- * `vault.ignore_paths` that do not resolve to anything on disk. Such
- * entries are typically typos — they look like exclusions but cannot
- * fire. Bare-name rules are skipped (a missing `.git` directory is
- * not an error).
+ * v0.10.9 hygiene lint, extended in v1.46.0: surface declared entries
+ * under `vault:` that do not resolve to anything on disk. Such entries
+ * are typically typos — they look like a boundary and cannot fire.
+ *
+ * The two polarities get different severities because their
+ * consequences are not comparable. A dead EXCLUSION costs nothing: the
+ * path it names is not there to exclude, so the vault behaves exactly
+ * as the operator intended, and bare-name rules are skipped entirely
+ * (a missing `.git` directory is not a finding). A dead INCLUDE ROOT
+ * means the allowlist admits nothing under it — with one root declared
+ * and misspelt, the index is empty and every recall returns nothing for
+ * a reason no other check would name.
+ *
+ * The include side therefore checks BOTH kinds against the vault root.
+ * A bare name still matches at any depth when the matcher runs, so the
+ * finding says what was verified — that the root is not there — rather
+ * than claiming the rule can never fire.
  *
  * Only runs when the operator declared the block themselves; the
  * built-in default set may legitimately list paths that do not exist
@@ -131,14 +143,55 @@ export const vaultIgnoreCheck: DoctorCheck = {
       // Do not let this follow-on lint mask the primary config issue.
       return;
     }
-    if (scope.source !== "_brain.yaml") return;
-    for (const rule of scope.rules) {
+    // Each polarity is linted only when the OPERATOR declared it. A vault
+    // that writes `include_paths` alone still resolves with the built-in
+    // exclusions in force, and warning about one of those would name a key
+    // the operator's config does not contain.
+    if (scope.declared.ignore) {
+      for (const rule of scope.rules.ignore) {
+        if (rule.kind !== "path") continue;
+        if (existsSync(join(vault, rule.raw))) continue;
+        issues.push({
+          severity: "warning",
+          code: "vault-ignore-missing-path",
+          message: `vault.ignore_paths entry '${rule.raw}' does not exist in this vault`,
+        });
+      }
+    }
+    if (!scope.declared.include) return;
+
+    // A path-kind include root is anchored at the vault root, so its absence
+    // there is decidable and worth naming on its own. A name-kind root is
+    // NOT: the grammar matches a bare name at any depth, so `existsSync` at
+    // the root answers a question the rule never asked and reported a
+    // working allowlist as broken. Those are covered by the aggregate below
+    // instead, which asks the question the check actually exists for.
+    for (const rule of scope.rules.include ?? []) {
       if (rule.kind !== "path") continue;
       if (existsSync(join(vault, rule.raw))) continue;
       issues.push({
-        severity: "warning",
-        code: "vault-ignore-missing-path",
-        message: `vault.ignore_paths entry '${rule.raw}' does not exist in this vault`,
+        severity: "error",
+        code: "vault-include-missing-path",
+        message:
+          `vault.include_paths entry '${rule.raw}' names a path that does not exist in this vault; ` +
+          "an include root that matches nothing narrows the index for no reason",
+      });
+    }
+
+    // The aggregate: an allowlist that admits no file at all. This is the
+    // failure the per-entry check was reaching for and could not see, and it
+    // catches every shape of it - a typo in a bare name, a root that climbs
+    // out of the vault, a set of roots that happen to hold no notes - by
+    // measuring the walk rather than inferring from the rules. It is an
+    // error because an empty index is not a degraded search, it is no
+    // search: nothing is recalled, and nothing says why.
+    if (walkVaultScope(vault, scope).includedFiles === 0) {
+      issues.push({
+        severity: "error",
+        code: "vault-include-admits-nothing",
+        message:
+          `vault.include_paths (${scope.includePaths?.join(", ") ?? ""}) admits no file in this ` +
+          "vault, so the index would be empty; check the roots against the vault layout",
       });
     }
   },

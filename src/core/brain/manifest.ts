@@ -15,6 +15,7 @@ import { join, relative } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
 import { sha256Hex } from "../integrity/digest.ts";
+import { pathCovers } from "../vault-scope/defaults.ts";
 import { BRAIN_ROOT_REL, BRAIN_SNAPSHOT_EXCLUDED_ENTRIES, brainDirs } from "./paths.ts";
 import { isoSecond } from "./time.ts";
 import { isBrainSnapshotReason, type BrainSnapshotReason } from "./types.ts";
@@ -251,15 +252,15 @@ export function buildManifest(brainRoot: string, opts: BuildManifestOptions = {}
       // The entries the snapshot family never touches. Hashing something
       // the archive does not contain and the restore does not replace
       // makes the drift gate fire on churn no rollback would ever undo.
-      if (BRAIN_SNAPSHOT_EXCLUDED_ENTRIES.some((e) => rel === e || rel.startsWith(`${e}/`))) {
+      if (BRAIN_SNAPSHOT_EXCLUDED_ENTRIES.some((entry) => pathCovers(entry, rel))) {
         continue;
       }
       // Defense-in-depth: a `..` path *segment* cannot legitimately
-      // appear inside a sane Brain tree. We anchor on the segment
-      // boundary so an otherwise-valid filename like `..notes.md`
-      // (legal as a Unix dotfile) is not silently dropped from
-      // manifest coverage.
-      if (rel === ".." || rel.startsWith("../")) continue;
+      // appear inside a sane Brain tree. `pathCovers` anchors on the
+      // segment boundary, so an otherwise-valid filename like
+      // `..notes.md` (legal as a Unix dotfile) is not silently dropped
+      // from manifest coverage.
+      if (pathCovers("..", rel)) continue;
       if (st.isDirectory()) {
         stack.push(abs);
         continue;
@@ -311,6 +312,14 @@ function freezeManifest(
 // ---------- diffManifests --------------------------------------------------
 
 /**
+ * Sort order for every diff bucket: one comparator, defined once. The three
+ * buckets must agree, and a comparator rebuilt per call is three chances for
+ * them to stop agreeing.
+ */
+const byManifestPath = (a: BrainManifestDiffEntry, b: BrainManifestDiffEntry): number =>
+  a.path.localeCompare(b.path);
+
+/**
  * Compute the path-keyed diff between two manifests. Order of the
  * arguments matters: `before → after` is the conventional direction
  * (left is the older state).
@@ -341,11 +350,9 @@ export function diffManifests(before: BrainManifest, after: BrainManifest): Brai
     added.push({ path, before: null, after: right });
   }
 
-  const cmp = (a: BrainManifestDiffEntry, b: BrainManifestDiffEntry): number =>
-    a.path.localeCompare(b.path);
-  added.sort(cmp);
-  removed.sort(cmp);
-  changed.sort(cmp);
+  added.sort(byManifestPath);
+  removed.sort(byManifestPath);
+  changed.sort(byManifestPath);
   return Object.freeze({
     added: Object.freeze(added),
     removed: Object.freeze(removed),

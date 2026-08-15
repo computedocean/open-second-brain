@@ -15,8 +15,11 @@
  *     decision is never a silent fallback - abstain/error is an explicit,
  *     recorded outcome.
  *   - AUDITED: every decision (inject, abstain, error) writes exactly one
- *     structured, payload-safe audit line (counts, scores, reason - never the
- *     prompt text or recalled content).
+ *     structured audit line (counts, scores, classification - never the
+ *     prompt text or recalled content) to the LOCAL hook-audit trail, and
+ *     one recall-telemetry record onto the synced continuity log. The two
+ *     are deliberately not the same payload: only the local line may carry
+ *     a retriever's own message (see `recordDecision`).
  *   - FAIL-OPEN FOR THE SESSION: the hook process never blocks the user. It
  *     arms a self-watchdog ceiling and exits 0 on every path.
  *
@@ -25,47 +28,108 @@
  * present, is the standard `hookSpecificOutput.additionalContext` envelope.
  */
 
-import { join } from "node:path";
-
 import { defaultConfigPath, resolveRecallInjectEnabled, resolveVault } from "../src/core/config.ts";
 import { appendAuditRecord } from "../src/core/reliability/audit.ts";
+import { emitGatedTelemetry } from "../src/core/brain/continuity/emit.ts";
+import { hookAuditDir } from "../src/core/brain/paths.ts";
 import {
   decideRecallInject,
   defaultRecallRetriever,
+  RECALL_INJECT_FAULT,
+  recallInjectAuditDetails,
+  recallInjectTelemetryMetadata,
   type RecallInjectDecision,
 } from "../src/core/brain/recall-inject.ts";
+import {
+  emitRecallTelemetry,
+  RECALL_CHANNEL,
+  RECALL_TELEMETRY_MODE,
+  RECALL_TELEMETRY_STATUS,
+  type RecallTelemetryStatus,
+} from "../src/core/brain/recall-telemetry.ts";
 import { armProcessCeiling, resolveHookCeilingMs } from "./lib/process-ceiling.ts";
 import { asHookPayload, readHookInput } from "./lib/stdin.ts";
 import { isContextEventName } from "./lib/context-events.ts";
 
 /**
- * One payload-safe audit line per decision. Never throws (a hung filesystem
- * is exactly when this runs) and never records the prompt text or recalled
- * content - only the decision kind, reason, and bounded counts/scores.
+ * Record one decision on both surfaces: the hook audit trail, and the
+ * recall-telemetry channel.
+ *
+ * The audit line alone made the `hook` channel empty by construction, so
+ * the doctor's coverage check could only ever answer "unknown" for the
+ * one channel operators complain about. Both writes are best-effort and
+ * neither can disturb the fail-open contract: the audit has its own
+ * try/catch, and the telemetry goes through the shared gated emitter,
+ * which swallows a throwing continuity write exactly as every other
+ * telemetry site does.
+ */
+function recordDecision(vault: string, decision: RecallInjectDecision): void {
+  auditDecision(vault, decision);
+  emitGatedTelemetry(true, () =>
+    emitRecallTelemetry(vault, {
+      host: HOOK_TELEMETRY_HOST,
+      channel: RECALL_CHANNEL.hook,
+      // The hook's retriever IS a search; nothing finer is claimed here.
+      mode: RECALL_TELEMETRY_MODE.search,
+      status: telemetryStatus(decision),
+      durationMs: 0,
+      resultCount: decision.kind === "inject" ? decision.noteCount : 0,
+      // Classifications and counts only. The two surfaces are NOT the
+      // same payload: this one is a continuity record that syncs and that
+      // `brain_recall_telemetry` returns verbatim to a model, so it takes
+      // the withholding projection while the local audit line below takes
+      // the one that still carries the retriever's own message.
+      metadata: recallInjectTelemetryMetadata(decision),
+    }),
+  );
+}
+
+/** Runtime identity on the record; the transport is `channel`, not this. */
+const HOOK_TELEMETRY_HOST = "recall-inject";
+
+/**
+ * The hook's three decisions onto the telemetry status vocabulary.
+ *
+ * `abstain` maps to `empty` rather than to nothing at all: the hook ran
+ * and decided not to inject, and that is precisely the signal that
+ * separates a quiet hook from an absent one. Emitting nothing for an
+ * abstain would destroy the evidence this unit exists to produce.
+ */
+function telemetryStatus(decision: RecallInjectDecision): RecallTelemetryStatus {
+  switch (decision.kind) {
+    case "inject":
+      return RECALL_TELEMETRY_STATUS.ok;
+    case "abstain":
+      return RECALL_TELEMETRY_STATUS.empty;
+    case "error":
+      return RECALL_TELEMETRY_STATUS.error;
+  }
+}
+
+/**
+ * One audit line per decision. Never throws (a hung filesystem is exactly
+ * when this runs) and never records the prompt text or recalled content -
+ * only the decision kind, its classification, and bounded counts/scores.
+ *
+ * This line, unlike the telemetry record above, MAY carry the retriever's
+ * own message: the audit trail is local, unsynced operational evidence
+ * under `<vault>/.open-second-brain/hook-audit/`, and a SQLite or config
+ * message is precisely what an operator debugging a broken retriever
+ * needs. The withholding happens on the other surface, not here.
  */
 function auditDecision(vault: string, decision: RecallInjectDecision): void {
   try {
-    appendAuditRecord(join(vault, ".open-second-brain", "hook-audit"), {
+    appendAuditRecord(hookAuditDir(vault), {
       timestamp: new Date().toISOString(),
-      actor: "recall-inject",
+      actor: HOOK_TELEMETRY_HOST,
       action: "recall_inject_decision",
       target: "UserPromptSubmit",
       ok: decision.kind === "inject",
-      details: auditDetails(decision),
+      details: recallInjectAuditDetails(decision),
     });
   } catch {
     // best-effort: auditing must never disturb the fail-open contract
   }
-}
-
-function auditDetails(decision: RecallInjectDecision): Record<string, unknown> {
-  if (decision.kind === "inject") {
-    return { decision: "inject", note_count: decision.noteCount, top_score: decision.topScore };
-  }
-  if (decision.kind === "abstain") {
-    return { decision: "abstain", reason: decision.reason, top_score: decision.topScore };
-  }
-  return { decision: "error", reason: decision.reason };
 }
 
 async function main(): Promise<void> {
@@ -78,7 +142,10 @@ async function main(): Promise<void> {
     ceilingMs: resolveHookCeilingMs(),
     onExpire: () => {
       if (auditVault !== null) {
-        auditDecision(auditVault, { kind: "error", reason: "hook_ceiling_exceeded" });
+        recordDecision(auditVault, {
+          kind: "error",
+          fault: RECALL_INJECT_FAULT.hookCeilingExceeded,
+        });
       }
     },
   });
@@ -105,7 +172,7 @@ async function main(): Promise<void> {
     const configPath = defaultConfigPath();
 
     const decision = await decideRecallInject(prompt, defaultRecallRetriever(configPath, vault));
-    auditDecision(vault, decision);
+    recordDecision(vault, decision);
     if (decision.kind !== "inject") return;
 
     const out = {

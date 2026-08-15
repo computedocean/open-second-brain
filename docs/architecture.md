@@ -133,10 +133,23 @@ with backup/sync. It describes:
 - schema version + dream / retire / confidence / snapshot thresholds;
 - optional `notes.read_paths` (user-authored folders the agent may read);
 - optional `temporal:`, `link_graph:`, `guardrails:`, `discipline_report:` tuning blocks;
+- an optional `health:` block tuning the semantic lints, the remediation
+  step cap, the `silence_before` watermark, and the derived-page freshness
+  ceiling (`materialize_max_age_days`, default 30 days). Its day and count
+  keys must each be a positive integer; a zero or a fraction is an explicit
+  config error at load, never a clamped default;
 - optional `integrity:` gates (`owner_scope_delivery`, `embedding_abi`,
   `pack_validity_seconds`) that decide where a mismatch is reported and
   where it is refused;
-- `vault.ignore_paths` (exclusion policy for every vault walker);
+- `vault.ignore_paths` (exclusion policy for every vault walker) and the
+  optional `vault.include_paths` allowlist. A path is in scope when it is
+  not excluded AND, if an allowlist is declared, under one of its roots;
+  absent, the allowlist changes nothing. The two compose in that order —
+  an allowlist narrows, it never re-includes an exclusion. An empty
+  `include_paths` is refused at parse time (it would be an off switch on
+  indexing, not a boundary); an empty `ignore_paths` keeps its meaning of
+  "exclude nothing". Both keys share one grammar: no slash is a bare name
+  matched at any depth, a slash is a vault-relative path matched exactly;
 - optional `write_binding.path_prefixes` (where a CALLER-NAMED write may
   land: `brain_create_note`, `brain_update_note`, `brain_append_note`,
   `brain_write_batch`). This is a write boundary over caller-named paths,

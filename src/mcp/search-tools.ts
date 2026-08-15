@@ -15,7 +15,6 @@ import {
   EMBEDDING_QUOTA_MESSAGE,
   evaluateSurfacingGate,
   expandHit,
-  indexRootCoverage,
   indexStatus,
   resolveSearchConfig,
   search,
@@ -38,15 +37,17 @@ import {
 } from "../core/config.ts";
 import { assessRecallAdequacy } from "../core/brain/recall-adequacy.ts";
 import {
-  classifyNegativeRecall,
   NEGATIVE_RECALL_STATE,
   NEGATIVE_RECALL_UNKNOWN_REASONS,
-  type CoverageIndexSnapshot,
-  type CoverageScope,
   type NegativeRecallState,
   type NegativeRecallVerdict,
 } from "../core/brain/negative-recall.ts";
-import { resolveNoteRoots } from "../core/brain/notes/note-walk.ts";
+import {
+  RETRIEVAL_DEGRADATION_CODES,
+  RETRIEVAL_TRAIL_KEY,
+  retrievalTrailEnvelope,
+} from "../core/search/retrieval-trail.ts";
+import { probeRetrievalCorpus } from "../core/search/pipeline/outcome.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "./protocol.ts";
 import type { ServerContext, ToolDefinition } from "./tool-contract.ts";
 import {
@@ -73,7 +74,9 @@ import { parseRecallBenchmarkDataset, runRecallBenchmark } from "../core/search/
 import {
   deriveRecallSignals,
   emitRecallTelemetry,
+  RECALL_CHANNEL,
   RECALL_SIGNALS_UNMEASURED_CARDS,
+  recallTelemetryEnvelope,
   type RecallQualitySignals,
   type RecallSignalsUnmeasured,
 } from "../core/brain/recall-telemetry.ts";
@@ -90,17 +93,45 @@ const TELEMETRY_TOP_ARTIFACTS_MAX = 10;
 const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-    query: { type: "string", minLength: 1, maxLength: 2000 },
-    query_document: { type: "string", minLength: 1, maxLength: 4000 },
-    focus_query: { type: "string", minLength: 1, maxLength: 1000 },
-    focus_path_prefix: { type: "string", minLength: 1, maxLength: 256 },
+    query: {
+      type: "string",
+      minLength: 1,
+      maxLength: 2000,
+      description:
+        "What to recall from the vault. Matched against the index by keyword, semantics, or both.",
+    },
+    query_document: {
+      type: "string",
+      minLength: 1,
+      maxLength: 4000,
+      description:
+        "Line-oriented query program with intent:, lex:, vec: and hyde: lanes, steering each retrieval layer separately. Absent means 'query' drives every lane.",
+    },
+    focus_query: {
+      type: "string",
+      minLength: 1,
+      maxLength: 1000,
+      description:
+        "Steer this one call towards a working-set topic without persisting a session focus.",
+    },
+    focus_path_prefix: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      description:
+        "Steer this one call towards a vault subtree, paired with focus_query as a transient focus.",
+    },
     focus_session: {
       type: "string",
       minLength: 1,
       maxLength: 128,
       description: "Session id whose bound focus applies (falls back to the global focus).",
     },
-    evidence_pack: { type: "boolean" },
+    evidence_pack: {
+      type: "boolean",
+      description:
+        "Return the evidence pack: matched/missing terms, coverage, abstention text and the false-absence guard. Default false.",
+    },
     include_superseded: {
       type: "boolean",
       description:
@@ -118,9 +149,21 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
       description:
         "Hard filter on event time (validity, body anchor, mtime last): at/before this point. Same forms as 'since'.",
     },
-    limit: { type: "integer", minimum: 1, maximum: MCP_LIMIT_MAX },
-    semantic: { type: "boolean" },
-    keyword_only: { type: "boolean" },
+    limit: {
+      type: "integer",
+      minimum: 1,
+      maximum: MCP_LIMIT_MAX,
+      description: "How many ranked results to return. Default 10.",
+    },
+    semantic: {
+      type: "boolean",
+      description:
+        "Force the semantic lane on or off. Absent lets the configured hybrid strategy decide.",
+    },
+    keyword_only: {
+      type: "boolean",
+      description: "Skip the semantic lane entirely, so no embedding is needed. Default false.",
+    },
     disclosure: {
       type: "string",
       enum: ["full", "cards"],
@@ -172,11 +215,30 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
       description:
         "Cross-vault union: search profile vaults and read-only recall sources too, merging results with origin labels. Default false (active vault only).",
     },
-    path_prefix: { type: "string", maxLength: 256 },
-    telemetry: { type: "boolean" },
-    telemetry_host: { type: "string", maxLength: 200 },
-    session_id: { type: "string", maxLength: 512 },
-    turn_id: { type: "string", maxLength: 512 },
+    path_prefix: {
+      type: "string",
+      maxLength: 256,
+      description: "Restrict results to this vault subtree. Absent searches the whole vault.",
+    },
+    telemetry: {
+      type: "boolean",
+      description: "Emit one recall-telemetry continuity record for this call. Default false.",
+    },
+    telemetry_host: {
+      type: "string",
+      maxLength: 200,
+      description: "Optional host/client label recorded on the telemetry record.",
+    },
+    session_id: {
+      type: "string",
+      maxLength: 512,
+      description: "Optional session correlation id recorded on the telemetry record.",
+    },
+    turn_id: {
+      type: "string",
+      maxLength: 512,
+      description: "Optional turn correlation id recorded on the telemetry record.",
+    },
     properties: {
       type: "object",
       description:
@@ -217,6 +279,21 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
   required: ["query"],
   additionalProperties: false,
 };
+
+/**
+ * The negative-recall states a zero-result `brain_search` can report.
+ *
+ * The same two-of-three narrowing {@link RECALL_GATE_NEGATIVE_STATES}
+ * makes, for the same reason: the probe behind the trail supplies neither
+ * retraction evidence nor an assertion of non-occurrence, so
+ * `did_not_happen` is not a claim this surface has grounds for. Declaring
+ * it would leave a client unable to tell "this surface cannot say that"
+ * from "it did not happen".
+ */
+export const SEARCH_NEGATIVE_STATES: ReadonlyArray<NegativeRecallState> = Object.freeze([
+  NEGATIVE_RECALL_STATE.notFound,
+  NEGATIVE_RECALL_STATE.unknown,
+]);
 
 const SEARCH_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
   type: "object",
@@ -392,6 +469,46 @@ const SEARCH_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
       },
     },
     retrieval_trace_unavailable: { type: "string" },
+    // Retrieval trail (evidence-at-the-boundary, C2). Declared for the
+    // same reason the receipts above are: this schema does not set
+    // `additionalProperties: false`, so an undeclared key would validate
+    // silently. The `code` enum is the enforcement - the server validates
+    // every response against this schema, so emitting a code that is not
+    // in `RETRIEVAL_DEGRADATION` fails the contract loudly instead of
+    // handing a client a value it cannot interpret. Same rule as
+    // {@link RECALL_GATE_NEGATIVE_STATES}.
+    [RETRIEVAL_TRAIL_KEY]: {
+      type: "object",
+      required: ["retrieved", "pool", "degraded"],
+      properties: {
+        // Rows handed back, which `total` does not state: that is the
+        // ranked pool the window was cut from.
+        retrieved: { type: "integer" },
+        pool: { type: "integer" },
+        degraded: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["code"],
+            properties: {
+              code: { type: "string", enum: [...RETRIEVAL_DEGRADATION_CODES] },
+              // Identifiers and integers only, by the vocabulary's own
+              // rule; open-keyed because each code names its own fields.
+              detail: { type: "object" },
+            },
+          },
+        },
+        empty: {
+          type: "object",
+          required: ["state", "reason"],
+          properties: {
+            state: { type: "string", enum: [...SEARCH_NEGATIVE_STATES] },
+            reason: { type: "string" },
+            unknown_reason: { type: "string", enum: [...NEGATIVE_RECALL_UNKNOWN_REASONS] },
+          },
+        },
+      },
+    },
     telemetry_id: { type: "string" },
   },
 };
@@ -399,11 +516,33 @@ const SEARCH_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
 const RECALL_GATE_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-    prompt: { type: "string", minLength: 1, maxLength: 4000 },
-    previous_prompt: { type: "string", maxLength: 4000 },
-    explicit: { type: "boolean" },
-    telemetry_host: { type: "string", maxLength: 200 },
-    session_id: { type: "string", maxLength: 512 },
+    prompt: {
+      type: "string",
+      minLength: 1,
+      maxLength: 4000,
+      description: "The turn's prompt, scored to decide whether recall is worth running at all.",
+    },
+    previous_prompt: {
+      type: "string",
+      maxLength: 4000,
+      description:
+        "The preceding turn's prompt, so a follow-up is judged in context rather than on its own.",
+    },
+    explicit: {
+      type: "boolean",
+      description:
+        "The user asked for memory in so many words; the gate then retrieves regardless of score. Default false.",
+    },
+    telemetry_host: {
+      type: "string",
+      maxLength: 200,
+      description: "Optional host/client label recorded on the telemetry record.",
+    },
+    session_id: {
+      type: "string",
+      maxLength: 512,
+      description: "Optional session correlation id recorded on the telemetry record.",
+    },
     scores: {
       type: "array",
       maxItems: 200,
@@ -710,9 +849,17 @@ async function toolBrainSearch(
   const until = coerceStringOptional(args, "until", 64);
   const recordAccess = coerceBoolOptional(args, "record_access") ?? true;
   const telemetry = coerceBoolOptional(args, "telemetry") ?? false;
-  const telemetryHost = coerceStringOptional(args, "telemetry_host", 200) ?? "mcp";
   const telemetrySessionId = coerceStringOptional(args, "session_id", 512);
   const telemetryTurnId = coerceStringOptional(args, "turn_id", 512);
+  // One envelope for both emit sites below: the correlation fields are
+  // copied once, and `channel` is a fact about this handler rather than
+  // about the caller-supplied `telemetry_host` string.
+  const telemetryEnvelope = recallTelemetryEnvelope({
+    host: coerceStringOptional(args, "telemetry_host", 200) ?? RECALL_CHANNEL.mcp,
+    channel: RECALL_CHANNEL.mcp,
+    ...(telemetrySessionId !== undefined ? { sessionId: telemetrySessionId } : {}),
+    ...(telemetryTurnId !== undefined ? { turnId: telemetryTurnId } : {}),
+  });
   const rawQueryDocument = coerceStringOptional(args, "query_document", 4000);
   const structuredQuery =
     rawQueryDocument !== undefined
@@ -806,9 +953,7 @@ async function toolBrainSearch(
     // this catch can no longer mask the original search error.
     emitGatedTelemetry(telemetry || undefined, () =>
       emitRecallTelemetry(ctx.vault, {
-        host: telemetryHost,
-        ...(telemetrySessionId !== undefined ? { sessionId: telemetrySessionId } : {}),
-        ...(telemetryTurnId !== undefined ? { turnId: telemetryTurnId } : {}),
+        ...telemetryEnvelope,
         mode: "search",
         status: e instanceof MCPError && e.message.includes("timeout") ? "timeout" : "error",
         durationMs: Date.now() - startedAtMs,
@@ -842,9 +987,7 @@ async function toolBrainSearch(
     // outcome and rows are frozen, so this lane can only read them.
     const signals = searchRecallSignals(outcome);
     return emitRecallTelemetry(ctx.vault, {
-      host: telemetryHost,
-      ...(telemetrySessionId !== undefined ? { sessionId: telemetrySessionId } : {}),
-      ...(telemetryTurnId !== undefined ? { turnId: telemetryTurnId } : {}),
+      ...telemetryEnvelope,
       mode: "search",
       status: surfaced.length > 0 ? "ok" : "empty",
       durationMs: Date.now() - startedAtMs,
@@ -911,6 +1054,11 @@ async function toolBrainSearch(
     // Absent on the generic path, so the default response stays
     // byte-identical.
     ...(outcome.surface !== undefined ? { surface: outcome.surface } : {}),
+    // Retrieval trail (evidence-at-the-boundary, C2): why this answer
+    // narrowed and why it is empty when it is, through the same seam the
+    // CLI payload uses so both surfaces name one key with one body.
+    // Absent - never null - on a healthy non-empty answer.
+    ...retrievalTrailEnvelope(outcome),
     // Retrieval receipts (what-the-index-already-knew, task F): the
     // decision trace and the trust assessment every gated search already
     // built and no surface serialized. Under `explain` only, absent -
@@ -941,9 +1089,25 @@ function searchRecallSignals(
   return deriveRecallSignals(outcome.results);
 }
 
+/**
+ * The recall-telemetry gaps for one search.
+ *
+ * `no_matching_context` is the shared gap every producer in this tree
+ * emits for an empty answer (`context-pack`, `pre-compress-pack`,
+ * `brain_query`), so it stays. What used to be missing is WHY: this
+ * function answered the same question as the retrieval trail from the same
+ * outcome and invented its own free strings to do it. It now emits the
+ * trail's codes, so a gap histogram and a search response name one
+ * vocabulary rather than two.
+ */
 function searchTelemetryGaps(outcome: SearchOutcome): ReadonlyArray<string> {
   const gaps = new Set<string>();
+  const trail = outcome.retrievalTrail;
   if (outcome.total === 0) gaps.add("no_matching_context");
+  for (const degradation of trail?.degraded ?? []) gaps.add(degradation.code);
+  // The corpus statement's `unknown` half is a gap in its own right: it
+  // says the index could not answer, not that the vault holds nothing.
+  if (trail?.empty?.unknownReason !== undefined) gaps.add(trail.empty.unknownReason);
   for (const term of outcome.evidencePack?.missingTerms ?? []) {
     gaps.add(`missing_term:${term}`);
   }
@@ -1037,59 +1201,23 @@ async function toolBrainRecallGate(
 }
 
 /**
- * Both root sets unresolved. Handed to the classifier when the index
- * facts could not be read at all, which it reports as
- * `unknown`/`coverage-unavailable` - deliberately not as an absent index
- * and never as an exhaustively searched one.
- */
-const UNRESOLVED_COVERAGE_SCOPE: CoverageScope = Object.freeze({
-  authorizedRoots: Object.freeze([]),
-  indexedRoots: Object.freeze([]),
-});
-
-/**
  * The corpus statement behind a zero-result recall attempt.
  *
- * Gathers the two universes the verdict is judged against - what the
- * index holds (`indexStatus`) and which authorized note roots it actually
- * reached (`indexRootCoverage` over `resolveNoteRoots`) - and hands them
- * to the pure classifier.
+ * The gathering itself lives in `core/search/pipeline/outcome.ts` since
+ * evidence-at-the-boundary C2, because the search pipeline owes the same
+ * answer on its own zero-result path and two copies of it would drift.
+ * This gate keeps its own wiring - a vault plus a config path, resolved
+ * inside the probe's guard so a resolution failure is reported as
+ * `coverage-unavailable` like every other unreadable input.
  *
  * It supplies no retraction evidence and asserts nothing, which is why
  * this surface declares only {@link RECALL_GATE_NEGATIVE_STATES}: a gate
- * that reads no claim graph has no grounds for `did_not_happen`, and
- * inventing grounds on the zero-result path is a design decision taken
- * separately from this wiring.
- *
- * Every read is attempted before anything is committed to, so a failure
- * anywhere leaves BOTH inputs unresolved rather than half-resolved: a
- * partially gathered picture is exactly the material a misleading
- * `not_found` would be built from. The failure is not swallowed either;
- * it surfaces as the named `coverage-unavailable` reason, which is the
- * whole point of the unit.
+ * that reads no claim graph has no grounds for `did_not_happen`.
  */
 async function assessNegativeRecall(ctx: ServerContext): Promise<NegativeRecallVerdict> {
-  let snapshot: CoverageIndexSnapshot | null = null;
-  let scope: CoverageScope = UNRESOLVED_COVERAGE_SCOPE;
-  try {
-    const config = resolveSearchConfig({
-      vault: ctx.vault,
-      configPath: ctx.configPath ?? undefined,
-    });
-    const status = await indexStatus(config);
-    const authorizedRoots = resolveNoteRoots(ctx.vault);
-    // Skip the second open when there is nothing it could answer: no
-    // index to read, or no note root the operator authorized.
-    const indexedRoots =
-      status.exists && authorizedRoots.length > 0
-        ? (await indexRootCoverage(config, authorizedRoots)).rootsWithDocuments
-        : [];
-    snapshot = status;
-    scope = { authorizedRoots, indexedRoots };
-  } catch {
-    // Deliberately empty: the unresolved defaults above ARE the report.
-  }
-  return classifyNegativeRecall({ snapshot, scope });
+  return probeRetrievalCorpus(() =>
+    resolveSearchConfig({ vault: ctx.vault, configPath: ctx.configPath ?? undefined }),
+  );
 }
 
 /**
@@ -1117,9 +1245,23 @@ function parseRecallScores(raw: unknown): ReadonlyArray<number> | undefined {
 const RECALL_FEEDBACK_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-    query: { type: "string", minLength: 1, maxLength: 2000 },
-    result_path: { type: "string", minLength: 1, maxLength: 512 },
-    verdict: { type: "string", enum: ["up", "down"] },
+    query: {
+      type: "string",
+      minLength: 1,
+      maxLength: 2000,
+      description: "The query that produced the judged result; re-run to recover its layer scores.",
+    },
+    result_path: {
+      type: "string",
+      minLength: 1,
+      maxLength: 512,
+      description: "Vault path of the single result being judged.",
+    },
+    verdict: {
+      type: "string",
+      enum: ["up", "down"],
+      description: "'up' when the result was useful, 'down' when it was not.",
+    },
   },
   required: ["query", "result_path", "verdict"],
   additionalProperties: false,
@@ -1174,23 +1316,52 @@ const EVAL_INPUT_SCHEMA: Record<string, unknown> = {
         queries: {
           type: "array",
           minItems: 1,
+          description: "The benchmark cases, one per scored query. Non-empty.",
           items: {
             type: "object",
             required: ["id", "query", "expected"],
             properties: {
-              id: { type: "string", minLength: 1 },
-              query: { type: "string", minLength: 1 },
-              expected: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-              k: { type: "integer", minimum: 1, maximum: MCP_LIMIT_MAX },
-              answer: { type: "string", minLength: 1 },
+              id: {
+                type: "string",
+                minLength: 1,
+                description: "Stable case id, reported back in per_query.",
+              },
+              query: { type: "string", minLength: 1, description: "The query text to run." },
+              expected: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string", minLength: 1 },
+                description: "Vault paths a correct answer must surface. Non-empty.",
+              },
+              k: {
+                type: "integer",
+                minimum: 1,
+                maximum: MCP_LIMIT_MAX,
+                description: "Per-case cutoff, overriding the run-wide k.",
+              },
+              answer: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Reference answer text; enables answer-containment scoring for this case.",
+              },
             },
           },
         },
       },
       required: ["queries"],
     },
-    k: { type: "integer", minimum: 1, maximum: MCP_LIMIT_MAX },
-    expand: { type: "boolean" },
+    k: {
+      type: "integer",
+      minimum: 1,
+      maximum: MCP_LIMIT_MAX,
+      description: "Run-wide rank depth for hit@k and the containment metrics. Default 5.",
+    },
+    expand: {
+      type: "boolean",
+      description:
+        "Route every query through deterministic expansion before scoring. Default false.",
+    },
   },
   required: ["dataset"],
   additionalProperties: false,
@@ -1315,9 +1486,26 @@ async function toolBrainEval(
 const FILE_CONTEXT_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-    file_path: { type: "string", minLength: 1, maxLength: 1024 },
-    limit: { type: "integer", minimum: 1, maximum: MCP_LIMIT_MAX },
-    min_bytes: { type: "integer", minimum: 0, maximum: 10_000_000 },
+    file_path: {
+      type: "string",
+      minLength: 1,
+      maxLength: 1024,
+      description:
+        "Path of the file about to be read; its basename, stem and parent directory become the query terms.",
+    },
+    limit: {
+      type: "integer",
+      minimum: 1,
+      maximum: MCP_LIMIT_MAX,
+      description: "How many prior-work hits to return. Default 5.",
+    },
+    min_bytes: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10_000_000,
+      description:
+        "Skip files smaller than this, reporting the reason instead of an empty hit. Default 1500.",
+    },
     agent_scope: AGENT_SCOPE_SCHEMA,
   },
   required: ["file_path"],

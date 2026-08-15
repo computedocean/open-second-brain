@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -34,14 +34,37 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // The locked directory first: a 0-mode directory cannot be walked, so the
+  // vault removal below would fail on the test that creates one.
+  try {
+    chmodSync(join(vault, LOCKED_DIR), 0o755);
+  } catch {
+    // Only one test creates it.
+  }
   rmSync(vault, { recursive: true, force: true });
   rmSync(configHome, { recursive: true, force: true });
 });
 
+/** A directory this vault denies itself, so `stat` answers with an errno. */
+const LOCKED_DIR = "Locked";
+const RUNNING_AS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
 const handler = NER_TOOLS[0]!.handler;
+
+/**
+ * A cited source is trusted only when the file it names is really there
+ * (GitHub #160), so every intake below that expects its entities in the
+ * canonical registry seeds the note it claims to have read.
+ */
+function seed(rel: string): void {
+  const abs = join(vault, rel);
+  mkdirSync(join(abs, ".."), { recursive: true });
+  writeFileSync(abs, `bytes of ${rel}\n`, "utf8");
+}
 
 describe("brain_intake_entities", () => {
   test("intakes agent-supplied entities into the registry", async () => {
+    seed("Notes/scaling.md");
     const res = await handler(ctx, {
       source: "[[Notes/scaling.md]]",
       entities: [
@@ -60,6 +83,7 @@ describe("brain_intake_entities", () => {
   });
 
   test("applies typed relations between extracted entities", async () => {
+    seed("Notes/restaking.md");
     const res = await handler(ctx, {
       source: "[[Notes/restaking.md]]",
       entities: [
@@ -74,6 +98,7 @@ describe("brain_intake_entities", () => {
   });
 
   test("cites the source wikilink in a newly created entity body", async () => {
+    seed("Articles/eth-roadmap.md");
     await handler(ctx, {
       entities: [{ category: "concept", name: "Sharding" }],
       source: "[[Articles/eth-roadmap.md]]",
@@ -88,9 +113,44 @@ describe("brain_intake_entities", () => {
     expect(listEntities(vault)).toHaveLength(0);
   });
 
+  /**
+   * The classifier refuses an unreadable source rather than calling it
+   * untrusted, and that refusal reaches the caller as an MCP error. Rethrown
+   * verbatim, the Node errno spells out `/home/<user>/<vault>/Locked/note.md`
+   * - an existence-and-permission oracle over the operator's filesystem,
+   * queried with a string the caller chose. The refusal is right; the
+   * operator's path in the answer is not.
+   */
+  test.skipIf(RUNNING_AS_ROOT)("an unreadable source fails without naming a path", async () => {
+    const locked = join(vault, LOCKED_DIR);
+    mkdirSync(locked, { recursive: true });
+    writeFileSync(join(locked, "note.md"), "bytes\n", "utf8");
+    chmodSync(locked, 0o000);
+    let thrown: unknown;
+    try {
+      await handler(ctx, {
+        source: `[[${LOCKED_DIR}/note.md]]`,
+        entities: [{ category: "concept", name: "Restaking" }],
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(MCPError);
+    const message = (thrown as Error).message;
+    expect(message).toContain(`${LOCKED_DIR}/note.md`);
+    expect(message).toContain("EACCES");
+    expect(message).not.toContain(vault);
+    expect(message).not.toContain("permission denied");
+    expect(listEntities(vault)).toHaveLength(0);
+  });
+
   test("translates an unknown relation into INVALID_PARAMS with no partial write", async () => {
+    // A real source, so the refusal under test is the relation vocabulary and
+    // not the source contract checked before it.
+    seed("Notes/scaling.md");
     await expect(
       handler(ctx, {
+        source: "[[Notes/scaling.md]]",
         entities: [
           { category: "concept", name: "A" },
           { category: "concept", name: "B" },

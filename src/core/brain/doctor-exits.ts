@@ -144,6 +144,22 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "follows it has already left the store",
   },
   {
+    code: "vault-include-missing-path",
+    reason:
+      "the allowlist names a root that is not at the vault root. Creating the folder and " +
+      "correcting the spelling are different intents with different indexes as their result, " +
+      "and the finding cannot tell which the operator meant - deleting the entry, the only " +
+      "mechanical option, would silently widen the boundary they wrote",
+  },
+  {
+    code: "vault-include-admits-nothing",
+    reason:
+      "the allowlist as a whole matches no file in this vault, so the index would be empty. " +
+      "Which of the declared roots is wrong, and whether the answer is to fix a spelling, add " +
+      "a root or create the folder, is a question about what the operator meant to index; a " +
+      "mechanical repair would have to pick one of those on their behalf",
+  },
+  {
     code: "vault-ignore-missing-path",
     reason:
       "the ignore rule names a path that is not in this vault. It is usually a typo, but it can " +
@@ -186,6 +202,15 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "the line range on a logged artifact reference does not parse. The range the author meant " +
       "is not derivable from the malformed text, and the event itself stays valid, so nothing " +
       "is lost by leaving it reported",
+  },
+  {
+    code: "recall-channel-unmeasured",
+    reason:
+      "the finding is that the install side of a recall channel could not be READ - a config gate " +
+      "that would not resolve, or an audit root that denied the walk. What repairs it depends on " +
+      "which, and on why: a permission an operator has to decide to grant, a config file to fix, " +
+      "or a path that belongs to another user entirely. Guessing one would act on a state this " +
+      "pass never managed to observe",
   },
   {
     code: "preference-missing-field",

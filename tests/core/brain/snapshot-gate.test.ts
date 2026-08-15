@@ -34,12 +34,18 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { takeSnapshot, withDestructiveSnapshot } from "../../../src/core/brain/snapshot-gate.ts";
+import {
+  createUniqueSnapshot,
+  takeSnapshot,
+  withDestructiveSnapshot,
+} from "../../../src/core/brain/snapshot-gate.ts";
 import { BrainSnapshotStoreError, listSnapshots } from "../../../src/core/brain/snapshot.ts";
-import { brainDirs, validateRunId } from "../../../src/core/brain/paths.ts";
+import { createSnapshot } from "../../../src/core/brain/snapshot.ts";
+import { isFileAlreadyExists } from "../../../src/core/fs-atomic.ts";
+import { brainDirs, snapshotPath, validateRunId } from "../../../src/core/brain/paths.ts";
 import { bootstrapBrain } from "../../../src/core/brain/init.ts";
 import { BRAIN_SNAPSHOT_REASON } from "../../../src/core/brain/types.ts";
-import { atomicWriteFileSync } from "../../../src/core/fs-atomic.ts";
+import { FileAlreadyExistsError, atomicWriteFileSync } from "../../../src/core/fs-atomic.ts";
 
 let vault: string;
 let configHome: string;
@@ -293,5 +299,113 @@ describe("takeSnapshot and withDestructiveSnapshot share one archive path", () =
       process.env["PATH"] = savedPath;
       rmSync(emptyDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("createUniqueSnapshot - the retry discriminator", () => {
+  /**
+   * The injected-creator tests below replay a collision with a synthetic
+   * typed error, which proves the LOOP but not the WIRE: they would keep
+   * passing if the real creator stopped producing a recognisable collision,
+   * and a snapshot gate that cannot recognise one aborts the destructive
+   * operation it exists to protect instead of laddering past a taken name.
+   * So this one drives the real `createSnapshot` against an archive a peer
+   * already wrote.
+   */
+  test("the real creator's collision is recognisable to the discriminator", () => {
+    // The injected tests below prove the LOOP. This proves the WIRE: they
+    // would keep passing if `createSnapshot` stopped producing an error the
+    // discriminator recognises, and a gate that cannot recognise one aborts
+    // the destructive operation it exists to protect rather than laddering
+    // past a taken name.
+    const taken = "dream-2026-06-01-120000";
+    atomicWriteFileSync(snapshotPath(vault, taken), "a peer got here first");
+    let thrown: unknown;
+    try {
+      createSnapshot(vault, taken, { reason: "dream" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeDefined();
+    expect(isFileAlreadyExists(thrown)).toBe(true);
+  });
+
+  test("ladders past a name a peer takes after the availability probe", () => {
+    // The gate's own probe skips a name already on disk, so the only way to
+    // reach the creator's collision is to let the peer win in the window the
+    // probe cannot see: the callback writes the winner's archive and then
+    // runs the REAL creator against it.
+    const base = "dream-2026-06-01-130000";
+    const calls: string[] = [];
+    const snapshot = createUniqueSnapshot(vault, base, (runId) => {
+      calls.push(runId);
+      if (calls.length === 1) {
+        atomicWriteFileSync(snapshotPath(vault, runId), "a peer got here first");
+      }
+      return createSnapshot(vault, runId, { reason: "dream" }).path;
+    });
+
+    expect(calls).toEqual([base, `${base}-2`]);
+    expect(snapshot.runId).toBe(`${base}-2`);
+    expect(readFileSync(snapshotPath(vault, base), "utf8")).toBe("a peer got here first");
+    expect(existsSync(snapshot.path)).toBe(true);
+  });
+
+  test("retries the next run id on a typed collision", () => {
+    const calls: string[] = [];
+    const snapshot = createUniqueSnapshot(vault, "dream-2026-06-01-000000", (runId) => {
+      calls.push(runId);
+      const path = snapshotPath(vault, runId);
+      if (calls.length === 1) {
+        atomicWriteFileSync(path, "winner");
+        throw new FileAlreadyExistsError(path);
+      }
+      atomicWriteFileSync(path, "loser");
+      return path;
+    });
+
+    expect(calls).toEqual(["dream-2026-06-01-000000", "dream-2026-06-01-000000-2"]);
+    expect(snapshot.runId).toBe("dream-2026-06-01-000000-2");
+    expect(snapshot.path).toBe(snapshotPath(vault, "dream-2026-06-01-000000-2"));
+  });
+
+  test("an unrelated failure propagates even when the archive path exists", () => {
+    // The defect this replaces: the retry used to be discriminated by
+    // re-running `existsSync` AFTER the throw, so a real failure that
+    // left bytes behind (a compressor that died part-way through its
+    // output) was read as a collision, retried, and finally reported as
+    // an id-exhaustion that named neither the failure nor its cause.
+    const real = new Error("zstd exited with status 1: No space left on device");
+    const calls: string[] = [];
+    expect(() =>
+      createUniqueSnapshot(vault, "dream-2026-06-01-000000", (runId) => {
+        calls.push(runId);
+        atomicWriteFileSync(snapshotPath(vault, runId), "partial");
+        throw real;
+      }),
+    ).toThrow(real);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("exhausts a bounded number of ids and says so", () => {
+    let calls = 0;
+    let thrown: unknown;
+    try {
+      createUniqueSnapshot(
+        vault,
+        "dream-2026-06-01-000000",
+        (runId) => {
+          calls += 1;
+          throw new FileAlreadyExistsError(snapshotPath(vault, runId));
+        },
+        3,
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    expect(calls).toBe(3);
+    expect((thrown as Error).message).toMatch(/could not reserve a unique snapshot run id/);
+    expect((thrown as Error).message).toMatch(/after 3 attempts/);
+    expect((thrown as Error).cause).toBeInstanceOf(FileAlreadyExistsError);
   });
 });

@@ -61,6 +61,71 @@ describe("lintConsolidate — fix-merged-link", () => {
     expect(content).toContain("[[pref-canon#section]]");
   });
 
+  test("a two-step merge converges in ONE pass", () => {
+    // A -> B -> C. The single-hop merge map rewrote [[pref-a]] to
+    // [[pref-b]], reported a `to` that was itself merged away, and needed
+    // a second run to converge; the canonical-id resolver walks the chain.
+    writePref("c", { topic: "x", principle: "y" });
+    writePref("b", { topic: "x", principle: "y", merged_into: "pref-c" });
+    writePref("a", { topic: "x", principle: "y", merged_into: "pref-b" });
+    writeFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "saw [[pref-a]] today\n");
+
+    const report = lintConsolidate(vault, { apply: true });
+    expect(report.fixes.map((f) => [f.from, f.to])).toEqual([["pref-a", "pref-c"]]);
+    const content = readFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "utf8");
+    expect(content).toContain("[[pref-c]]");
+
+    // Idempotent: a second pass finds nothing left to converge.
+    const second = lintConsolidate(vault, { apply: true });
+    expect(second.fixes.length).toBe(0);
+    expect(second.filesWritten).toBe(0);
+  });
+
+  test("a merge cycle is declared as unresolved rather than silently skipped", () => {
+    writePref("loop-a", { topic: "x", principle: "y", merged_into: "pref-loop-b" });
+    writePref("loop-b", { topic: "x", principle: "y", merged_into: "pref-loop-a" });
+    writeFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "saw [[pref-loop-a]]\n");
+
+    const report = lintConsolidate(vault, { apply: true });
+    expect(report.fixes.length).toBe(0);
+    expect(report.unresolved.map((u) => u.target)).toEqual(["pref-loop-a"]);
+    expect(report.unresolved[0]!.reason).toContain("cycle");
+    // The link is left exactly where it is.
+    expect(readFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "utf8")).toContain(
+      "[[pref-loop-a]]",
+    );
+  });
+
+  test("a merged_into value the id grammar rejects is declared, not swallowed", () => {
+    // A hand edit or an external tool can leave a `merged_into:` value the
+    // page-id grammar refuses. The chain then terminates in nothing: the
+    // link can neither be followed nor honestly left alone. Reporting
+    // nothing for it printed a clean vault over a link pointing at a page
+    // that has been merged away, which is the silence this pass exists to
+    // break. Distinct from a malformed link TARGET, which is simply not
+    // this resolver's business and stays silent - the case below.
+    writePref("bad-hop", { topic: "x", principle: "y", merged_into: "pref_B" });
+    writeFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "saw [[pref-bad-hop]]\n");
+
+    const report = lintConsolidate(vault, { apply: true });
+    expect(report.fixes.length).toBe(0);
+    expect(report.unresolved.map((u) => u.target)).toEqual(["pref-bad-hop"]);
+    expect(readFileSync(join(vault, "Brain", "log", "2026-05-25.md"), "utf8")).toContain(
+      "[[pref-bad-hop]]",
+    );
+  });
+
+  test("a link whose own id is outside the merge namespace stays silent", () => {
+    // The other half of the same discriminator: `sig-` artifacts are not
+    // merge-namespace ids at all, so the resolver saying "not my business"
+    // is correct and must not become a finding.
+    writeFileSync(join(vault, "Brain", "log", "2026-05-26.md"), "saw [[sig-2026-05-01-x]]\n");
+
+    const report = lintConsolidate(vault, { apply: false });
+    expect(report.fixes.length).toBe(0);
+    expect(report.unresolved.length).toBe(0);
+  });
+
   test("does not rewrite wikilinks that merely share a prefix", () => {
     writePref("canon", { topic: "x", principle: "y" });
     writePref("dup", { topic: "x", principle: "y", merged_into: "pref-canon" });
@@ -171,6 +236,7 @@ describe("lintConsolidate — empty vault", () => {
     const r = lintConsolidate(vault, { apply: false });
     expect(r.fixes.length).toBe(0);
     expect(r.demotions.length).toBe(0);
+    expect(r.unresolved.length).toBe(0);
     expect(r.filesWritten).toBe(0);
   });
 });

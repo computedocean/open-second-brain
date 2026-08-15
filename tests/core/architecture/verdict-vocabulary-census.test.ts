@@ -75,6 +75,56 @@ import {
   GRAPH_HEALTH_CODES,
   isGraphHealthCode,
 } from "../../../src/core/partner/codegraph-health.ts";
+import {
+  isRecallInjectFault,
+  RECALL_INJECT_FAULT,
+  RECALL_INJECT_FAULTS,
+} from "../../../src/core/brain/recall-inject.ts";
+import {
+  isRecallChannel,
+  isRecallTelemetryMode,
+  isRecallTelemetryStatus,
+  RECALL_CHANNEL,
+  RECALL_CHANNELS,
+  RECALL_TELEMETRY_MODE,
+  RECALL_TELEMETRY_MODES,
+  RECALL_TELEMETRY_STATUS,
+  RECALL_TELEMETRY_STATUSES,
+} from "../../../src/core/brain/recall-telemetry.ts";
+import {
+  isMaterializeFreshness,
+  isMaterializeStaleReason,
+  isMaterializeUnknownReason,
+  MATERIALIZE_FRESHNESS,
+  MATERIALIZE_FRESHNESS_STATES,
+  MATERIALIZE_STALE_REASON,
+  MATERIALIZE_STALE_REASONS,
+  MATERIALIZE_UNKNOWN_REASON,
+  MATERIALIZE_UNKNOWN_REASONS,
+} from "../../../src/core/brain/staleness.ts";
+import {
+  isReadinessStatus,
+  READINESS_STATUS,
+  READINESS_STATUSES,
+} from "../../../src/core/doctor-readiness.ts";
+import {
+  isRetrievalDegradationCode,
+  RETRIEVAL_DEGRADATION,
+  RETRIEVAL_DEGRADATION_CODES,
+} from "../../../src/core/search/retrieval-trail.ts";
+import {
+  isPageLintSkipReason,
+  PAGE_LINT_SKIP_REASON,
+  PAGE_LINT_SKIP_REASONS,
+} from "../../../src/core/brain/page-lint.ts";
+import {
+  isSchemaCompletenessRule,
+  isSchemaNodeKind,
+  SCHEMA_COMPLETENESS_RULE,
+  SCHEMA_COMPLETENESS_RULES,
+  SCHEMA_NODE_KIND,
+  SCHEMA_NODE_KINDS,
+} from "../../../src/mcp/registry-guard.ts";
 
 interface VocabularyUnderCensus {
   /** Identifies the vocabulary in a failure message. */
@@ -141,6 +191,16 @@ function auditVocabulary(vocabulary: VocabularyUnderCensus): ReadonlyArray<strin
  * already shipped the complete trio.
  */
 const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
+  {
+    // B5. `unknown` is the member the trio was missing: the install-state
+    // probe reads a manifest that can exist and refuse to parse, and among
+    // pass, fail and skipped there was no answer for "could not measure"
+    // that was not a lie in one direction or the other.
+    name: "READINESS_STATUS",
+    values: READINESS_STATUS,
+    members: READINESS_STATUSES,
+    guard: isReadinessStatus,
+  },
   { name: "GATE_MODE", values: GATE_MODE, members: GATE_MODES, guard: isGateMode },
   {
     name: "SCHEMA_PACK_INTEGRITY",
@@ -232,6 +292,122 @@ const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
     values: GRAPH_HEALTH_CODES,
     members: GRAPH_HEALTH_CODE_LIST,
     guard: isGraphHealthCode,
+  },
+  {
+    // B4. Three vocabularies for one gate, because the verdict, the
+    // reason an artifact is out of date, and the reason no verdict could
+    // be reached are three disjoint sets. The verdict replaced a boolean
+    // `fresh`, which is exactly the shape that forced a failed
+    // measurement to be reported as one of the two real answers.
+    name: "MATERIALIZE_FRESHNESS",
+    values: MATERIALIZE_FRESHNESS,
+    members: MATERIALIZE_FRESHNESS_STATES,
+    guard: isMaterializeFreshness,
+  },
+  {
+    // B4. Registered separately from the verdict: a stale reason is only
+    // ever paired with `stale`, and a guard that accepted both sets
+    // would let a persisted `unknown` reason be read back as a claim
+    // that the outputs are merely out of date.
+    name: "MATERIALIZE_STALE_REASON",
+    values: MATERIALIZE_STALE_REASON,
+    members: MATERIALIZE_STALE_REASONS,
+    guard: isMaterializeStaleReason,
+  },
+  {
+    // B4. These values leave TypeScript: the `--if-stale` fast-path
+    // writes the reason into the `communities` metric payload and into
+    // its `--json` output, so a rename here with the reader left alone
+    // is the copy-drift this census exists for.
+    name: "MATERIALIZE_UNKNOWN_REASON",
+    values: MATERIALIZE_UNKNOWN_REASON,
+    members: MATERIALIZE_UNKNOWN_REASONS,
+    guard: isMaterializeUnknownReason,
+  },
+  {
+    // C1. The transport a recall record arrived on. Registered because
+    // the doctor check that crosses it against an install state switches
+    // over it with no default arm, and because the value is persisted
+    // into the continuity log and copied into a tool-schema enum - both
+    // routes out of TypeScript this census exists to pin.
+    name: "RECALL_CHANNEL",
+    values: RECALL_CHANNEL,
+    members: RECALL_CHANNELS,
+    guard: isRecallChannel,
+  },
+  {
+    // C1. Not new - the guard was a hand-rolled equality chain, so
+    // `query` was added to the union and three copies of the list went
+    // stale, one of them a tool-schema enum that then rejected a mode
+    // the server itself records.
+    name: "RECALL_TELEMETRY_MODE",
+    values: RECALL_TELEMETRY_MODE,
+    members: RECALL_TELEMETRY_MODES,
+    guard: isRecallTelemetryMode,
+  },
+  {
+    // C1. The same conversion, and the vocabulary the injecting hook's
+    // three decisions map onto.
+    name: "RECALL_TELEMETRY_STATUS",
+    values: RECALL_TELEMETRY_STATUS,
+    members: RECALL_TELEMETRY_STATUSES,
+    guard: isRecallTelemetryStatus,
+  },
+  {
+    // Why the prompt-time recall hook failed. Minted because the error
+    // decision used to carry the retriever's RAW message and the hook
+    // copied it onto a synced continuity record that
+    // `brain_recall_telemetry` returns verbatim to a model - a SQLite or
+    // config failure names the index file or the config path, and the
+    // redactor strips secret-shaped tokens, not paths. Registered here
+    // because the value leaves TypeScript: it is persisted into that
+    // payload, and a member added to the object and forgotten in the list
+    // would be a fault no reader could narrow back.
+    name: "RECALL_INJECT_FAULT",
+    values: RECALL_INJECT_FAULT,
+    members: RECALL_INJECT_FAULTS,
+    guard: isRecallInjectFault,
+  },
+  {
+    // C2. Why a retrieval narrowed or came back empty. Registered because
+    // the values leave TypeScript twice over: they are declared as an
+    // `enum` in the `brain_search` output schema, where an undeclared code
+    // fails the response contract, and they are emitted as recall-telemetry
+    // gap strings - two hand-written copies away from the one definition if
+    // nothing asserts the trio agrees.
+    name: "RETRIEVAL_DEGRADATION",
+    values: RETRIEVAL_DEGRADATION,
+    members: RETRIEVAL_DEGRADATION_CODES,
+    guard: isRetrievalDegradationCode,
+  },
+  {
+    // C3. The two vocabularies the schema-completeness audit is built on:
+    // what kind of schema node the walk is standing on, and what a node
+    // failed to declare. Test-time only, so no value crosses a wire - but
+    // the rule vocabulary is the audit's whole contract with its readers,
+    // and a member added to the object and forgotten in the list would be
+    // a rule that never appears in a failure message.
+    name: "SCHEMA_NODE_KIND",
+    values: SCHEMA_NODE_KIND,
+    members: SCHEMA_NODE_KINDS,
+    guard: isSchemaNodeKind,
+  },
+  {
+    name: "SCHEMA_COMPLETENESS_RULE",
+    values: SCHEMA_COMPLETENESS_RULE,
+    members: SCHEMA_COMPLETENESS_RULES,
+    guard: isSchemaCompletenessRule,
+  },
+  {
+    // A4. Why a written page was not linted. The values ride out of
+    // TypeScript in the `lint.skipped[]` array of all four note-write
+    // tools, where a caller reads the reason to decide whether the silence
+    // about that page means clean or means unread - so a value added here
+    // and forgotten in the list is a reason no reader can narrow.
+    name: "PAGE_LINT_SKIP_REASON",
+    values: PAGE_LINT_SKIP_REASON,
+    members: PAGE_LINT_SKIP_REASONS,
+    guard: isPageLintSkipReason,
   },
 ]);
 
