@@ -13,6 +13,7 @@ import {
   slugify,
 } from "../../src/mcp/index.ts";
 import { createPluginRepo, createSandboxVault } from "../helpers/fixtures.ts";
+import { REDACTION_PLACEHOLDER } from "../../src/core/redactor.ts";
 
 let tmp: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -263,6 +264,7 @@ describe("tool listing", () => {
         "brain_session_checkpoint",
         "brain_idea_lineage",
         "brain_note_history",
+        "brain_note_lifecycle",
         // Schema admin + watchdog recovery probes.
         "schema_apply_mutations",
         "schema_inspect",
@@ -326,6 +328,7 @@ describe("tool listing", () => {
         "brain_memory_bridge",
         // Route-level MCP latency (context-pack-economics-observability).
         "brain_route_metrics",
+        "brain_scaffold_stub",
         // Shadow-only retrieval advisor (retrieval-quality-and-context-delivery).
         "brain_retrieval_plan",
         // Durable token-impact ledger (context-pack-economics-observability).
@@ -359,7 +362,9 @@ describe("tool calls", () => {
     // ones like config.vault_path.
     expect(JSON.stringify(s)).not.toContain(vault);
     expect(s.vault_exists).toBe(true);
-    expect(s.config.api_key).toBe("[REDACTED]");
+    // Was `[REDACTED]`: the key-name-only copy in config.ts is now the
+    // shared redactor's structured pass, and with it the one placeholder.
+    expect(s.config.api_key).toBe(REDACTION_PLACEHOLDER);
     expect(s.config_keys).toContain("vault_path");
   });
 
@@ -691,7 +696,11 @@ describe("stdio loop", () => {
     //   knowledge-intake-and-consolidation t_28ba3fc4) = 107.
     // + brain_retrieval_plan (shadow-only retrieval advisor,
     //   retrieval-quality-and-context-delivery t_3ffb021c) = 108.
-    expect(list.result.tools.length).toBe(108);
+    // + brain_note_lifecycle (rename / move / archive / delete for note FILES,
+    //   wiring-what-exists B2 t_ae62fabd) = 109.
+    // + brain_scaffold_stub (materialise a note for an unresolved wikilink
+    //   target, wiring-what-exists B3 t_783b37f8) = 110.
+    expect(list.result.tools.length).toBe(110);
   });
 
   test("returns parse error for invalid JSON", async () => {

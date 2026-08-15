@@ -4,10 +4,79 @@
  * Extracted from dream.ts so the planning sub-modules
  * (reconcile-outcomes.ts, dream-refresh.ts) and the orchestrator can
  * exchange typed state without a single-file dependency knot. Pure
- * data shapes plus two stateless helpers; no I/O.
+ * data shapes plus three stateless helpers; no I/O. `topicKey` lives here
+ * rather than at one consumer because the plan and the reconcile pass that
+ * reads the plan must agree on what one topic IS, and two copies of that rule
+ * would be one drift away from a contradiction the plan flags but reconcile
+ * cannot find.
  */
 
+import { foldQuoteVariantsByClass, normalizeEntityShape } from "./entities/canonical.ts";
 import type { BrainPreference, BrainRetiredReason, BrainSignal, BrainSignalSign } from "./types.ts";
+
+/**
+ * The key one topic owns in the consolidation pass.
+ *
+ * The read path canonicalises an entity reference before it compares it
+ * (`search/entity-alias.ts` folds query entities through
+ * `normalizeEntityName`); the consolidation path compared raw bytes, so two
+ * signals whose topics differed only by Unicode normal form, letter case, an
+ * internal whitespace run, or a curly-versus-straight quote were consolidated
+ * as unrelated subjects. The shape pass is the identity kernel's own -
+ * `normalizeEntityShape` is NFC, trim, whitespace collapse, lowercase, every
+ * step structural, so the rule behaves identically for a script with no case
+ * distinction and for one that has it.
+ *
+ * The quote step is the kernel's OTHER fold, and deliberately so. The kernel
+ * sends every quote class to the ASCII single quote, which merges a
+ * typographic DOUBLE quote with an apostrophe: `prefer-“single”-quotes` and
+ * `prefer-'single'-quotes` became one key, contended, and the pass then
+ * planned nothing for either - two live rules inert and an inbox that only
+ * grows. A topic key is computed per run and written nowhere, so it can
+ * afford the faithful fold that a persisted identity key cannot; see
+ * `foldQuoteVariantsByClass` and the note on `foldQuoteVariants` for what
+ * re-targeting a stored key would cost.
+ *
+ * A key is an index, never a label. Everything an operator reads back keeps
+ * the raw spelling a signal actually used - see `preferredTopicDisplay` in
+ * `dream-plan-topics.ts`.
+ *
+ * NOT every raw topic comparison in the Brain goes through this function, and
+ * the ones that do not are named rather than left implied: `query.ts`'s
+ * preference lookup and `intent-review.ts`'s pre-dream clustering both
+ * compare raw bytes, so the review can cluster signals differently from the
+ * plan that acts on them. Folding those is a behaviour change to the read
+ * path and to a report shape, which is a separate unit; what this release
+ * adds is a doctor check (`topic-key-collision` in
+ * `doctor/preference-hygiene.ts`) so the contention warning's remedy - find
+ * the near-duplicate pair and give the key one owner - has a tool behind it.
+ */
+export function topicKey(rawTopic: string): string {
+  return foldQuoteVariantsByClass(normalizeEntityShape(rawTopic));
+}
+
+/**
+ * Two or more preferences whose topics fold onto one {@link topicKey}.
+ *
+ * Before the fold they were separate subjects and each answered its own
+ * signals; after it they contend, and "one preference per topic" can no
+ * longer decide which of them a signal on that key bears on. The pass records
+ * the contention and plans nothing for the key rather than picking a winner
+ * by scan order - retiring the wrong rule is not a recoverable mistake.
+ *
+ * Byte-identical topics are NOT a contention: that is the pre-existing
+ * duplicate the design doc §7.4 invariant already covers, it keeps its
+ * historical first-wins handling, and reporting it here would be this unit
+ * inventing a finding it did not cause.
+ */
+export interface TopicKeyContention {
+  /** The folded key both preferences resolve to. */
+  readonly key: string;
+  /** The distinct raw topics claiming it, in code-unit order. */
+  readonly topics: ReadonlyArray<string>;
+  /** The ids of every claiming preference, in code-unit order. */
+  readonly prefIds: ReadonlyArray<string>;
+}
 
 /** Id prefix the preference writer stamps on every live rule. */
 export const PREF_ID_PREFIX = "pref-";
@@ -124,6 +193,13 @@ export interface PlanState {
    * existing move-to-processed semantics.
    */
   readonly quarantined: DreamQuarantinedEntry[];
+  /**
+   * Folded topic keys claimed by more than one preference. Every entry is a
+   * key the pass deliberately planned nothing for; the run summary carries
+   * one warning per entry so the ambiguity reaches an operator instead of
+   * being resolved by directory-enumeration order.
+   */
+  readonly topicKeyContentions: TopicKeyContention[];
 }
 
 export interface SignalSuppressedPlan {
@@ -206,6 +282,7 @@ export function emptyPlan(): PlanState {
     contradictionTopics: new Set(),
     signalsSuppressed: [],
     quarantined: [],
+    topicKeyContentions: [],
   };
 }
 

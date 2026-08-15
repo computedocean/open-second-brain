@@ -117,6 +117,8 @@ o2b brain session-describe    Count raw turns and deterministic summary depths f
 o2b brain session-expand      Expand a session recall node to immediate sources and paginated raw turn content (since v0.29.0)
 o2b brain session-summary     write|get|list a session-scoped structured digest (request/decisions/learnings/next_steps) (since v1.11.0)
 o2b brain idea-lineage        Trace how a derived artifact was reached: observation -> synthesis -> conclusion over continuity sourceRefs or belief-evolution (since v1.11.0)
+o2b brain note-lifecycle      <rename|move|archive|delete> <path> [<to>] [--apply] [--confirm] [--expect N] [--strict] [--json] - note-FILE lifecycle; source and destination both go through the create-note path envelope. Dry-run without --apply; delete also needs --confirm. A relocation rewrites inbound [[wikilinks]] vault-wide (both path spellings always, the bare basename only when exactly one note carries it) and the receipt names how stale the search index still is; delete rewrites nothing, reports the references it strands, and returns a recoverability verdict saying the archive it took does not cover a note outside Brain/
+o2b brain scaffold-stub       list [--limit N] [--json] | write <target> [--path <p>] [--source <s>...] [--if-exists refuse|skip] [--apply] [--json] - unresolved wikilink targets. list reads them from the search index and refuses with a state and a next_command when that index is missing or only partially resolved, never printing an empty list for an index nobody finished resolving; write materialises a stub whose title is the target and whose body links back to its sources. A target that already resolves, or names several notes, is refused
 o2b brain note-history        Decompose a note's git history into episodic phases split on a commit-time gap (since v1.11.0)
 o2b brain import-claude-memory (CLI-only) Import metadata.type=feedback entries from a Claude Code memory directory into Brain/preferences/. --dry-run / --apply, sidecar manifest for idempotency, UPDATE preserves accumulated evidence
 ```
@@ -815,6 +817,29 @@ o2b search check              Pre-flight diagnostics: vault, index directory, SQ
                               the absence of a fault is never reported as a pass.
                               --json adds an integrity object; without the flag the output is
                               unchanged and no index_state cell is touched
+                              --no-probe skips the live embedding-provider call. The probe is on by
+                              default, as it has been in every release that resolved a key; the flag
+                              exists so a diagnostic can be run with no network at all.
+
+                              Exit codes. `0` clean. `1` a machine fault or a condemned index, and it
+                              keeps precedence: a provider verdict never masks one. `5` the embedding
+                              provider is configured and was proved unreachable - it answered, and it
+                              refused. `6` the probe did not complete, by its own clock or by the
+                              outer budget; "I could not find out" is not "it is broken", and the two
+                              are separate codes for that reason.
+
+                              Code `5` is a behaviour change, and a breaking one: this verb exited `0`
+                              over a provider it had already proved unreachable, so a script gating on
+                              the exit code read it as healthy. It is deliberately the same number
+                              `o2b install --check` uses for the same condition, and a test asserts the
+                              two cannot drift. A provider that is not configured still exits `0` -
+                              absent is not broken.
+
+                              The `--json` key `provider_reachable` (a boolean, or null when unknown)
+                              is replaced by `provider_probe`, a string from a closed vocabulary:
+                              not-configured, reachable, unreachable, timed-out, skipped. The boolean
+                              had to answer four questions with two values, so a provider that refused
+                              and one that never answered were the same `false`.
 o2b search provider add NAME  Register an OpenAI-compatible embedding endpoint (since v0.36.0)
                               --base-url U --model M --env-key K (K is the env var NAME holding the key);
                               persisted to Brain/search/embedding-providers.json, resolved after built-ins

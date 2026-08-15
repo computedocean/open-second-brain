@@ -169,15 +169,35 @@ Recommended behavior:
 - vault-portable config is backed up with the vault;
 - machine-local config can be regenerated with `o2b init --adopt-vault`;
 - `o2b export-config` writes a redacted machine snapshot into the vault;
-- secrets are excluded and represented as `[REDACTED]` only when needed.
+- secrets are excluded and represented as `***REDACTED***` only when needed.
 
 ## Vault layout
 
-The agent owns one directory in the vault: `Brain/`. The write
-contract stays simple ("agent writes only under `Brain/`").
-User-authored notes (daily journals, weekly notes) live wherever the
-operator names them; the agent reads those paths only when they are
-listed in `notes.read_paths`.
+The agent owns one directory in the vault for its own artefacts:
+`Brain/`. User-authored notes (daily journals, weekly notes) live
+wherever the operator names them; the agent reads those paths only when
+they are listed in `notes.read_paths`.
+
+Two operations reach user space, both of them operator-invoked and named
+here rather than implied. `brain_note_lifecycle` moves, renames, archives
+and deletes a note at a path the caller supplies, and rewrites inbound
+`[[wikilink]]` references to it across the vault. Its `archive` action
+moves the note to `Archive/<original path>` — a second top-level
+directory, because the note is user content and `Brain/` is refused for
+every note path, source and destination alike. **An operator whose backup
+rule covers only `Brain/` should extend it to `Archive/`.** The rewrite
+pass never writes outside the vault, never writes a path `vault.ignore_paths`
+or `vault.include_paths` excludes, and never rewrites `Brain/log/`, which
+is an append-only record of what was said at a time.
+
+An export refuses in two cases rather than writing something misleading.
+A payload the redactor could only partially scan refuses, because a file
+that was scanned in part cannot claim to be clean. And a secret-shaped
+**identifier** — a filename, an id, a mapping key — refuses rather than
+being redacted, because redacting an identifier does not hide it, it
+renames it: two notes whose names both redact to the same placeholder
+collapse onto one path and one of the bodies is lost. A placeholder in a
+payload is a redaction; a placeholder in an identifier is a lost identity.
 
 ```text
 Brain/
@@ -197,8 +217,10 @@ Brain/
 ```
 
 This layout is intentionally agent-owned: every artefact Open Second
-Brain writes lives under `Brain/`. User-authored content elsewhere in
-the vault is read-only to the agent and stays under operator control.
+Brain generates lives under `Brain/`. User-authored content elsewhere in
+the vault stays under operator control and is read-only to the agent's
+own passes; the note-lifecycle verbs above are the one surface that
+writes it, and they act only on a path the caller named.
 
 ## Brain layer
 
@@ -253,4 +275,12 @@ Open Second Brain must not store:
 - credentials;
 - connection strings containing secrets.
 
-If secret-like content appears in input, tools should redact it as `[REDACTED]` before writing.
+If secret-like content appears in input, tools should redact it as `***REDACTED***` before writing.
+
+Every path that writes vault content to a destination OUTSIDE the vault - the
+export verbs and `o2b export-config` - goes through `src/core/egress/guard.ts`
+and is declared in `src/core/egress/registry.ts`, with
+`tests/core/architecture/egress-census.test.ts` deriving the population from
+source so a new export path cannot ship undeclared. A payload the redactor
+could only partially scan refuses the write rather than producing a file that
+claims to be clean.

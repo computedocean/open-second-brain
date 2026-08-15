@@ -314,6 +314,31 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "Tombstone or supersede a memory, resolve chain tips, list curator slices",
         ),
         command(
+          "note-lifecycle",
+          "Note FILES: rename, move, archive or delete one, rewriting inbound wikilinks",
+          [
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("apply", "boolean"),
+            flag("confirm", "boolean"),
+            flag("expect", "string"),
+            flag("strict", "boolean"),
+          ],
+        ),
+        command(
+          "scaffold-stub",
+          "Unresolved wikilink targets: list them from the index, or materialise a stub",
+          [
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("path", "string"),
+            flag("source", "string-array"),
+            flag("if-exists", "string"),
+            flag("limit", "string"),
+            flag("apply", "boolean"),
+          ],
+        ),
+        command(
           "claims",
           "Claim-graph query: current truth, truth at an instant, replaced-by, contested-by",
         ),
@@ -338,7 +363,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "bank-export",
           "Serialise a whole-vault bank bundle: preferences, graph, pages, sources",
         ),
-        command("bank-import", "Reconstruct the page graph from a bank bundle"),
+        command("bank-import", "Reconstruct the page graph and preferences from a bank bundle"),
         command(
           "authored-at-backfill",
           "Backfill authored_at on session-imported signals (dry-run by default)",
@@ -526,8 +551,18 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("status", "Print search index status"),
         command(
           "check",
-          "Run search pre-flight diagnostics; --integrity adds a full structural scan of the index file",
-          [flag("integrity", "boolean")],
+          "Run search pre-flight diagnostics; --integrity adds a full structural scan of the index file, --no-probe skips the live embedding-provider call",
+          // The whole schema, for the reason the three verbs above give:
+          // the vault-addressing triple was parsed here and advertised
+          // nowhere, so `o2b help --json` - the only discovery surface
+          // these verbs have - said this verb took nothing but --json.
+          [
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("db", "string"),
+            flag("integrity", "boolean"),
+            flag("no-probe", "boolean"),
+          ],
         ),
         command("provider", "Manage embedding provider profiles"),
         command("expand", "Drill a search card into the fuller note and its raw chunk transcript"),

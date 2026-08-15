@@ -59,6 +59,11 @@ import {
   SNAPSHOT_STORE_EXCLUSION,
   SNAPSHOT_STORE_EXCLUSION_REASONS,
 } from "../../../src/core/brain/manifest.ts";
+import {
+  isSnapshotPruneRefusal,
+  SNAPSHOT_PRUNE_REFUSAL,
+  SNAPSHOT_PRUNE_REFUSALS,
+} from "../../../src/core/brain/snapshot.ts";
 import { GATE_MODE, GATE_MODES, isGateMode } from "../../../src/core/integrity/stamp.ts";
 import {
   isTriggerStatus,
@@ -118,6 +123,26 @@ import {
   PAGE_LINT_SKIP_REASONS,
 } from "../../../src/core/brain/page-lint.ts";
 import {
+  EGRESS_REDACTION,
+  EGRESS_REDACTION_STATUSES,
+  isEgressRedactionStatus,
+} from "../../../src/core/egress/registry.ts";
+import {
+  EGRESS_OUTCOME,
+  EGRESS_OUTCOMES,
+  isEgressOutcome,
+} from "../../../src/core/egress/guard.ts";
+import {
+  isProviderProbeState,
+  PROVIDER_PROBE,
+  PROVIDER_PROBE_STATES,
+} from "../../../src/core/search/provider-probe.ts";
+import {
+  isPreferenceRestoreFailure,
+  PREFERENCE_RESTORE_FAILURE,
+  PREFERENCE_RESTORE_FAILURES,
+} from "../../../src/core/brain/portability/preference-restore.ts";
+import {
   isSchemaCompletenessRule,
   isSchemaNodeKind,
   SCHEMA_COMPLETENESS_RULE,
@@ -125,6 +150,38 @@ import {
   SCHEMA_NODE_KIND,
   SCHEMA_NODE_KINDS,
 } from "../../../src/mcp/registry-guard.ts";
+import {
+  isRecoverabilityBlocker,
+  isRecoverabilityState,
+  isRecoveryCoverage,
+  RECOVERABILITY_BLOCKER,
+  RECOVERABILITY_BLOCKERS,
+  RECOVERABILITY_STATE,
+  RECOVERABILITY_STATES,
+  RECOVERY_COVERAGE,
+  RECOVERY_COVERAGES,
+} from "../../../src/core/brain/gates/recoverability.ts";
+import {
+  BASENAME_REWRITE,
+  BASENAME_REWRITES,
+  INDEX_EVIDENCE,
+  INDEX_EVIDENCE_STATES,
+  isBasenameRewrite,
+  isIndexEvidenceState,
+  isNoteLifecycleAction,
+  NOTE_LIFECYCLE_ACTION,
+  NOTE_LIFECYCLE_ACTIONS,
+} from "../../../src/core/brain/notes/lifecycle.ts";
+import {
+  DANGLING_SCAN,
+  DANGLING_SCANS,
+  isDanglingScan,
+} from "../../../src/core/brain/notes/scaffold-stub.ts";
+import {
+  isStubScaffoldAction,
+  STUB_SCAFFOLD_ACTION,
+  STUB_SCAFFOLD_ACTIONS,
+} from "../../../src/mcp/brain/lifecycle-file-tools.ts";
 
 interface VocabularyUnderCensus {
   /** Identifies the vocabulary in a failure message. */
@@ -408,6 +465,154 @@ const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
     values: PAGE_LINT_SKIP_REASON,
     members: PAGE_LINT_SKIP_REASONS,
     guard: isPageLintSkipReason,
+  },
+  {
+    // C1. What a given export path does about secrets on the way out.
+    // Registered because the value is the load-bearing field of a
+    // declaration that a source-reading census checks against the code:
+    // a status renamed here and left spelled the old way in the census
+    // would silently stop matching, and every entry would read as
+    // accounted for.
+    name: "EGRESS_REDACTION",
+    values: EGRESS_REDACTION,
+    members: EGRESS_REDACTION_STATUSES,
+    guard: isEgressRedactionStatus,
+  },
+  {
+    // C1. Released or refused at the export boundary. Registered
+    // separately from the status above because they answer different
+    // questions - what a PATH does in general, and what happened to ONE
+    // payload - and a guard that accepted both would let a refusal be
+    // read back as a policy.
+    name: "EGRESS_OUTCOME",
+    values: EGRESS_OUTCOME,
+    members: EGRESS_OUTCOMES,
+    guard: isEgressOutcome,
+  },
+  {
+    // E1. What the live embedding-provider probe of `o2b search check`
+    // concluded. It replaced a `boolean | null` that had to answer four
+    // questions with two truth values, so a provider that answered with a
+    // refusal and one that never answered were the same `false`. The
+    // values leave TypeScript through the verb's `--json` payload, where
+    // a caller reads `provider_probe` to decide whether the silence about
+    // an endpoint means healthy, broken, or unmeasured - which is exactly
+    // the copy this census exists to keep honest.
+    name: "PROVIDER_PROBE",
+    values: PROVIDER_PROBE,
+    members: PROVIDER_PROBE_STATES,
+    guard: isProviderProbeState,
+  },
+  {
+    // E2. Why one preference in a bank bundle did not restore. The values
+    // ride out of TypeScript in the `preferences.failed[]` array of the
+    // bank-import result and its `--json` rendering, where an operator
+    // reads the reason to decide whether to re-export, resolve a
+    // divergence by hand, or upgrade an old bundle. A value the guard
+    // rejects would read back off that JSON as an unknown refusal.
+    name: "PREFERENCE_RESTORE_FAILURE",
+    values: PREFERENCE_RESTORE_FAILURE,
+    members: PREFERENCE_RESTORE_FAILURES,
+    guard: isPreferenceRestoreFailure,
+  },
+  {
+    // R1a. Three vocabularies for one gate, by the same rule U2 states at
+    // :228-232: what a recovery point is worth, which regions of the vault
+    // an archive actually holds, and what stops a region being provable
+    // are three disjoint sets, so they are a namespace rather than an
+    // abstraction. The state replaced a `throw`-or-`DestructiveSnapshot`
+    // pair that had no way to say "a recovery point exists and it does not
+    // cover all of this" - which is what `--include-originals` needed to
+    // say while it reported a snapshot path instead.
+    name: "RECOVERABILITY_STATE",
+    values: RECOVERABILITY_STATE,
+    members: RECOVERABILITY_STATES,
+    guard: isRecoverabilityState,
+  },
+  {
+    // R1a. Registered separately because the regions are read back off a
+    // gate result and switched over by the destructive-site registry: a
+    // guard that also accepted a state would let `partial` be read as a
+    // region of the vault an archive holds.
+    name: "RECOVERY_COVERAGE",
+    values: RECOVERY_COVERAGE,
+    members: RECOVERY_COVERAGES,
+    guard: isRecoveryCoverage,
+  },
+  {
+    // R1a. These values leave TypeScript: they ride out in the
+    // `recoverability.blockers[]` array of the delete-by-source response,
+    // where a caller reads them to decide whether the deletion it just
+    // authorised is reversible.
+    name: "RECOVERABILITY_BLOCKER",
+    values: RECOVERABILITY_BLOCKER,
+    members: RECOVERABILITY_BLOCKERS,
+    guard: isRecoverabilityBlocker,
+  },
+  {
+    // B1. One member, and the census does not care how many: what it
+    // asserts is that the guard accepts it and rejects everything else.
+    // The value rides out of TypeScript in the prune report the
+    // destructive gate returns and the CLI prints, and it exists because
+    // a configured retention of zero used to make the most destructive
+    // operation in the snapshot module remove every archive in the vault
+    // without a word.
+    name: "SNAPSHOT_PRUNE_REFUSAL",
+    values: SNAPSHOT_PRUNE_REFUSAL,
+    members: SNAPSHOT_PRUNE_REFUSALS,
+    guard: isSnapshotPruneRefusal,
+  },
+  {
+    // B2. The dispatch key of the note-file lifecycle tool, so the value
+    // arrives as an untyped MCP argument or a raw CLI positional and the
+    // guard is the boundary between the two.
+    name: "NOTE_LIFECYCLE_ACTION",
+    values: NOTE_LIFECYCLE_ACTION,
+    members: NOTE_LIFECYCLE_ACTIONS,
+    guard: isNoteLifecycleAction,
+  },
+  {
+    // B2. What a rename did about `[[Basename]]` - the one inbound
+    // spelling that is not unique by construction. Three answers, and
+    // the reason it is a vocabulary rather than a boolean is that
+    // "withheld because two notes carry the name" and "there was nothing
+    // to rewrite" are opposite facts a boolean would collapse.
+    name: "BASENAME_REWRITE",
+    values: BASENAME_REWRITE,
+    members: BASENAME_REWRITES,
+    guard: isBasenameRewrite,
+  },
+  {
+    // B2. The freshness of the derived index a relocation could not
+    // update. No `current` member: nothing in this codebase writes the
+    // `links` table on a note write, so an index that exists is stale
+    // with respect to a rename that just happened, and declaring a
+    // member nothing produces would invite the opposite reading.
+    name: "INDEX_EVIDENCE",
+    values: INDEX_EVIDENCE,
+    members: INDEX_EVIDENCE_STATES,
+    guard: isIndexEvidenceState,
+  },
+  {
+    // B3. Three of its four members are refusals, and that is the unit:
+    // the index reports dangling links as a COUNT, and a count taken
+    // after an incremental pass is not reproducible. An empty list from
+    // a partially-resolved index would read as a clean vault, so the
+    // scan says which of the four states produced the answer.
+    name: "DANGLING_SCAN",
+    values: DANGLING_SCAN,
+    members: DANGLING_SCANS,
+    guard: isDanglingScan,
+  },
+  {
+    // B3. The dispatch key of the stub-scaffolding tool. Separate from
+    // NOTE_LIFECYCLE_ACTION because the subjects are different kinds:
+    // every lifecycle action names an existing note by path, and a
+    // dangling target has no path yet - that is what makes it dangling.
+    name: "STUB_SCAFFOLD_ACTION",
+    values: STUB_SCAFFOLD_ACTION,
+    members: STUB_SCAFFOLD_ACTIONS,
+    guard: isStubScaffoldAction,
   },
 ]);
 

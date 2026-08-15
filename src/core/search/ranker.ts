@@ -7,10 +7,19 @@
  * The ranker imports no I/O modules. Callers (search.ts) gather the
  * inputs from the store and pass them in. This makes it trivially
  * testable and substitutable.
+ *
+ * Freshness is measured from the authoring instant the document declares
+ * (`documents.authored_at`) when that instant is usable, falling back to
+ * the filesystem mtime the indexer recorded. Any indexed note can populate
+ * that column - the indexer reads the frontmatter key off every markdown
+ * file - so the fallback is not a niche path, and "usable" is enforced here
+ * rather than assumed. See {@link freshnessAnchorSeconds} and
+ * `authored-at.ts`.
  */
 
 import { clamp01 } from "../math.ts";
 import { PAGE_TIER_DEFAULT, tierWeight, type PageTier } from "../brain/page-meta/tier.ts";
+import { usableAuthoredAtSeconds } from "./authored-at.ts";
 import { weibullDecay, DEFAULT_RECENCY, type WeibullRecencyOptions } from "./recency.ts";
 import { scoreSessionFocusTarget } from "./session-focus.ts";
 import { rrfFuse, DEFAULT_RRF_K, type FusionMode } from "./fusion.ts";
@@ -215,10 +224,47 @@ function semanticFromDistance(distance: number): number {
   return clamp01(sim);
 }
 
-function recencyBoost(mtime: number, nowMs: number, opts: WeibullRecencyOptions): number {
-  const ageMs = Math.max(0, nowMs - mtime * 1000);
+/**
+ * Freshness decay for a candidate whose age is measured from
+ * `anchorSeconds` (unix seconds - the same unit both `documents.mtime`
+ * and `documents.authored_at` are stored in, so no conversion enters
+ * here).
+ */
+function recencyBoost(anchorSeconds: number, nowMs: number, opts: WeibullRecencyOptions): number {
+  const ageMs = Math.max(0, nowMs - anchorSeconds * 1000);
   const ageDays = ageMs / DAY_MS;
   return weibullDecay(ageDays, opts);
+}
+
+/**
+ * The instant a candidate's age is measured from, in unix seconds: the
+ * authoring instant the document declares, else the filesystem mtime the
+ * indexer recorded when it wrote the file.
+ *
+ * `mtime` answers "when did this vault last touch the file", which is a
+ * storage fact. Freshness is a question about the content, and only
+ * `authored_at` answers it: a conversation imported today whose turns
+ * happened a year ago is a year old, however new its file is.
+ *
+ * The real exposure: the indexer reads `authored_at` off the frontmatter of
+ * EVERY indexed markdown file (`authoredAtFromFrontmatter`), so any note in
+ * the vault can populate the column, not only the artifacts session import
+ * and the inbox backfill write. A vault whose notes declare no `authored_at`
+ * still resolves to `mtime` for every candidate - the pre-existing behaviour,
+ * exactly - but that is a property of the CORPUS, not a limit on who can
+ * reach this layer.
+ *
+ * Which is why the anchor is not the declared value but the USABLE one: an
+ * instant later than the query clock cannot be an authoring instant, and
+ * taken at face value it pinned the document at the top of the decay curve
+ * permanently (`weibullDecay` returns its full amplitude for a non-positive
+ * age). Such a document falls back to `mtime` - the storage fact is the only
+ * instant left, and it is exactly where the same note sat before this layer
+ * existed. Clamping to now instead would hold it at maximum freshness
+ * forever, which is the defect and not its fix.
+ */
+function freshnessAnchorSeconds(usableAuthoredAt: number | null, mtime: number): number {
+  return usableAuthoredAt ?? mtime;
 }
 
 interface Candidate {
@@ -499,7 +545,16 @@ export function rankResults(inputs: RankerInputs, opts: RankerOptions): BrainSea
     // the prior points at "now" and the query points at the past, so
     // leaving it undamped would fight the layer below. Damped, never
     // removed - `recencyAmplitude: 0` stays the only off switch.
-    const recency = recencyBoost(c.mtime, nowMs, recencyOpts) * recMul * temporalDamping;
+    // Age runs from the authoring instant when the record declares a usable
+    // one (D1) - see `freshnessAnchorSeconds` for why, and for what "usable"
+    // rules out. Resolved ONCE per candidate: the freshness prior, the
+    // reported field and the chronology tie-break must not disagree about
+    // whether this row carries an authoring instant.
+    const authoredAt = usableAuthoredAtSeconds(hyd.authoredAt, nowMs);
+    const recency =
+      recencyBoost(freshnessAnchorSeconds(authoredAt, c.mtime), nowMs, recencyOpts) *
+      recMul *
+      temporalDamping;
     // Relevance term: reciprocal-rank-fused when in rrf mode, otherwise
     // the weighted sum of the normalised lanes. The fused value already
     // carries the intent multipliers (applied per lane, above); the
@@ -592,9 +647,11 @@ export function rankResults(inputs: RankerInputs, opts: RankerOptions): BrainSea
         linkBoost,
         recencyBoost: recency,
         // Conversation chronology (S1): expose the authoring instant only
-        // when the note carries one, so a note with no turn instant keeps
-        // the byte-identical result shape.
-        ...(hyd.authoredAt != null ? { authoredAt: hyd.authoredAt } : {}),
+        // when the note carries a usable one, so a note with no turn instant
+        // keeps the byte-identical result shape - and a note whose declared
+        // instant the ranker refused does not hand a consumer, as an
+        // authoring instant, a value the ranking itself would not trust.
+        ...(authoredAt !== null ? { authoredAt } : {}),
         searchType: c.searchType,
         reasons: buildReasons({
           reuseBoost,
@@ -641,6 +698,13 @@ export function rankResults(inputs: RankerInputs, opts: RankerOptions): BrainSea
   // an `authored_at`. A pair where either side has none falls through to
   // the historical tie-break, so any non-tied pair (and every pair without
   // turn instants) keeps today's order byte-identically.
+  // D1 narrowed this rung's domain without emptying it. Now that the same
+  // instant drives the freshness prior above, two instants inside the live
+  // decay band separate the SCORE and never arrive here. What still does:
+  // a pair whose instants both decay to the same value (the epsilon floor
+  // in `recency.ts` swallows anything past roughly half a year), a
+  // composite `clamp01` saturated, and a vault that turned the freshness
+  // layer off. Those are ordinary, so the rung stays.
   // Query-side temporal intent (t_58fc4720): under an active window the
   // temporal layer separates the tie FIRST - above the whole ladder
   // below, `keywordScore` included, not only above the two freshness
@@ -668,8 +732,11 @@ export function rankResults(inputs: RankerInputs, opts: RankerOptions): BrainSea
       const bTemporal = b.breakdown?.temporal ?? 0;
       if (aTemporal !== bTemporal) return bTemporal - aTemporal;
     }
-    const aAuthored = inputs.hydrated.get(a.chunkId)?.authoredAt ?? null;
-    const bAuthored = inputs.hydrated.get(b.chunkId)?.authoredAt ?? null;
+    // Read off the RESULT, not the hydrated row: the result carries the
+    // usable instant this run resolved, so a row whose declared instant was
+    // refused above cannot win the rung the refusal exists to protect.
+    const aAuthored = a.authoredAt ?? null;
+    const bAuthored = b.authoredAt ?? null;
     if (aAuthored !== null && bAuthored !== null && aAuthored !== bAuthored) {
       return bAuthored - aAuthored;
     }

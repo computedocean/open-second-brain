@@ -8,7 +8,12 @@
  * timestamps), so the format is a deterministic interchange artifact.
  *
  * The importer (`importVaultGraph`, Feature 5 Task 4) reconstructs page
- * stubs under three conflict modes.
+ * stubs under three conflict modes. It refuses a node per entry rather
+ * than aborting the run: an unreadable shape, a path that escapes the
+ * vault, and a node whose path or title carries the redactor's
+ * placeholder all land in `rejected` while the rest of the graph imports.
+ * See {@link hasRedactedIdentity} for why a lost name is a refusal and not
+ * a lossy import.
  */
 
 import { existsSync, mkdirSync } from "node:fs";
@@ -26,6 +31,7 @@ import {
   extractFrontmatterRelations,
   normalizeRelationTarget,
 } from "../../graph/frontmatter-relations.ts";
+import { REDACTION_PLACEHOLDER } from "../../redactor.ts";
 import { BRAIN_ROOT_REL, ensureInsideVault } from "../paths.ts";
 import { loadVaultMap, resolveTokens } from "./role-tokens.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
@@ -118,7 +124,11 @@ export interface GraphImportResult {
   readonly skipped: string[];
   readonly overwritten: string[];
   readonly merged: string[];
-  /** Node paths refused because they escaped the vault. */
+  /**
+   * Node paths the importer refused: a node whose shape is not readable,
+   * one whose path escapes the vault, and one whose path or title carries
+   * the redactor's placeholder (see {@link hasRedactedIdentity}).
+   */
   readonly rejected: string[];
 }
 
@@ -154,13 +164,40 @@ function isValidGraphNode(node: unknown): node is GraphNodeInput {
 }
 
 /**
+ * Whether a node lost the identity that names it.
+ *
+ * A graph node is addressed by its `path` and displayed by its `title`,
+ * and {@link REDACTION_PLACEHOLDER} is a single constant: two nodes
+ * redacted in the same field are not two anonymous pages, they are one
+ * path, and importing both writes the second over the first while
+ * reporting two creations. The page a redacted path names cannot be
+ * recovered from the bundle, so the node is refused.
+ *
+ * `links` and `relations` are deliberately NOT checked: those name OTHER
+ * pages. A target that no longer resolves is a dangling wikilink, which is
+ * the vault's ordinary state and what the stub-scaffolding verb is for -
+ * losing a reference is not losing this node's identity.
+ */
+function hasRedactedIdentity(node: GraphNodeInput): boolean {
+  if (node.path.includes(REDACTION_PLACEHOLDER)) return true;
+  return node.title !== undefined && node.title.includes(REDACTION_PLACEHOLDER);
+}
+
+/**
  * Render a deterministic page stub. Single-target relations land in
  * frontmatter (the only form OSB's frontmatter parser round-trips);
  * body wikilinks list the links. Multi-target relations are flattened
  * into the body links (type not preserved - a documented limitation of
  * the frontmatter parser).
+ *
+ * Exported for `notes/scaffold-stub.ts` (B3), which materialises a note
+ * for a dangling wikilink target. That verb needs exactly this shape and
+ * for exactly this reason: every byte it emits is DERIVED - the title
+ * from the target the link spelled, the body links from the documents the
+ * index says referenced it - so a scaffolded note contains no prose
+ * pretending to be the user's.
  */
-function renderStub(
+export function renderStub(
   title: string,
   links: ReadonlyArray<string>,
   relations: Readonly<Record<string, ReadonlyArray<string>>>,
@@ -225,6 +262,13 @@ export function importVaultGraph(
     // GraphNodeInput type is not a runtime guarantee.
     if (!isValidGraphNode(node)) {
       result.rejected.push(String((node as { path?: unknown })?.path ?? "<invalid-node>"));
+      continue;
+    }
+    // A node whose own name was redacted before it reached this bundle.
+    // The export boundary refuses to emit one; a bundle written by an
+    // earlier build, or scrubbed by another tool, can still carry it.
+    if (hasRedactedIdentity(node)) {
+      result.rejected.push(node.path);
       continue;
     }
     // Resolve `{{role}}` tokens in the target path via the vault-map so a

@@ -162,6 +162,7 @@ const NON_CONTENT: ReadonlyArray<string> = [
   "brain_memory_bridge",
   "brain_moc_audit",
   "brain_note",
+  "brain_note_lifecycle",
   "brain_obligation",
   "brain_observed_use",
   "brain_pinned_context",
@@ -174,6 +175,7 @@ const NON_CONTENT: ReadonlyArray<string> = [
   "brain_retention",
   "brain_review_candidates",
   "brain_route_metrics",
+  "brain_scaffold_stub",
   "brain_secrets",
   "brain_session_checkpoint",
   "brain_skill_proposals",
@@ -309,7 +311,7 @@ test("the matrix classifies every tool exactly once", () => {
 });
 
 test("the tool count is unchanged: an argument was added, never a tool", () => {
-  expect(TOOLS.length).toBe(108);
+  expect(TOOLS.length).toBe(110);
 });
 
 test("every argument-scoped surface declares agent_scope in its input schema", () => {

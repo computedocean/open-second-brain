@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BRAIN_INDEX_REL, BRAIN_ROOT_REL } from "../../src/core/brain/paths.ts";
 import { isReadinessStatus } from "../../src/core/doctor-readiness.ts";
+import { REDACTION_PLACEHOLDER } from "../../src/core/redactor.ts";
 import { createPluginRepo, createSandboxVault } from "../helpers/fixtures.ts";
 import { runCli } from "../helpers/run-cli.ts";
 
@@ -219,18 +220,34 @@ describe("doctor", () => {
     HOME: tmp,
   });
 
-  test("without --readiness the output has no readiness section (byte-identical opt-out)", async () => {
-    const plain = await runCli(["doctor", "--vault", tmp], { env: readinessEnv() });
-    expect(plain.returncode).toBe(0);
-    expect(plain.stdout).not.toContain("readiness:");
+  /**
+   * Budget for a readiness test that spawns the CLI TWICE to compare the
+   * opt-out output against the opt-in one. One cold spawn of the real binary
+   * costs several seconds on a loaded machine, so a pair of them sits above
+   * bun's 5 s default and these two tests passed only when the spawns
+   * happened to be warm - the same "the suite's verdict is a function of the
+   * machine it ran on" defect 1.45.1 fixed for the config env leak. The
+   * single-spawn sibling below is inside the default budget and keeps it,
+   * so this constant marks exactly the tests that pay twice.
+   */
+  const TWO_SPAWN_TIMEOUT_MS = 30_000;
 
-    const withFlag = await runCli(["doctor", "--vault", tmp, "--readiness"], {
-      env: readinessEnv(),
-    });
-    // The readiness run appends its section; the base output is unchanged,
-    // so the plain output is an exact prefix of the readiness output.
-    expect(withFlag.stdout.startsWith(plain.stdout)).toBe(true);
-  });
+  test(
+    "without --readiness the output has no readiness section (byte-identical opt-out)",
+    async () => {
+      const plain = await runCli(["doctor", "--vault", tmp], { env: readinessEnv() });
+      expect(plain.returncode).toBe(0);
+      expect(plain.stdout).not.toContain("readiness:");
+
+      const withFlag = await runCli(["doctor", "--vault", tmp, "--readiness"], {
+        env: readinessEnv(),
+      });
+      // The readiness run appends its section; the base output is unchanged,
+      // so the plain output is an exact prefix of the readiness output.
+      expect(withFlag.stdout.startsWith(plain.stdout)).toBe(true);
+    },
+    TWO_SPAWN_TIMEOUT_MS,
+  );
 
   test("--readiness runs the default probes with explicit outcomes", async () => {
     const r = await runCli(["doctor", "--vault", tmp, "--readiness"], { env: readinessEnv() });
@@ -244,23 +261,27 @@ describe("doctor", () => {
     expect(r.stdout).toContain("[PASS] runtime_adapter_wiring:");
   });
 
-  test("--readiness --json omits the readiness key without the flag and adds it with it", async () => {
-    const plain = await runCli(["doctor", "--vault", tmp, "--json"], { env: readinessEnv() });
-    expect(JSON.parse(plain.stdout).readiness).toBeUndefined();
+  test(
+    "--readiness --json omits the readiness key without the flag and adds it with it",
+    async () => {
+      const plain = await runCli(["doctor", "--vault", tmp, "--json"], { env: readinessEnv() });
+      expect(JSON.parse(plain.stdout).readiness).toBeUndefined();
 
-    const withFlag = await runCli(["doctor", "--vault", tmp, "--json", "--readiness"], {
-      env: readinessEnv(),
-    });
-    const parsed = JSON.parse(withFlag.stdout);
-    expect(Array.isArray(parsed.readiness)).toBe(true);
-    // The probe set is the default registry; assert it is non-empty and that
-    // every entry carries a status from the closed vocabulary, rather than
-    // pinning a count that a new probe changes for no behavioural reason.
-    expect(parsed.readiness.length).toBeGreaterThan(0);
-    expect(parsed.readiness.every((p: { status: string }) => isReadinessStatus(p.status))).toBe(
-      true,
-    );
-  });
+      const withFlag = await runCli(["doctor", "--vault", tmp, "--json", "--readiness"], {
+        env: readinessEnv(),
+      });
+      const parsed = JSON.parse(withFlag.stdout);
+      expect(Array.isArray(parsed.readiness)).toBe(true);
+      // The probe set is the default registry; assert it is non-empty and that
+      // every entry carries a status from the closed vocabulary, rather than
+      // pinning a count that a new probe changes for no behavioural reason.
+      expect(parsed.readiness.length).toBeGreaterThan(0);
+      expect(parsed.readiness.every((p: { status: string }) => isReadinessStatus(p.status))).toBe(
+        true,
+      );
+    },
+    TWO_SPAWN_TIMEOUT_MS,
+  );
 
   test("--readiness exits 1 with a fail reason when a probe fails", async () => {
     // A key-requiring embedding provider (openai-compat) with no key makes the
@@ -373,7 +394,10 @@ describe("export-config", () => {
     const r = await runCli(["export-config", "--config", config, "--output", out]);
     expect(r.returncode).toBe(0);
     const data = JSON.parse(readFileSync(out, "utf8"));
-    expect(data.config.api_key).toBe("[REDACTED]");
+    // `[REDACTED]` until the key-name-only copy in config.ts was collapsed
+    // into the shared redactor; this is now the one placeholder spelling
+    // every redaction in the project emits.
+    expect(data.config.api_key).toBe(REDACTION_PLACEHOLDER);
     expect(data.config.vault_path).toBe("/tmp/vault");
   });
 });

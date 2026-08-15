@@ -35,6 +35,7 @@ import {
   SEMANTIC_VECTOR_CODE,
 } from "./capability-tier.ts";
 import { sha256Hex } from "../integrity/digest.ts";
+import { parseAuthoredAtSeconds } from "./authored-at.ts";
 import { chunkMarkdown } from "./chunker.ts";
 import { expandTextForCjkFts } from "./cjk-tokenizer.ts";
 import { declaredInputWindowTokens, passagePrefixSentByProvider } from "./embeddings/presets.ts";
@@ -49,6 +50,13 @@ import {
 } from "./embeddings/signature.ts";
 import { resolveEventAnchor } from "./event-anchor.ts";
 import { extractLinks } from "./links.ts";
+import {
+  probeProvider,
+  PROVIDER_PROBE,
+  PROVIDER_PROBE_NOT_CONFIGURED,
+  PROVIDER_PROBE_SKIPPED,
+  type ProviderProbeState,
+} from "./provider-probe.ts";
 import { extractFrontmatterRelations } from "../graph/frontmatter-relations.ts";
 import { loadSchemaPack, type SchemaPack } from "../brain/schema-pack.ts";
 import { tieredFieldsForKind } from "../brain/frontmatter-tiers.ts";
@@ -76,7 +84,6 @@ import {
 import { LATEST_SCHEMA_VERSION } from "./schema.ts";
 import { chunkWindowDiagnosticCode, SearchError } from "./types.ts";
 import { walkVault } from "./walker.ts";
-import { withTimeout } from "./with-timeout.ts";
 import type { ChunkInput, LinkInput } from "./store.ts";
 import type {
   ChunkWindowCensus,
@@ -250,18 +257,24 @@ function aliasesFromFrontmatter(frontmatter: Record<string, unknown>): string[] 
 
 /**
  * The note's `authored_at` frontmatter instant as unix seconds, or null
- * when undeclared or unparseable (conversation chronology, S1). Tolerant
- * by design: a malformed value never fails indexing, it just leaves the
- * document with no turn instant so it ranks byte-identically. A value at
- * or before the Unix epoch is treated as absent (the import layer's "no
- * timestamp" sentinel), never a real authoring instant.
+ * when undeclared, unparseable, or not usable as an authoring instant
+ * (conversation chronology, S1). Tolerant by design: a malformed value never
+ * fails indexing, it just leaves the document with no turn instant so it
+ * ranks byte-identically.
+ *
+ * This key is read off EVERY indexed markdown file - not only the artifacts
+ * session import and the inbox backfill write - so the rule that decides
+ * what counts as an authoring instant lives in `authored-at.ts` and is
+ * enforced HERE, at the boundary that fills the column, rather than being
+ * re-derived by each consumer of it. See {@link usableAuthoredAtSeconds} for
+ * the two refusals (pre-epoch sentinel, and an instant later than the moment
+ * the indexer read the file).
  */
-function authoredAtFromFrontmatter(frontmatter: Record<string, unknown>): number | null {
-  const raw = frontmatter["authored_at"];
-  if (typeof raw !== "string") return null;
-  const ms = Date.parse(raw.trim());
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  return Math.floor(ms / 1000);
+function authoredAtFromFrontmatter(
+  frontmatter: Record<string, unknown>,
+  nowMs: number,
+): number | null {
+  return parseAuthoredAtSeconds(frontmatter["authored_at"], nowMs);
 }
 
 const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
@@ -380,7 +393,11 @@ async function indexInto(
           mtime: mtimeSec,
           size: file.stat.size,
           pageType: pageTypeFromFrontmatter(frontmatter),
-          authoredAt: authoredAtFromFrontmatter(frontmatter),
+          // `t0` - the instant this run started - is the reading clock the
+          // "not later than the read" refusal measures against. One clock
+          // for the whole run, so two files with the same declared instant
+          // resolve identically however long the run takes.
+          authoredAt: authoredAtFromFrontmatter(frontmatter, t0),
           // The event anchor is materialised HERE, on the same pass that
           // already holds the parsed frontmatter and the body, so the
           // query side never re-scans a candidate's body. It is a pure
@@ -1298,7 +1315,23 @@ function isDirectoryWritable(dir: string): boolean {
   }
 }
 
-export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexCheckReport> {
+/** What one `indexCheck` run may do beyond reading this machine. */
+export interface IndexCheckOptions {
+  /**
+   * Whether to make the one outbound call this report can make: a single
+   * `ping` at the configured embedding provider. Defaults to `true`,
+   * which is what every release before it has done, so a caller that
+   * passes nothing gets the report it has always got. `false` produces
+   * the `skipped` probe state - never a pass and never a fault, because
+   * a call nobody made proves neither.
+   */
+  readonly probeProvider?: boolean;
+}
+
+export async function indexCheck(
+  config: ResolvedSearchConfig,
+  opts?: IndexCheckOptions,
+): Promise<IndexCheckReport> {
   const warnings: string[] = [];
   const fatal: string[] = [];
   // One resolver for what the operator configured, shared with the index
@@ -1370,24 +1403,30 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     warnings.push(await semanticCapabilityLabel(capability.code));
   }
 
-  let providerReachable: boolean | null = null;
-  let providerReason: string | null = null;
-  if (embeddingKeyResolved) {
-    try {
-      const provider = makeProvider(config.semantic);
-      const probe = await withTimeout(provider.ping(), 5_000);
-      if (probe.ok) {
-        providerReachable = true;
-      } else {
-        providerReachable = false;
-        providerReason = probe.reason;
-        warnings.push(`embedding provider check failed: ${probe.reason}`);
-      }
-    } catch (e) {
-      providerReachable = false;
-      providerReason = e instanceof Error ? e.message : String(e);
-      warnings.push(`embedding provider check failed: ${providerReason}`);
-    }
+  // The live probe (wiring-what-exists, E1). Three decisions, each one
+  // the difference between two states a single verdict used to blur:
+  //
+  //   - Nothing configured is `not-configured`, not a failed probe. The
+  //     absence of a provider is not a broken provider, and it costs no
+  //     network call: `probeProvider` is never reached on that arm.
+  //   - An unconfigured setup takes that arm even when the caller asked
+  //     for no probe, because "there is nothing to ask" is established
+  //     without asking and is the more specific true statement.
+  //   - Only a provider that ANSWERED with a refusal is a fatal finding.
+  //     A probe that did not complete goes to `warnings`, because it
+  //     proved nothing, and the CLI gives it an exit code of its own so
+  //     it is not read as either verdict.
+  const probe = !embeddingKeyResolved
+    ? PROVIDER_PROBE_NOT_CONFIGURED
+    : opts?.probeProvider === false
+      ? PROVIDER_PROBE_SKIPPED
+      : await probeProvider(() => makeProvider(config.semantic));
+  const providerProbe = probe.state;
+  const providerReason = probe.reason;
+  if (providerProbe === PROVIDER_PROBE.unreachable) {
+    fatal.push(`embedding provider unreachable: ${providerReason}`);
+  } else if (providerProbe === PROVIDER_PROBE.timedOut) {
+    warnings.push(`embedding provider probe did not complete: ${providerReason}`);
   }
 
   // Stored-versus-runtime embedding ABI (context-integrity-gates, Unit
@@ -1413,7 +1452,7 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     config,
     embeddingKeyResolved,
     vecExtension,
-    providerReachable,
+    providerProbe,
     embeddingAbi,
   });
 
@@ -1425,7 +1464,7 @@ export async function indexCheck(config: ResolvedSearchConfig): Promise<IndexChe
     embeddingAbi,
     vecExtension,
     embeddingKeyResolved,
-    providerReachable,
+    providerProbe,
     providerReason,
     warnings: Object.freeze(warnings),
     fatal: Object.freeze(fatal),
@@ -1437,7 +1476,7 @@ interface BuildRecommendationsInput {
   readonly config: ResolvedSearchConfig;
   readonly embeddingKeyResolved: boolean;
   readonly vecExtension: "loaded" | "unavailable" | "not-attempted";
-  readonly providerReachable: boolean | null;
+  readonly providerProbe: ProviderProbeState;
   readonly embeddingAbi: ReadonlyArray<StampMismatch>;
 }
 
@@ -1476,10 +1515,12 @@ function buildRecommendations(input: BuildRecommendationsInput): string[] {
   }
 
   // "Everything wired, no embeddings yet" → suggest the first
-  // reindex plus the optional cron template. providerReachable is
-  // `true` only after both key and vec are present, so it is the
-  // tightest proxy for "ready to compute but never did".
-  if (input.providerReachable === true && input.vecExtension === "loaded") {
+  // reindex plus the optional cron template. The probe reports
+  // `reachable` only after both key and vec are present, so it is the
+  // tightest proxy for "ready to compute but never did" - and a probe
+  // that was skipped or timed out proves no such thing, which is why the
+  // comparison is against that one state rather than "not a failure".
+  if (input.providerProbe === PROVIDER_PROBE.reachable && input.vecExtension === "loaded") {
     recs.push(
       "Run `o2b search reindex --embeddings` to compute the first vectors, then optionally `o2b search reindex --cron-template` for periodic refresh.",
     );
