@@ -12,10 +12,11 @@ compares these copies against the live server (anti-drift), so edits here
 that diverge from the TS core fail CI. To re-vendor after a schema change in
 the TS core, copy the projection from a live ``o2b mcp`` ``tools/list``.
 
-The copies mirror the live server exactly, including spots where the provider
-relies on server-side coercion (e.g. ``brain_pre_compact_extract`` declares
-``turn_start``/``turn_end`` as strings while ``_flush_buffer`` passes ints).
-Do not "fix" such fields here; the server is the source of truth.
+The copies mirror the live server exactly. Do not "fix" a field here because
+the provider disagrees with it: the server is the source of truth, it does not
+coerce, and a payload whose type diverges is rejected with ``-32602`` before
+the tool body runs. Provider-built payloads are checked against these copies
+by ``ProviderPayloadConformanceTests`` in the same suite.
 """
 
 from __future__ import annotations
@@ -386,11 +387,12 @@ STATIC_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                                     'scores': {'type': 'array',
                                                'maxItems': 200,
                                                'items': {'type': 'number'},
-                                               'description': 'Optional top-k recall relevance '
-                                                              'scores. When given, the gate adds '
+                                               'description': 'Optional top-k recall scores. Adds '
                                                               'an adequacy verdict: '
                                                               'sufficient/proceed, weak/re_recall, '
-                                                              'or insufficient/abstain.'}},
+                                                              'insufficient/abstain. An empty '
+                                                              'array adds the negative '
+                                                              'verdict.'}},
                      'required': ['prompt'],
                      'additionalProperties': False}},
     {'name': 'brain_context',

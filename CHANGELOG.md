@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.1] - 2026-08-15
+
+### Fixed
+
+- **Every Hermes pre-compaction flush has been discarded at the boundary since 0.32.0.** `brain_pre_compact_extract` declares `turn_start` and `turn_end` as turn ids - strings - and the provider sent the buffer's integer offsets. The tool reads them with the argument reader that does not coerce, so the call was rejected with `-32602` before extraction ran; the lifecycle hook swallows bridge errors by design, so neither side said anything and the buffered turns were simply gone. The provider sends strings, which is what the sibling Aider bracket has always sent. Reported and fixed by @GMDD59 in #158.
+- The vendored schema copy carried a comment instructing the next reader to leave that mismatch alone, on the theory that the server coerced it. It does not, and the comment now says so.
+- A payload conformance suite drives the provider's lifecycle hooks and validates what actually crossed the bridge against the vendored schemas - required keys, declared types, enums, string bounds, and the closed property set - and fails when a hook stops calling out at all, because a flush that never happens is the failure mode being guarded. Nothing checked the shape of a provider-built payload before; the Hermes test double accepts anything, which is why a payload the real server always refused looked healthy in every run.
+- The anti-drift gate on the vendored schemas has been failing since 1.45.0, which reworded the `brain_recall_gate` `scores` description without re-vendoring the copy Hermes advertises before its bridge is up. Re-vendored.
+- **A starter vault went stale ninety days after the bundle was authored.** The dropped bundle carries a fictional five-day history with fixed May 2026 dates, one of them the evidence behind a `pinned` preference, so from 13 August 2026 on every vault initialised with `--starter` reported `pinned-without-recent-evidence` on its first `o2b brain doctor` run. The bundle is now aged to the day it is dropped: every date moves by the same whole number of days, so the trial window still open, the evidence two days back and the retired entries months behind all survive the move, and the starter is clean whenever it is installed rather than for one quarter after it was written. `bootstrapBrain`'s `now` seam, reserved for exactly this and until now unused, is what the tests pin it with.
+- A test that deletes `OPEN_SECOND_BRAIN_CONFIG` from the real process environment never put it back, and every test file the runner ordered after it lost the hermetic default the suite's preload installs. On a developer machine the fallback to a real `~/.config/open-second-brain/config.yaml` hid it completely; on a bare runner it was forty-two failures or four, depending on where the ordering landed, and it turned the suite's verdict into a function of the machine it ran on.
+
 ## [1.45.0] - 2026-08-10
 
 Eight units on one seam: what this system does when it cannot answer. A check that could not run reported the same thing as a check that passed. An archive that omitted a file reported the same thing as one that contained it. A search over a stale index returned the same nothing as a search over a complete one. A rule dropped under budget pressure was reported as dropped without saying which rule. A finding an operator had judged benign had no state meaning benign, only a seven-day timer. A retired preference left every decision built on it looking current.
@@ -6943,6 +6954,7 @@ plugin config (vault field)`, and exits with a clear
 - Sandbox vault and plugin manifest fixtures for tests.
 - GitHub release workflow for tag-based and manually dispatched releases.
 
+[1.45.1]: https://github.com/itechmeat/open-second-brain/compare/v1.45.0...v1.45.1
 [1.45.0]: https://github.com/itechmeat/open-second-brain/compare/v1.44.1...v1.45.0
 [1.44.1]: https://github.com/itechmeat/open-second-brain/compare/v1.44.0...v1.44.1
 [1.44.0]: https://github.com/itechmeat/open-second-brain/compare/v1.43.0...v1.44.0
