@@ -19,6 +19,7 @@
 
 import { resolveAgentName } from "../../core/config.ts";
 import { loadBrainConfig } from "../../core/brain/policy.ts";
+import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import { applyHygienePlan } from "../../core/brain/hygiene/apply.ts";
 import { buildHygienePlan } from "../../core/brain/hygiene/plan.ts";
 import { resolveConflictFindings } from "../../core/brain/hygiene/resolve-conflicts.ts";
@@ -76,15 +77,24 @@ function scanWithResolver(
   });
 }
 
+/**
+ * The artifacts one finding would disclose, as the owner-scope view
+ * spells references: an absolute path rendered vault-relative, anything
+ * else left as the Brain artifact id it already is.
+ */
+function findingRefs(vault: string, finding: HygieneFinding): ReadonlyArray<string> {
+  return finding.targets.map((target) =>
+    target.startsWith("/") ? vaultRelativeSafe(vault, target) : target,
+  );
+}
+
 function findingView(vault: string, finding: HygieneFinding): Record<string, unknown> {
   return {
     id: finding.id,
     detector: finding.detector,
     severity: finding.severity,
     title: finding.title,
-    targets: finding.targets.map((target) =>
-      target.startsWith("/") ? vaultRelativeSafe(vault, target) : target,
-    ),
+    targets: findingRefs(vault, finding),
     proposed_action: finding.proposed_action,
     evidence: finding.evidence,
   };
@@ -143,6 +153,26 @@ async function linkIntegrityView(ctx: ServerContext): Promise<Record<string, unk
   };
 }
 
+/**
+ * Per-detector counts over the findings actually returned.
+ *
+ * Every detector that RAN keeps a key, so a detector with nothing to say
+ * is still reported as having run with zero - the distinction between
+ * "not run" and "found nothing" that `detectors_run` and `counts`
+ * together carry.
+ */
+function countByDetector(
+  detectorsRun: ReadonlyArray<HygieneDetectorId>,
+  findings: ReadonlyArray<HygieneFinding>,
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const detector of detectorsRun) counts[detector] = 0;
+  for (const finding of findings) {
+    counts[finding.detector] = (counts[finding.detector] ?? 0) + 1;
+  }
+  return counts;
+}
+
 async function toolBrainHygiene(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -184,15 +214,43 @@ async function toolBrainHygiene(
       "'detectors' entries must be: conflicts, dedup, freshness, usefulness",
     );
   }
-  const report = scanWithResolver(ctx.vault, detectors, now);
+  const scanned = scanWithResolver(ctx.vault, detectors, now);
+
+  // The owner boundary is applied to the REPORT, once, before EITHER mode
+  // reads it. `findings[].targets` are artifact ids (or absolute paths
+  // rendered vault-relative) and the `title` spells the same artifact out
+  // in prose (a-label-is-not-a-boundary, U3, recon C2).
+  //
+  // Hoisted out of the `scan` branch on purpose. While it lived there,
+  // `apply` planned against the UNFILTERED report, so a caller scoped to
+  // one owner whose scan correctly returned nothing could still hand a
+  // finding id to `apply` and merge, retire or archive another owner's
+  // preference - and read both hidden ids back out of the applier's
+  // `detail`. Finding ids are derivable rather than secret
+  // (`hygiene/detectors/id.ts` hashes the sorted target list), so
+  // withholding them from the scan was never the boundary; this is.
+  //
+  // Filtering the report rather than the plan is also what makes a hidden
+  // finding IDENTICAL TO ABSENT: `buildHygienePlan` indexes what it is
+  // given, so an id it cannot see lands in `unknown_ids` exactly as an id
+  // nobody ever issued does. A separate "withheld" bucket - or a hidden
+  // id landing in `excluded_review` while a nonexistent one lands in
+  // `unknown_ids` - would be an existence oracle over the same
+  // population the scan just refused to enumerate
+  // (`preferences-collect.ts` states the convention).
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+  const findings = view.keep(scanned.findings, (f) => findingRefs(ctx.vault, f));
+  const report: HygieneScanReport = Object.freeze({ ...scanned, findings });
 
   if (mode === "scan") {
+    // `counts` is recomputed from the visible findings: a count over the
+    // unfiltered set would report how many findings were withheld.
     return {
       mode,
       generated_at: report.generated_at,
       detectors_run: report.detectors_run,
-      counts: report.counts,
-      findings: report.findings.map((finding) => findingView(ctx.vault, finding)),
+      counts: countByDetector(report.detectors_run, findings),
+      findings: findings.map((finding) => findingView(ctx.vault, finding)),
       errors: report.errors,
       link_integrity: await linkIntegrityView(ctx),
     };

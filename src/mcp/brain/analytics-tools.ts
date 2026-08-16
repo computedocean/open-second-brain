@@ -12,6 +12,7 @@ import {
   type IngestDedupSurface,
 } from "../../core/brain/dedup-telemetry.ts";
 import { buildConceptCluster } from "../../core/brain/link-graph/concept-cluster.ts";
+import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import { buildTimelineIndex } from "../../core/brain/temporal/build-index.ts";
 import { selectEvents } from "../../core/brain/temporal/select-events.ts";
 import { buildBeliefEvolution } from "../../core/brain/temporal/belief-evolution.ts";
@@ -24,6 +25,7 @@ import {
 import { normaliseWikilinkTarget } from "../../core/brain/wikilink.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
+import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import {
   coerceIsoTimestampOrDate,
@@ -71,11 +73,18 @@ async function toolBrainTimeline(
     ...(since !== undefined ? { since } : {}),
     ...(until !== undefined ? { until } : {}),
   });
-  const sliced = limit !== undefined ? events.slice(0, limit) : events;
+  // A timeline row names the preference the event was about, its topic,
+  // and the file the event was read from (a-label-is-not-a-boundary,
+  // U3). Filtered BEFORE the limit and before `total`, so the count is
+  // the visible one - a total that still included the hidden rows would
+  // leak their number.
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+  const visible = view.keep(events, (ev) => [ev.source.path, ev.prefId, ev.artifact]);
+  const sliced = limit !== undefined ? visible.slice(0, limit) : visible;
   return {
-    vault_path: ctx.vault,
+    vault_path: vaultPathField(ctx),
     window: index.window,
-    total: events.length,
+    total: visible.length,
     events: sliced.map((ev) => ({
       at: ev.at,
       kind: ev.kind,
@@ -114,12 +123,24 @@ async function toolBrainBeliefEvolution(
     : { topic: (topicRaw as string).trim() };
   const index = buildTimelineIndex(ctx.vault, {});
   const evo = buildBeliefEvolution(index, ctx.vault, target);
+  // A topic target fans out to every pref/ret carrying that topic, so
+  // one `topic` argument reaches artifacts the caller never named
+  // (a-label-is-not-a-boundary, U3). Every row names its subject: a
+  // transition by `prefId` and by the wikilink the dream summary used,
+  // an evidence row by `prefId` and by the `artifact` it was applied to,
+  // a retirement by its whole supersession chain.
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
   return {
-    vault_path: ctx.vault,
+    vault_path: vaultPathField(ctx),
     target: evo.target,
-    transitions: evo.transitions,
-    evidence: evo.evidence,
-    retirements: evo.retirements,
+    transitions: view.keep(evo.transitions, (t) => [t.prefId, t.link]),
+    evidence: view.keep(evo.evidence, (e) => [e.prefId, e.artifact]),
+    retirements: view.keep(evo.retirements, (r) => [
+      r.prefId,
+      r.retiredBy,
+      r.supersededBy,
+      r.supersedes,
+    ]),
     generated_at: evo.generatedAt,
   };
 }
@@ -151,11 +172,16 @@ async function toolBrainConceptSynthesis(
     includeUnlinked = includeUnlinkedRaw;
   }
   const targetId = normaliseWikilinkTarget(idRaw);
+  // `linkers[].source` names every artifact pointing at the target and
+  // `unlinkedMentions[]` carries a VERBATIM line of the mentioning
+  // page's body (a-label-is-not-a-boundary, U3). Both producers already
+  // take the scope; passing it is the whole fix.
   const cluster = buildConceptCluster(ctx.vault, targetId, {
     includeUnlinked,
+    ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
   });
   return {
-    vault_path: ctx.vault,
+    vault_path: vaultPathField(ctx),
     target_id: cluster.targetId,
     target_title: cluster.targetTitle,
     linkers: cluster.linkers,
@@ -219,13 +245,22 @@ async function toolBrainDedup(
   }
   const since = coerceIsoTimestampOrDate("brain_analytics", "since", args["since"]);
   const until = coerceIsoTimestampOrDate("brain_analytics", "until", args["until"]);
+  const summary = summarizeIngestDedup(ctx.vault, {
+    ...(typeof surface === "string" ? { surface: surface as IngestDedupSurface } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(until !== undefined ? { until } : {}),
+  });
+  // `by_source[].ref` is the one field here with a per-artifact subject:
+  // "a session id, or a vault-relative note path - whatever the run keys
+  // provenance by" (`dedup-telemetry.ts`), and a note path is
+  // owner-taggable (a-label-is-not-a-boundary, U3). The totals and the
+  // per-run trend beside it are folds over ingest RUNS with no artifact
+  // in them, so they stay as measured.
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
   return {
-    vault_path: ctx.vault,
-    ...summarizeIngestDedup(ctx.vault, {
-      ...(typeof surface === "string" ? { surface: surface as IngestDedupSurface } : {}),
-      ...(since !== undefined ? { since } : {}),
-      ...(until !== undefined ? { until } : {}),
-    }),
+    vault_path: vaultPathField(ctx),
+    ...summary,
+    by_source: view.keep(summary.by_source, (row) => [row.ref]),
   };
 }
 

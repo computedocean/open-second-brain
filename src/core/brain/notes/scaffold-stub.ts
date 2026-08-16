@@ -116,6 +116,16 @@ const REINDEX_COMMAND = requireNextStep(SEARCH_INDEX_MISSING_CODE).nextCommand;
 /** Default cap on targets returned by one scan. */
 export const DANGLING_SCAN_DEFAULT_LIMIT = 100;
 
+/**
+ * The `limit` handed to `Store.listDangling` so it groups every
+ * unresolved row rather than the first page of them.
+ *
+ * `listDangling` takes a required cap; there is no "all" spelling. The
+ * caller's own limit cannot be that cap, because it has to be applied
+ * after the ownership filter - see the call site.
+ */
+const UNBOUNDED_TARGETS = Number.MAX_SAFE_INTEGER;
+
 function refusal(state: DanglingScan, detail: string): DanglingScanResult {
   return Object.freeze({
     state,
@@ -128,6 +138,21 @@ function refusal(state: DanglingScan, detail: string): DanglingScanResult {
 export interface ListDanglingOptions {
   /** Maximum targets returned. Defaults to {@link DANGLING_SCAN_DEFAULT_LIMIT}. */
   readonly limit?: number;
+  /**
+   * Owner scope the listing is filtered against
+   * (a-label-is-not-a-boundary, U3). Absent / `null` filters nothing,
+   * which is what both existing callers get.
+   *
+   * The predicate cannot be SQL - `documents` has no owner column
+   * (`src/core/search/schema.ts:103-113`) - so it lands here, one layer
+   * above `listDangling`, where the vault root is in hand and
+   * `isPathOwnerVisible` can be asked. A target whose sources are ALL
+   * filtered away is dropped WHOLE: the surviving `target` string is the
+   * link spelling a hidden note wrote, so publishing it would name a
+   * private page's title and confirm the existence of the note that
+   * pointed at it.
+   */
+  readonly ownerScope?: string | null;
 }
 
 /**
@@ -178,9 +203,19 @@ export async function listDanglingTargets(
           "a dangling list is only reproducible after a forced full pass",
       );
     }
+    // The limit caps what the CALLER receives, so it is applied AFTER
+    // the ownership filter, never before it. Asking the store for
+    // `limit` targets and then hiding some of them silently returns
+    // fewer rows than the caller asked for and than the vault holds -
+    // and the shortfall is proportional to how much the other owner
+    // wrote, which is the existence leak read off a row count. Ordering
+    // it this way costs nothing: `listDangling` reads every unresolved
+    // row out of sqlite regardless and applies `limit` while grouping.
+    const scope = opts.ownerScope ?? null;
+    const visible = await visibleTargets(vault, store.listDangling(UNBOUNDED_TARGETS), scope);
     return Object.freeze({
       state: DANGLING_SCAN.measured,
-      targets: store.listDangling(limit),
+      targets: Object.freeze(visible.slice(0, limit)),
       detail: null,
       nextCommand: REINDEX_COMMAND,
     });
@@ -189,6 +224,43 @@ export async function listDanglingTargets(
   } finally {
     await store.close();
   }
+}
+
+/**
+ * Drop the sources the scope may not see, and drop the WHOLE target when
+ * none of them survives.
+ *
+ * Filtering `sources` alone would not close this: `target` is the link
+ * text a hidden note wrote, so a target reachable only from hidden
+ * sources publishes that note's private outbound link - and, when the
+ * link was written by title, the private page's title with it. A target
+ * that still has a visible source stays, because that source's own text
+ * already names it to this caller.
+ *
+ * The owner-scope view is reached through a DEFERRED import for the same
+ * reason the store is: it imports the search-side frontmatter cache, and
+ * a static edge from a Brain note writer into the search tree is the
+ * shape the acyclic-import ratchet exists to keep out.
+ */
+async function visibleTargets(
+  vault: string,
+  targets: ReadonlyArray<DanglingLinkTarget>,
+  scope: string | null,
+): Promise<ReadonlyArray<DanglingLinkTarget>> {
+  if (scope === null) return targets;
+  const { ownerScopeView } = await import("../owner-scope-view.ts");
+  const view = ownerScopeView(vault, scope);
+  const kept: DanglingLinkTarget[] = [];
+  for (const target of targets) {
+    const sources = target.sources.filter((source) => view.visible(source));
+    if (sources.length === 0) continue;
+    kept.push(
+      sources.length === target.sources.length
+        ? target
+        : Object.freeze({ target: target.target, sources: Object.freeze(sources) }),
+    );
+  }
+  return Object.freeze(kept);
 }
 
 /**

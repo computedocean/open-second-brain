@@ -43,6 +43,8 @@ import {
 } from "../../core/brain/write-advisory.ts";
 import { loadFeedbackDefaultScopeSafe } from "../../core/brain/policy.ts";
 import { writePreference } from "../../core/brain/preference.ts";
+import { gatedOwnerScopeView, type OwnerScopeView } from "../../core/brain/owner-scope-view.ts";
+import { brainArtifactSlug } from "../../core/brain/wikilink.ts";
 import { validateBrainFeedbackInput } from "../../core/brain/sessions/validate-feedback.ts";
 import { isoDate, isoSecond } from "../../core/brain/time.ts";
 import { slugify } from "../../core/vault.ts";
@@ -56,7 +58,11 @@ import {
 } from "../../core/brain/types.ts";
 import { appendLogEvent } from "../../core/brain/log.ts";
 import { appendBrainNote } from "../../core/brain/note.ts";
-import { mirrorSignal, resolveSharedNamespace } from "../../core/brain/shared-namespace.ts";
+import {
+  mirrorReportFields,
+  mirrorSignal,
+  resolveSharedNamespace,
+} from "../../core/brain/shared-namespace.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import {
@@ -228,27 +234,35 @@ async function toolBrainFeedback(
     // `confirmed_at` is now; `unconfirmed_until` is also now so the trial
     // window collapses on inspection. The just-written signal is recorded
     // as the rule's origin under `evidenced_by`.
-    prefResult = writePreference(ctx.vault, {
-      slug,
-      topic: topic.trim(),
-      principle: principle.trim(),
-      created_at: createdAt,
-      unconfirmed_until: createdAt,
-      status: BRAIN_PREFERENCE_STATUS.confirmed,
-      evidenced_by: [`[[${sigResult.id}]]`],
-      confirmed_at: createdAt,
-      // Issue #149: an explicit zero, not an absent value. The
-      // on-disk encoding of "absent" is the literal `null`, and two
-      // ranking surfaces (`pre-compress-pack`, `morning-brief`) map
-      // `null` to negative infinity before sorting - so a rule
-      // force-confirmed a second ago would sort BELOW every rule
-      // that has a number, including one measured at zero. Zero is
-      // also the true Wilson lower bound on no evidence, which is
-      // why the dream pass already pre-seeds it for new
-      // preferences. This writer now matches it.
-      confidence_value: 0,
-      ...(effectiveScope !== undefined ? { scope: effectiveScope } : {}),
-    });
+    prefResult = writePreference(
+      ctx.vault,
+      {
+        slug,
+        topic: topic.trim(),
+        principle: principle.trim(),
+        created_at: createdAt,
+        unconfirmed_until: createdAt,
+        status: BRAIN_PREFERENCE_STATUS.confirmed,
+        evidenced_by: [`[[${sigResult.id}]]`],
+        confirmed_at: createdAt,
+        // Issue #149: an explicit zero, not an absent value. The
+        // on-disk encoding of "absent" is the literal `null`, and two
+        // ranking surfaces (`pre-compress-pack`, `morning-brief`) map
+        // `null` to negative infinity before sorting - so a rule
+        // force-confirmed a second ago would sort BELOW every rule
+        // that has a number, including one measured at zero. Zero is
+        // also the true Wilson lower bound on no evidence, which is
+        // why the dream pass already pre-seeds it for new
+        // preferences. This writer now matches it.
+        confidence_value: 0,
+        ...(effectiveScope !== undefined ? { scope: effectiveScope } : {}),
+      },
+      // Ownership is resolved by the writer, never echoed from `agent`:
+      // that argument is caller-supplied, and a caller must not be able to
+      // name whose memory this becomes. The server's config path is handed
+      // over rather than a resolved name for the same reason.
+      ctx.configPath !== null ? { configPath: ctx.configPath } : {},
+    );
     try {
       // Offset by 1s so the force-confirmed event sorts after the feedback
       // event on the same UTC second (parseLogDay is stable on ties, but a
@@ -270,7 +284,7 @@ async function toolBrainFeedback(
 
   return {
     kind: prefResult ? "preference" : "signal",
-    ...(mirror !== undefined ? { mirror } : {}),
+    ...mirrorReportFields(mirror),
     ...(advisory !== null ? { advisory } : {}),
     // Same key and same resolution as the CLI's `--json` renderer, from
     // the one composer: an agent that learns the exit on one surface
@@ -343,6 +357,52 @@ function readDreamGates(args: Record<string, unknown>): DreamGateOverrides | und
   }
 }
 
+/**
+ * The rows of a dream plan or run summary the caller may see
+ * (a-label-is-not-a-boundary, U3).
+ *
+ * Every list here names a preference or a signal by id, and the pass
+ * that produced them is vault-wide by construction: consolidation reads
+ * every topic, and clustering only half a vault would produce different
+ * preferences for every caller. So the PASS stays unscoped and the
+ * REPORT is filtered - a caller is told what it did to the artifacts
+ * that caller may see, and nothing about the rest.
+ *
+ * `contradictions`, `quarantined` and `intent_reviews` are absent from
+ * the fold on purpose: their subject is a TOPIC over inbox signals, and
+ * a signal carries no `owner:` anywhere in this product, so there is no
+ * ownership claim on disk to read.
+ */
+function scopedDreamRows<R extends string>(
+  view: OwnerScopeView,
+  plan: {
+    readonly new_unconfirmed: ReadonlyArray<string>;
+    readonly confirmed: ReadonlyArray<string>;
+    readonly retired: ReadonlyArray<{ readonly id: string; readonly reason: R }>;
+    readonly moved_to_processed: ReadonlyArray<string>;
+    readonly suppressed: ReadonlyArray<string>;
+  },
+): {
+  new_unconfirmed: ReadonlyArray<string>;
+  confirmed: ReadonlyArray<string>;
+  retired: ReadonlyArray<{ id: string; reason: R }>;
+  moved_to_processed: ReadonlyArray<string>;
+  suppressed: ReadonlyArray<string>;
+} {
+  const ids = (list: ReadonlyArray<string>): ReadonlyArray<string> => view.keep(list, (id) => [id]);
+  return {
+    new_unconfirmed: ids(plan.new_unconfirmed),
+    confirmed: ids(plan.confirmed),
+    // A retire names the preference by BOTH spellings across the move:
+    // `ret-<slug>` after the pass, `pref-<slug>` before it.
+    retired: view
+      .keep(plan.retired, (r) => [r.id, `pref-${brainArtifactSlug(r.id)}`])
+      .map((r) => ({ id: r.id, reason: r.reason })),
+    moved_to_processed: ids(plan.moved_to_processed),
+    suppressed: ids(plan.suppressed),
+  };
+}
+
 async function toolBrainDream(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -368,6 +428,9 @@ async function toolBrainDream(
   const agent = normalizeAgentArgument(agentArg) ?? resolveAgentName(ctx.configPath ?? undefined);
   const gates = readDreamGates(args);
   const stepArg = coerceStr(args, "step", false);
+  // One view for the whole call: every branch below reports preference
+  // and signal ids, and the staged lifecycle reports them twice.
+  const dreamView = gatedOwnerScopeView(ctx.vault, ctx.agentName);
 
   // Single-step requests (no-dead-ends, Unit E - operator surface).
   // Deliberately checked before any environment work: a step the pass
@@ -434,7 +497,7 @@ async function toolBrainDream(
         return {
           action,
           run_id: bundle.runId,
-          plan: bundle.plan,
+          plan: { ...bundle.plan, ...scopedDreamRows(dreamView, bundle.plan) },
           sources: bundle.sources.length,
           dir: `Brain/dream/staged/${bundle.runId}`,
         };
@@ -451,12 +514,7 @@ async function toolBrainDream(
           applied: outcome.applied,
           drift: [...outcome.validation.drift],
           ...(outcome.summary !== undefined
-            ? {
-                changed: outcome.summary.changed,
-                new_unconfirmed: [...outcome.summary.new_unconfirmed],
-                confirmed: [...outcome.summary.confirmed],
-                retired: outcome.summary.retired.map((r) => ({ id: r.id, reason: r.reason })),
-              }
+            ? { changed: outcome.summary.changed, ...scopedDreamRows(dreamView, outcome.summary) }
             : {}),
         };
       }
@@ -534,12 +592,8 @@ async function toolBrainDream(
     matched: changeList.length,
     changed_count: dryRun ? 0 : changeList.length,
     dry_run: dryRun,
-    new_unconfirmed: [...summary.new_unconfirmed],
-    confirmed: [...summary.confirmed],
-    retired: summary.retired.map((r) => ({ id: r.id, reason: r.reason })),
+    ...scopedDreamRows(dreamView, summary),
     contradictions: [...summary.contradictions],
-    moved_to_processed: [...summary.moved_to_processed],
-    suppressed: [...summary.suppressed],
     warnings: summary.warnings.map((w) => ({
       code: w.code,
       message: w.message,

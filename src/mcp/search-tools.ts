@@ -52,8 +52,12 @@ import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "./protocol.ts";
 import type { ServerContext, ToolDefinition } from "./tool-contract.ts";
 import {
   AGENT_SCOPE_SCHEMA,
+  MATCH_QUALITY_ARG_NAME,
+  MATCH_QUALITY_SCHEMA,
+  RECALL_SCORES_SCHEMA,
   coerceAgentScope,
   coerceBoolOptional,
+  coerceRecallAdequacyInput,
   coerceStr,
   coerceStringOptional,
 } from "./coerce.ts";
@@ -513,6 +517,22 @@ const SEARCH_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
   },
 };
 
+/** The argument name the scores are paired with, as the schema spells it. */
+const RECALL_SCORES_ARG_NAME = "scores";
+
+/**
+ * "Both or neither", said in the schema rather than only in the refusal.
+ *
+ * `coerceRecallAdequacyInput` answers an incomplete pair with
+ * INVALID_PARAMS, and until this keyword landed the pairing appeared in no
+ * `required` array anywhere, so the only way a client could discover it was
+ * to make the call the server refuses.
+ */
+const RECALL_ADEQUACY_PAIRING = Object.freeze({
+  [RECALL_SCORES_ARG_NAME]: Object.freeze([MATCH_QUALITY_ARG_NAME]),
+  [MATCH_QUALITY_ARG_NAME]: Object.freeze([RECALL_SCORES_ARG_NAME]),
+});
+
 const RECALL_GATE_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
@@ -543,15 +563,18 @@ const RECALL_GATE_INPUT_SCHEMA: Record<string, unknown> = {
       maxLength: 512,
       description: "Optional session correlation id recorded on the telemetry record.",
     },
-    scores: {
-      type: "array",
-      maxItems: 200,
-      items: { type: "number" },
-      description:
-        "Optional top-k recall scores. Adds an adequacy verdict: sufficient/proceed, weak/re_recall, insufficient/abstain. An empty array adds the negative verdict.",
-    },
+    scores: RECALL_SCORES_SCHEMA,
+    match_quality: MATCH_QUALITY_SCHEMA,
   },
   required: ["prompt"],
+  // `scores` and `match_quality` stand or fall together, and neither can
+  // sit in `required` - both are optional on their own. `dependentRequired`
+  // is the one keyword that states "both or neither" declaratively, so a
+  // schema-driven client can discover the pairing instead of learning it
+  // from an INVALID_PARAMS at call time. A client on a draft that predates
+  // the keyword ignores it, which is why the two property descriptions and
+  // the tool description say it in prose as well.
+  dependentRequired: RECALL_ADEQUACY_PAIRING,
   additionalProperties: false,
 };
 
@@ -593,6 +616,11 @@ const RECALL_GATE_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
         "result_count",
         "top_score",
         "mean_score",
+        // Required, not optional: the block used to return the two scores
+        // that decide NOTHING and withhold the one that decides the level,
+        // so a caller could not check the verdict against its own input or
+        // tell which threshold band it landed beside.
+        MATCH_QUALITY_ARG_NAME,
         "reason",
       ],
       properties: {
@@ -602,6 +630,7 @@ const RECALL_GATE_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
         result_count: { type: "integer" },
         top_score: { type: "number" },
         mean_score: { type: "number" },
+        [MATCH_QUALITY_ARG_NAME]: { type: "number" },
         reason: { type: "string" },
       },
     },
@@ -878,7 +907,7 @@ async function toolBrainSearch(
   const properties = parsePropertiesArgument(args["properties"]);
   const degreeFilters = parseDegreeArgument(args["degree"]);
   const visibility = parseVisibilityArgument(args["visibility"]);
-  const agentScope = coerceStringOptional(args, "agent_scope", 128);
+  const agentScope = coerceAgentScope(ctx, args, false);
   const sessionScope = coerceStringOptional(args, "session_scope", 128);
   const projectScope = coerceStringOptional(args, "project_scope", 128);
   const scope =
@@ -1147,13 +1176,13 @@ async function toolBrainRecallGate(
       ...(sessionId !== undefined ? { sessionId } : {}),
     });
   });
-  // Adequacy verdict (t_b8f66fec): thin verdict + action layer over the
-  // relevance scores of a recall attempt. Only computed when the caller
-  // passes `scores`, keeping the pure structural-gate contract otherwise.
-  const scores = parseRecallScores(args["scores"]);
-  if (scores === undefined) return { ...decision };
+  // Adequacy verdict (t_b8f66fec): thin verdict + action layer over one
+  // recall attempt. Only computed when the caller passes the pair,
+  // keeping the pure structural-gate contract otherwise.
+  const attempt = coerceRecallAdequacyInput("brain_recall_gate", args, "scores");
+  if (attempt === undefined) return { ...decision };
   const thresholds = resolveRecallAdequacyThresholds(ctx.configPath ?? undefined);
-  const verdict = assessRecallAdequacy(scores, thresholds);
+  const verdict = assessRecallAdequacy(attempt, thresholds);
   // signals-that-survive, unit 6: an unmet verdict is stamped onto the
   // cross-query demand log under the bucket key normalizeQueryTerms already
   // computes, so the knowledge-gap loop can aggregate recurrence without a
@@ -1192,6 +1221,10 @@ async function toolBrainRecallGate(
       result_count: verdict.resultCount,
       top_score: verdict.topScore,
       mean_score: verdict.meanScore,
+      // The quantity the level was decided by. Returning only the two
+      // descriptive scores left the caller unable to reconstruct the
+      // verdict from its own inputs.
+      [MATCH_QUALITY_ARG_NAME]: verdict.matchQuality,
       reason: verdict.reason,
     },
     // Absent, never null, when the attempt had usable results - the
@@ -1218,28 +1251,6 @@ async function assessNegativeRecall(ctx: ServerContext): Promise<NegativeRecallV
   return probeRetrievalCorpus(() =>
     resolveSearchConfig({ vault: ctx.vault, configPath: ctx.configPath ?? undefined }),
   );
-}
-
-/**
- * Parse the optional `scores` argument for the recall gate. Returns
- * `undefined` when absent (verdict skipped) and throws INVALID_PARAMS on
- * a malformed shape so callers get a clear error rather than a silently
- * dropped verdict. An empty array is a valid "no results" signal.
- */
-function parseRecallScores(raw: unknown): ReadonlyArray<number> | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (!Array.isArray(raw)) {
-    throw new MCPError(INVALID_PARAMS, "argument 'scores' must be an array of numbers");
-  }
-  if (raw.length > 200) {
-    throw new MCPError(INVALID_PARAMS, "argument 'scores' must not exceed 200 items");
-  }
-  for (const item of raw) {
-    if (typeof item !== "number") {
-      throw new MCPError(INVALID_PARAMS, "argument 'scores' must contain only numbers");
-    }
-  }
-  return raw as ReadonlyArray<number>;
 }
 
 const RECALL_FEEDBACK_INPUT_SCHEMA: Record<string, unknown> = {
@@ -1739,7 +1750,7 @@ export const SEARCH_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_recall_gate",
     description:
-      "Classify whether an automatic recall/surfacing attempt should run. Diagnostics only; does not search. Pass `scores` (a recall attempt's top-k relevance scores) to also get an adequacy verdict — sufficient (proceed) / weak (re_recall) / insufficient (abstain + escalate).",
+      "Classify whether an automatic recall attempt should run. Diagnostics only; does not search. Pass `scores` AND `match_quality` TOGETHER for an adequacy verdict — sufficient/proceed, weak/re_recall, insufficient/abstain; either alone is INVALID_PARAMS (see `dependentRequired`).",
     inputSchema: RECALL_GATE_INPUT_SCHEMA,
     outputSchema: RECALL_GATE_OUTPUT_SCHEMA,
     handler: toolBrainRecallGate,

@@ -36,6 +36,7 @@ import {
   type RecallResultSet,
 } from "../../../src/core/brain/recall-inject.ts";
 import { resolveSearchConfig, search } from "../../../src/core/search/index.ts";
+import { lexSource } from "../../helpers/source-lexer.ts";
 
 const FIXTURE_PATH = join("tests", "fixtures", "bench", "failure-modes.json");
 
@@ -72,6 +73,9 @@ async function alwaysConfident(): Promise<RecallResultSet> {
       }),
     ]),
     total: 1,
+    // The gaming strategy claims a perfect match for every prompt - that
+    // unconditional confidence is exactly what the floor has to see through.
+    idfWeightedCoverage: 1,
   });
 }
 
@@ -308,9 +312,10 @@ describe("metric 4: exactly one token estimator is reachable from the bench", ()
       .filter((file) => file.endsWith(".ts"))
       .map((file) => ({
         file,
-        code: readFileSync(join(BENCH_DIR, file), "utf8")
-          .replace(/\/\*[\s\S]*?\*\//g, "")
-          .replace(/^\s*\/\/.*$/gm, ""),
+        // The shared census lexer rather than two regexes, and the
+        // `withoutComments` view specifically: every assertion below
+        // reads an import specifier, which IS a string literal.
+        code: lexSource(readFileSync(join(BENCH_DIR, file), "utf8")).withoutComments,
       }));
   }
 

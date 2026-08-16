@@ -37,7 +37,12 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 
 import type { FrontmatterMap } from "../types.ts";
-import { formatFrontmatter, parseFrontmatter, writeFrontmatterAtomic } from "../vault.ts";
+import {
+  formatFrontmatter,
+  parseFrontmatter,
+  parseFrontmatterWithNotices,
+  writeFrontmatterAtomic,
+} from "../vault.ts";
 import { BrainParseError } from "./parse-error.ts";
 import { FrontmatterTierConflictError, mergeFrontmatterTiered } from "./frontmatter-tiers.ts";
 import { loadSchemaPack } from "./schema-pack.ts";
@@ -49,7 +54,11 @@ import {
 } from "./schema-vocab.ts";
 import { brainDirsForWrite, preferencePath, retiredPath, validateSlug } from "./paths.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
-import { OWNER_UNRESOLVED } from "../graph/agent-scope.ts";
+import { OWNER_UNRESOLVED, ownerStampFor } from "../graph/agent-scope.ts";
+import { resolveAgentName, UNCONFIGURED_AGENT_NAME } from "../config.ts";
+import { DEGRADATION_CODE } from "../integrity/degradation.ts";
+import { GATE_MODE } from "../integrity/stamp.ts";
+import { loadIntegrityConfigForWrite } from "./policy.ts";
 import { asProvenanceLevel, type ProvenanceLevel } from "./provenance/provenance.ts";
 import { sanitisePrinciple } from "./text/sanitize-principle.ts";
 import {
@@ -263,6 +272,16 @@ export interface WritePreferenceInput {
 export interface WritePreferenceOptions {
   /** When true, overwrite an existing file at the target path. */
   readonly overwrite?: boolean;
+  /**
+   * Plugin config the writing agent's identity is resolved from when the
+   * ownership gate stamps a newly created preference. Absent falls back
+   * to the default config discovery, which is what every other core
+   * writer that takes an identity does (`note.ts`, `decisions/record.ts`).
+   * A surface that runs against a non-default config - the MCP server
+   * started with `--config`, any `o2b brain` verb - passes its own, so
+   * the stamped owner is the identity that surface answers under.
+   */
+  readonly configPath?: string;
 }
 
 export interface ParsePreferenceOptions {
@@ -361,12 +380,18 @@ export function writePreference(
   const path = preferencePath(vault, slug);
   const id = `pref-${slug}`;
 
+  // Ownership (a-label-is-not-a-boundary, U1). Resolved BEFORE the
+  // idempotency hash so a write that changes the owner cannot dedupe
+  // against one that did not - the hash already folds `owner` in for
+  // exactly that reason.
+  const owned = withResolvedOwner(vault, path, input, options.configPath);
+
   // Idempotency consult (C1): a repeat with the same key + same payload
   // dedupes; the same key + a different payload throws before any write.
-  const idKey = input.idempotency_key?.trim();
+  const idKey = owned.idempotency_key?.trim();
   let idContentHash: string | undefined;
   if (idKey) {
-    idContentHash = computePayloadHash(preferencePayloadFields(input, slug));
+    idContentHash = computePayloadHash(preferencePayloadFields(owned, slug));
     const existing = lookupKey(vault, idKey);
     if (existing) {
       if (existing.contentHash === idContentHash) {
@@ -376,8 +401,8 @@ export function writePreference(
     }
   }
 
-  let metadata = preferenceFrontmatter(input, id);
-  const body = renderPreferenceBody(input);
+  let metadata = preferenceFrontmatter(owned, id);
+  const body = renderPreferenceBody(owned);
 
   if (options.overwrite && existsSync(path)) {
     // Tier guard (write-time-integrity-governance): rewrites merge
@@ -404,7 +429,7 @@ export function writePreference(
       const next = formatFrontmatter(metadata, body);
       const prev = readFileSync(path, "utf8");
       if (next === prev) {
-        recordPreferenceKey(vault, idKey, idContentHash, input.created_at, id, path);
+        recordPreferenceKey(vault, idKey, idContentHash, owned.created_at, id, path);
         return { path, id };
       }
     } catch {
@@ -419,8 +444,148 @@ export function writePreference(
     vaultForRelativePath: vault,
   });
 
-  recordPreferenceKey(vault, idKey, idContentHash, input.created_at, id, path);
+  recordPreferenceKey(vault, idKey, idContentHash, owned.created_at, id, path);
   return { path, id };
+}
+
+/**
+ * The `owner:` a write emits, in one place for every writer.
+ *
+ * Three sources, in this order, and the order is the whole rule:
+ *
+ *   1. **The caller's explicit token.** Unchanged from before this
+ *      existed - an importer restoring a page, or a surface that knows
+ *      better, still decides.
+ *   2. **What the file already says.** A rewrite NEVER re-owns. Ownership
+ *      is a property of the agent that created the memory, so a dream
+ *      pass, a merge or a refresh run by anyone cannot quietly transfer
+ *      it, and a page created before the gate was switched on stays
+ *      shared rather than being retro-owned by whoever rewrote it first.
+ *   3. **The server-resolved writing identity**, and only when creating a
+ *      new file with `integrity.owner_scope_delivery` switched on.
+ *
+ * With the gate `off` this returns the input untouched, so a vault that
+ * never opted in is byte-identical - the same contract `agent-scope.ts`
+ * and the delivery collector state for the read side.
+ *
+ * `warn` stamps as `fail` does, deliberately: it exists so an operator
+ * can see what `fail` would withhold before tightening the gate, and a
+ * mode that wrote no ownership would leave nothing to look at.
+ *
+ * Where they look is the FILES. This stamp is the whole of `warn`'s
+ * observability today: the read surfaces are inert under `warn`
+ * (`owner-scope-view.ts` states why), so the population `fail` would
+ * start withholding is visible by reading `owner:` off
+ * `Brain/preferences/`, not by any per-response field.
+ *
+ * The gate is read through {@link loadIntegrityConfigForWrite}, NOT the
+ * safe loader every reader uses. This is the WRITE side of the
+ * reader/writer asymmetry that loader documents: an unreadable
+ * `_brain.yaml` resolves STRICT for a reader, which only withholds more,
+ * but strict here means STAMP - so a single bad token in the YAML would
+ * have started marking new pages with an owner the operator never asked
+ * for, permanently, since ownership is carried forward and never
+ * re-derived. A writer cannot infer an intent to enable ownership from a
+ * file it could not read, so the write is refused with the parse failure
+ * named. Absent config is a different condition and still resolves to
+ * the defaults, i.e. `off`.
+ */
+function withResolvedOwner(
+  vault: string,
+  path: string,
+  input: WritePreferenceInput,
+  configPath: string | undefined,
+): WritePreferenceInput {
+  const owner = resolvedOwnerFor(vault, path, input.owner, configPath);
+  return owner === undefined ? input : { ...input, owner };
+}
+
+/**
+ * The `owner:` value a NEW preference file at `path` must carry, or
+ * `undefined` for "write no `owner:` field".
+ *
+ * The rule {@link withResolvedOwner} documents, exposed on its own so a
+ * writer that does not build a {@link WritePreferenceInput} can still
+ * ask it. `import-claude-memory.ts` is that writer: it renders its own
+ * frontmatter and calls `atomicWriteFileSync` directly, so it never
+ * reached `writePreference` and every memory it imported landed
+ * ownerless and was then delivered to every agent - while the claim
+ * "every production preference writer stamps the identity" was held true
+ * by a hand-written list of four writers that did not include it.
+ *
+ * Exported rather than duplicated for that reason: a second copy of this
+ * decision is how the fifth writer gets it wrong again.
+ */
+export function resolvedOwnerFor(
+  vault: string,
+  path: string,
+  explicit: string | undefined,
+  configPath: string | undefined,
+): string | undefined {
+  const given = explicit?.trim();
+  if (given) return given;
+  let mode: string;
+  try {
+    mode = loadIntegrityConfigForWrite(vault).owner_scope_delivery;
+  } catch (err) {
+    throw new Error(
+      `preference owner cannot be resolved: Brain/_brain.yaml exists but could not be ` +
+        `read (${err instanceof Error ? err.message : String(err)}), so whether ` +
+        `integrity.owner_scope_delivery asks this write to stamp an owner is unknown. ` +
+        `A writer does not guess that: stamping would mark this page with an owner the ` +
+        `operator may never have asked for, and skipping would leave it shared under a ` +
+        `gate that may be on. Fix the file, then re-run.`,
+      { cause: err },
+    );
+  }
+  if (mode === GATE_MODE.off) return undefined;
+  if (existsSync(path)) return carriedOwner(path).owner;
+  const agent = resolveAgentName(configPath);
+  const stamp = ownerStampFor(agent);
+  if (stamp === null) {
+    throw new Error(
+      `preference owner cannot be resolved: integrity.owner_scope_delivery is ` +
+        `${JSON.stringify(mode)}, which stamps the writing agent onto every new ` +
+        `preference, and the resolved identity ${JSON.stringify(agent)} does not ` +
+        `reduce to one ownership token - it is blank, it is not one string, or it is a ` +
+        `placeholder name (${JSON.stringify(UNCONFIGURED_AGENT_NAME)} and the rest of ` +
+        `PLACEHOLDER_AGENT_VALUES), which owner-scope delivery refuses as an identity ` +
+        `and therefore refuses as an owner; set VAULT_AGENT_NAME or 'agent_name' in ` +
+        `the plugin config to a real, non-placeholder name`,
+    );
+  }
+  return stamp;
+}
+
+/** Attribution recorded on the notices the ownership carry-forward reads produce. */
+const OWNER_CARRY_SITE = "brain.preference.owner";
+
+/**
+ * The ownership claim an existing preference file already carries, as a
+ * spreadable slice - `{}` when the file makes no claim this parser can
+ * reduce to one token.
+ *
+ * An unreadable file RAISES rather than resolving to `{}`. Every other
+ * degraded read on this path can afford to fall soft, but this one
+ * decides a boundary: resolving to "no claim" would republish an
+ * owner-private memory to every agent on the next rewrite, and nothing
+ * would have said so. A claim the parser cannot reduce to one token
+ * (`owner:` as a list or a mapping) is left alone instead, because the
+ * tiered frontmatter merge preserves it verbatim and re-emitting it as a
+ * normalised string would rewrite bytes this writer does not own.
+ */
+function carriedOwner(path: string): { owner?: string } {
+  const [meta, , notices] = parseFrontmatterWithNotices(path, { site: OWNER_CARRY_SITE });
+  const unreadable = notices.find((n) => n.code === DEGRADATION_CODE.frontmatterUnreadable);
+  if (unreadable) {
+    throw new Error(
+      `preference owner cannot be carried forward: ${path} exists but could not be ` +
+        `read (${unreadable.detail}), so the ownership this rewrite must preserve ` +
+        `is unknown`,
+    );
+  }
+  const raw = meta["owner"];
+  return typeof raw === "string" && raw.trim().length > 0 ? { owner: raw.trim() } : {};
 }
 
 /**
@@ -487,8 +652,15 @@ export function wouldRewritePreference(vault: string, input: WritePreferenceInpu
   if (!existsSync(path)) return true;
   try {
     const id = `pref-${slug}`;
-    const metadata = preferenceFrontmatter(input, id);
-    const body = renderPreferenceBody(input);
+    // The same ownership resolution the write performs, or this
+    // predicate reports "would change" on every owner-carrying
+    // preference forever: `writePreference` carries the existing owner
+    // forward, and a render that omitted it would never match the bytes
+    // on disk. No config path is needed - the file exists, so the
+    // resolution can only carry forward, never stamp.
+    const owned = withResolvedOwner(vault, path, input, undefined);
+    const metadata = preferenceFrontmatter(owned, id);
+    const body = renderPreferenceBody(owned);
     const next = formatFrontmatter(metadata, body);
     const prev = readFileSync(path, "utf8");
     return next !== prev;

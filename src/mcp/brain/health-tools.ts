@@ -13,6 +13,12 @@ import { applyRepair } from "../../core/brain/diagnostics.ts";
 import { nextCommandField } from "../../core/brain/next-step.ts";
 import { NO_EXIT_KEY, noExitReasons } from "../../core/brain/doctor-exits.ts";
 import { buildOperatorSnapshot } from "../../core/brain/operator-snapshot.ts";
+import { foldSemanticHealthVerdict } from "../../core/brain/health/reconcile.ts";
+import {
+  extractWikilinkRichBodies,
+  parseWikilinkRich,
+} from "../../core/brain/link-graph/parse-wikilink.ts";
+import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import type { DoctorIssue } from "../../core/brain/types.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { coerceBool, coerceFormat } from "../coerce.ts";
@@ -68,6 +74,12 @@ async function toolBrainDoctor(
     const outcome = applyRepair(ctx.vault, {
       dryRun: !apply,
       ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+      // The repair branch returns HERE, before the diagnostic streams
+      // below are filtered - so until this argument existed a scoped
+      // caller both read and REWROTE another owner's preferences
+      // (a-label-is-not-a-boundary, U3). The scope bounds the plan, so
+      // the write is bounded too, not just the report.
+      ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
     });
     return { format, repair: outcome };
   }
@@ -82,18 +94,51 @@ async function toolBrainDoctor(
     ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
   });
 
+  // Every issue names the artifact it is about - `path`, `target`, the
+  // referencing `sources`, and the message prose that repeats them - so
+  // an unscoped report enumerated another owner's preferences, retired
+  // pages and inbox signals by path (a-label-is-not-a-boundary, U3).
+  // Filtered BEFORE `ok` is decided: an `ok: false` beside an empty error
+  // list would say a hidden artifact is broken without naming it, which
+  // is the existence leak with the evidence removed.
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+  /** Generic over the three streams: they share the naming fields, not a type. */
+  const visibleIssues = <
+    T extends {
+      readonly message: string;
+      readonly path?: string;
+      readonly target?: string;
+      readonly sources?: ReadonlyArray<string>;
+    },
+  >(
+    issues: ReadonlyArray<T>,
+  ): ReadonlyArray<T> =>
+    view.keep(issues, (i) => [
+      i.path === undefined ? undefined : vaultRelativeSafe(ctx.vault, i.path),
+      i.target,
+      ...(i.sources ?? []),
+      // The semantic-health codes (`low-evidence-confirmed`,
+      // `batch-concept-inflation`) carry NO structured target - they name
+      // their subjects inside the message, as `[[pref-x]]`. Read through
+      // the shared wikilink lexer rather than by matching prose, so this
+      // is a structural read of the same link syntax the rest of the
+      // vault uses and no natural-language pattern is involved.
+      ...extractWikilinkRichBodies(i.message).map((b) => parseWikilinkRich(b).target),
+    ]);
+  const errors = visibleIssues(result.errors);
+  const warnings = visibleIssues(result.warnings);
+  const uncertain = result.uncertain === undefined ? undefined : visibleIssues(result.uncertain);
+
   // Decide a single ok flag — `strict` only changes the CLI exit code,
   // so we mirror that semantic here: with `strict`, warnings demote ok
   // to false. Errors always do.
-  const ok = result.errors.length === 0 && (!strict || result.warnings.length === 0);
+  const ok = errors.length === 0 && (!strict || warnings.length === 0);
 
   // Why a reported code carries no `next_command`. Without it the field's
   // absence has two readings - a class no single command resolves, and a
   // class nobody has registered - and an agent cannot tell them apart.
   // Resolved through the same table the CLI renderer reads.
-  const noExit = noExitReasons(
-    [...result.errors, ...result.warnings, ...(result.uncertain ?? [])].map((i) => i.code),
-  );
+  const noExit = noExitReasons([...errors, ...warnings, ...(uncertain ?? [])].map((i) => i.code));
 
   return {
     format,
@@ -105,19 +150,21 @@ async function toolBrainDoctor(
     // uses so the two surfaces cannot drift. Absent - not null - for a
     // code with no registered signal, because there is no honest command
     // to name and a generic one would be invented.
-    errors: result.errors.map((i) => issueView(ctx, i)),
-    warnings: result.warnings.map((i) => issueView(ctx, i)),
+    errors: errors.map((i) => issueView(ctx, i)),
+    warnings: warnings.map((i) => issueView(ctx, i)),
     // v0.10.15: ranked maintenance actions surfaced as a parallel
     // signal to errors/warnings. The list is independent of `strict`
     // because nothing here downgrades the `ok` flag - actions are
     // suggestions, not invariant violations.
-    suggested_actions: collectMaintenanceActions(ctx.vault).map((a) => ({
-      id: a.id,
-      category: a.category,
-      title: a.title,
-      impact: a.impact,
-      ...(a.target !== undefined ? { target: a.target } : {}),
-    })),
+    suggested_actions: view
+      .keep(collectMaintenanceActions(ctx.vault), (a) => [a.target])
+      .map((a) => ({
+        id: a.id,
+        category: a.category,
+        title: a.title,
+        impact: a.impact,
+        ...(a.target !== undefined ? { target: a.target } : {}),
+      })),
     // v0.10.16: trust-layer fields. `trust_verdict` is always populated
     // by runDoctor; `verification_delta_summary` only when the caller
     // threads a dream summary through (not exposed via this tool's
@@ -141,9 +188,9 @@ async function toolBrainDoctor(
     // clean vault's payload is byte-identical to the pre-`uncertain`
     // shape. Additive-safe: this tool declares no `outputSchema`, so no
     // structured-output contract constrains the key set.
-    ...(result.uncertain !== undefined && result.uncertain.length > 0
+    ...(uncertain !== undefined && uncertain.length > 0
       ? {
-          uncertain: result.uncertain.map((u) => ({
+          uncertain: uncertain.map((u) => ({
             code: u.code,
             ...(u.path !== undefined ? { path: vaultRelativeSafe(ctx.vault, u.path) } : {}),
             message: u.message,
@@ -168,10 +215,33 @@ async function toolBrainHealth(
   const format = coerceFormat(args);
   const result = runDoctor(ctx.vault);
   const sh = result.semantic_health;
+  // Three of the four finding families name preferences by id, and the
+  // batch-inflation family names their topics as well
+  // (a-label-is-not-a-boundary, U3). A finding whose members are not all
+  // visible is dropped WHOLE rather than trimmed: its `count` and its
+  // `topics` describe the batch the detector measured, so a batch of five
+  // reported as four is not a narrower true finding, it is a false one.
+  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+  const contradictions = view.keep(sh?.contradictions ?? [], (c) => [c.aId, c.bId]);
+  const conceptGaps = sh?.conceptGaps ?? [];
+  const staleClaims = view.keep(sh?.staleClaims ?? [], (s) => [s.id]);
+  const batchInflation = view.keep(sh?.batchInflation ?? [], (b) => b.ids);
   return {
     format,
-    verdict: sh?.verdict ?? "clean",
-    contradictions: (sh?.contradictions ?? []).map((c) => ({
+    // Folded over the FILTERED families, through the same arithmetic
+    // that produced the unfiltered one. `sh.verdict` summarises findings
+    // this caller may not see, so shipping it beside the emptied arrays
+    // said `watch` with nothing to point at - which tells the caller a
+    // hidden artifact tripped a detector, the existence leak with the
+    // evidence removed. `toolBrainDoctor` above recomputes its `ok` for
+    // exactly this reason.
+    verdict: foldSemanticHealthVerdict({
+      contradictions,
+      conceptGaps,
+      staleClaims,
+      batchInflation,
+    }),
+    contradictions: contradictions.map((c) => ({
       a: c.aId,
       b: c.bId,
       ...(c.scope !== null ? { scope: c.scope } : {}),
@@ -179,16 +249,17 @@ async function toolBrainHealth(
       a_sign: c.aSign,
       b_sign: c.bSign,
     })),
-    concept_gaps: (sh?.conceptGaps ?? []).map((g) => ({
+    // A term and its frequency; the only family that names no artifact.
+    concept_gaps: conceptGaps.map((g) => ({
       term: g.term,
       frequency: g.frequency,
     })),
-    stale_claims: (sh?.staleClaims ?? []).map((s) => ({
+    stale_claims: staleClaims.map((s) => ({
       id: s.id,
       last_evidence_at: s.lastEvidenceAt,
       age_days: s.ageDays,
     })),
-    batch_inflation: (sh?.batchInflation ?? []).map((b) => ({
+    batch_inflation: batchInflation.map((b) => ({
       ids: b.ids,
       window_start: b.windowStart,
       window_end: b.windowEnd,

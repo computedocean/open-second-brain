@@ -22,8 +22,9 @@
  *
  * ## The population, defined structurally
  *
- * Two rules, because one name means two different things depending on
- * what the module does with it.
+ * Three rules. The first two are about a FILE destination, and differ
+ * because one name means two different things depending on what the
+ * module does with it. The third is about a NETWORK destination.
  *
  * 1. UNAMBIGUOUS: the module declares a string parameter whose name is
  *    one of {@link DESTINATION_FLAGS} (`out`, `outdir`, `dest`, …). Those
@@ -47,6 +48,22 @@
  * Rule 2 adds no module today, which is the point - it is a tripwire, not
  * a backlog.
  *
+ * 3. NETWORK DESTINATION: the module sends an HTTP request carrying a
+ *    BODY ({@link NETWORK_POST_RE} inside a module that calls `fetch`).
+ *    That is the network analogue of putting bytes on disk, and it is a
+ *    SEPARATE rule rather than a widened rule 1 because the file rules
+ *    read a declared destination PARAMETER, which a network caller does
+ *    not have: its destination is an operator-configured URL resolved at
+ *    construction time. Declaring the embedding endpoint under rule 1
+ *    would have failed
+ *    {@link "no declaration outlives the module it describes"}, since
+ *    that assertion requires the declared module to be in a population
+ *    derived from a parameter spec plus a raw file write.
+ *
+ * Rule 3 is what admits the largest and most continuous egress in the
+ * product - every indexed chunk body, sent to whichever endpoint the
+ * operator configured - which the file rules could not see at all.
+ *
  * ## What it does not cover, stated rather than implied
  *
  * - A destination taken as a POSITIONAL argument, or a flag spec built
@@ -64,6 +81,11 @@
  *   would make both unreadable.
  * - `process.stdout`. Every CLI verb writes there, so including it would
  *   make the population the whole CLI.
+ * - A network destination reached by a method other than POST - vault
+ *   content packed into a query string on a GET, say. Rule 3 reads the
+ *   method because a body is what makes a request an egress rather than a
+ *   lookup; a GET that smuggles content past it is the shape to add here
+ *   the day one appears.
  * - Per-WRITE coverage. The guard is asserted per declared DESTINATION
  *   ({@link "every declared destination in a redacting module is matched
  *   by a guard call"}), which catches a new unguarded verb appended to an
@@ -88,10 +110,27 @@ import {
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 
 /**
+ * Where an operator is told what leaves the machine unscanned.
+ *
+ * The registry's `reason` fields are the decision record and live in
+ * `src/`; this file is the surface someone configuring an endpoint
+ * actually opens.
+ */
+const OPERATOR_EGRESS_DISCLOSURE_DOC = "docs/cli-reference.md";
+
+/**
  * Flag names that name a destination the operator chose. `target` is
  * deliberately absent: `o2b install --target` names an ADAPTER, not a
  * path, and admitting it would put a name-selector in a destination
  * census.
+ *
+ * `export` is here because leaving it out is what hid the eighth site:
+ * `o2b brain explorer --export <path>` wrote the whole preference graph,
+ * principles verbatim, to an operator-named file with no scan, and this
+ * census reported a clean sweep because the flag was spelled with a word
+ * the list did not carry. It is unambiguous in the same way as `out` -
+ * nothing reads FROM an `--export` - so it belongs in rule 1 rather than
+ * beside the ambiguous names.
  */
 const DESTINATION_FLAGS: ReadonlyArray<string> = Object.freeze([
   "out",
@@ -101,6 +140,7 @@ const DESTINATION_FLAGS: ReadonlyArray<string> = Object.freeze([
   "out-dir",
   "dest",
   "destination",
+  "export",
 ]);
 
 /**
@@ -145,6 +185,26 @@ const ANY_DESTINATION_G_RE = namedStringParamRe(
 const RAW_WRITE_RE =
   /\b(?:writeFileSync|appendFileSync|copyFileSync|cpSync|createWriteStream|atomicWriteFileSync|writeFile)\s*\(|\bBun\.write\s*\(/;
 
+/**
+ * An outbound HTTP request that carries a body, in the two shapes this
+ * tree writes it: the request object literal (`method: "POST"`) and the
+ * branch a delegating client takes before handing the request to an
+ * injected transport (`method === "POST"`). The second form is not
+ * decoration - without it `external-fetch.ts`, which is where every
+ * research provider's POST actually reaches the network, is invisible
+ * while the provider module that names the endpoint has no `fetch` of its
+ * own. That pair is the network twin of the delegated-write gap this
+ * census already states for files.
+ *
+ * Read alongside {@link NETWORK_FETCH_RE}, so a route table naming an
+ * HTTP verb cannot enrol a module by itself. A server that both branches
+ * on an inbound method and calls out with a body is in population by this
+ * rule, which is the syntactic answer on purpose: deciding whether that
+ * particular POST carries vault content is what a registry entry is for.
+ */
+const NETWORK_POST_RE = /\bmethod\s*(?::|===)\s*"POST"/;
+const NETWORK_FETCH_RE = /\bfetch\s*\(/;
+
 /** The shared egress guard. A module that calls it redacts on the way out. */
 const EGRESS_GUARD_CALL_RE = /\bredactForEgress\s*\(/;
 const EGRESS_GUARD_CALL_G_RE = /\bredactForEgress\s*\(/g;
@@ -162,23 +222,55 @@ function readSourceTree(): ReadonlyArray<{ path: string; text: string }> {
 }
 
 /**
- * True when this module declares an operator-named output destination:
- * an unambiguous destination name, or an ambiguous one in a module that
- * also writes bytes. See the two rules in the docblock.
+ * True when this module declares an operator-named output FILE: an
+ * unambiguous destination name, or an ambiguous one in a module that also
+ * writes bytes. Rules 1 and 2 in the docblock.
  */
-function declaresDestination(text: string): boolean {
+function declaresFileDestination(text: string): boolean {
   if (DESTINATION_FLAG_RE.test(text)) return true;
   return AMBIGUOUS_DESTINATION_RE.test(text) && RAW_WRITE_RE.test(text);
+}
+
+/**
+ * True when this module sends bytes to a NETWORK destination. Rule 3 in
+ * the docblock: a body-carrying HTTP request in a module that fetches.
+ */
+function declaresNetworkDestination(text: string): boolean {
+  return NETWORK_FETCH_RE.test(text) && NETWORK_POST_RE.test(text);
+}
+
+/** In population under any of the three rules. */
+function declaresDestination(text: string): boolean {
+  return declaresFileDestination(text) || declaresNetworkDestination(text);
 }
 
 function countMatches(text: string, re: RegExp): number {
   return (text.match(re) ?? []).length;
 }
 
+/** One file as the census reads it: a repo-relative path and its bytes. */
+interface CensusFile {
+  readonly path: string;
+  readonly text: string;
+}
+
+/**
+ * The census itself, over whatever tree it is handed.
+ *
+ * Taking the tree as an ARGUMENT is what makes the synthetic controls
+ * below able to fail. They used to append a fabricated path string to an
+ * already-derived `POPULATION`, so the synthetic module's SOURCE never
+ * reached this rule set: replacing the derivation with `[]` left both
+ * "must be declared" tests green over a fully blinded census. Feeding the
+ * intruder's real text through here is the shape
+ * `write-site-census.test.ts` already uses for the same purpose.
+ */
+function census(files: ReadonlyArray<CensusFile>): ReadonlyArray<string> {
+  return files.filter((f) => declaresDestination(f.text)).map((f) => f.path);
+}
+
 const SOURCE_TREE = readSourceTree();
-const POPULATION: ReadonlyArray<string> = SOURCE_TREE.filter((f) =>
-  declaresDestination(f.text),
-).map((f) => f.path);
+const POPULATION: ReadonlyArray<string> = census(SOURCE_TREE);
 
 const ENTRIES: ReadonlyArray<EgressSite> = Object.values(EGRESS_SITES);
 const DECLARED_MODULES: ReadonlySet<string> = new Set(ENTRIES.map((e) => e.module));
@@ -267,6 +359,21 @@ describe("egress site census", () => {
     }
   });
 
+  test("every unscanned network egress is disclosed where an operator reads", () => {
+    // The registry is a source file. An operator deciding whether to point
+    // an embedding endpoint at a vendor reads the CLI reference, and four
+    // of the five unscanned network payloads appeared nowhere outside
+    // `src/`. Keyed on the entry ID rather than on prose, so a new
+    // declaration is undisclosed until someone writes the disclosure.
+    const doc = readFileSync(join(REPO_ROOT, OPERATOR_EGRESS_DISCLOSURE_DOC), "utf8");
+    const undisclosed = ENTRIES.filter(
+      (entry) => entry.redaction === EGRESS_REDACTION.unscannedNetworkPayload,
+    )
+      .filter((entry) => !doc.includes(entry.id))
+      .map((entry) => entry.id);
+    expect(undisclosed).toEqual([]);
+  });
+
   test("ids and module paths are unique", () => {
     expect(new Set(ENTRIES.map((e) => e.id)).size).toBe(ENTRIES.length);
     expect(DECLARED_MODULES.size).toBe(ENTRIES.length);
@@ -280,14 +387,30 @@ describe("egress site census", () => {
 });
 
 describe("the census cannot pass by finding nothing", () => {
+  /**
+   * Run the REAL census over the real tree plus one synthetic module, and
+   * report which of the resulting population nobody declared.
+   *
+   * The intruder arrives as a path AND its source, so the derivation is
+   * what puts it in population. A control that appended the path alone
+   * asserted a set operation over a constant and passed with the
+   * derivation blinded to `[]`.
+   */
+  function unlistedWith(intruder: CensusFile): ReadonlyArray<string> {
+    return census([...SOURCE_TREE, intruder]).filter((path) => !DECLARED_MODULES.has(path));
+  }
+
   test("the detector still sees the sites it measures", () => {
     // A regex that stopped matching would report a clean sweep over an
     // empty set. Floors sit just under the live measurement, not an order
     // of magnitude under it.
-    expect(POPULATION.length).toBeGreaterThan(5);
+    expect(POPULATION.length).toBeGreaterThan(10);
     expect(
       ENTRIES.filter((e) => e.redaction === EGRESS_REDACTION.sharedRedactor).length,
     ).toBeGreaterThan(4);
+    expect(
+      ENTRIES.filter((e) => e.redaction === EGRESS_REDACTION.unscannedNetworkPayload).length,
+    ).toBeGreaterThan(3);
   });
 
   test("the five verbs this unit wired are all declared as redacting", () => {
@@ -335,13 +458,116 @@ describe("the census cannot pass by finding nothing", () => {
       "a verb that delegates the write but names --outdir",
       '  outdir: { type: "string" },\n  writeBundle(outdir, plan);\n',
     ],
+    [
+      "a destination flag spelled --export",
+      '  export: { type: "string" },\n  atomicWriteFileSync(exportPath, html);\n',
+    ],
   ]);
 
   for (const [shape, source] of INTRUDER_SHAPES) {
     test(`a new export path using ${shape} is in population`, () => {
-      expect(declaresDestination(source)).toBe(true);
+      expect(declaresFileDestination(source)).toBe(true);
     });
   }
+
+  /**
+   * The synthetic destination the file rule missed for a whole release.
+   * `--export` reads as a mode name rather than a path name, which is
+   * exactly why a hardcoded list of destination words is the same defect
+   * class this census exists to catch, one level up.
+   */
+  test("a synthetic --export module is in population and must be declared", () => {
+    const intruder: CensusFile = {
+      path: "src/cli/brain/verbs/synthetic-export-flag.ts",
+      text: 'export: { type: "string" },\n  atomicWriteFileSync(dest, body);\n',
+    };
+    expect(declaresFileDestination(intruder.text)).toBe(true);
+    expect(unlistedWith(intruder)).toEqual([intruder.path]);
+  });
+
+  /**
+   * Rule 3's own shapes. A network destination arrives as a `fetch` with a
+   * body, never as a parameter spec, so none of the file shapes above can
+   * stand in for these.
+   */
+  const NETWORK_INTRUDER_SHAPES: ReadonlyArray<readonly [string, string]> = Object.freeze([
+    [
+      "a provider client POSTing vault text to a configured endpoint",
+      "const res = await fetch(this.http.url, {\n" +
+        '  method: "POST",\n' +
+        "  body: JSON.stringify({ input: texts }),\n" +
+        "});\n",
+    ],
+    [
+      "a bare POST helper with the url inline",
+      'await fetch(`${base}/rerank`, { method: "POST", body });\n',
+    ],
+  ]);
+
+  for (const [shape, source] of NETWORK_INTRUDER_SHAPES) {
+    test(`${shape} is in population under the network rule`, () => {
+      expect(declaresNetworkDestination(source)).toBe(true);
+      // And not through a file rule, so the two populations stay legible.
+      expect(declaresFileDestination(source)).toBe(false);
+    });
+  }
+
+  test("a synthetic network-destination module must be declared too", () => {
+    const intruder: CensusFile = {
+      path: "src/core/search/embeddings/synthetic-provider.ts",
+      text:
+        "const response = await fetch(endpoint.url, {\n" +
+        '  method: "POST",\n' +
+        "  body: JSON.stringify({ input: chunkBodies }),\n" +
+        "});\n",
+    };
+    expect(declaresDestination(intruder.text)).toBe(true);
+    expect(unlistedWith(intruder)).toEqual([intruder.path]);
+  });
+
+  test("reading a URL is not egress", () => {
+    // The rule is about bytes going UP. A GET, however many, is ingress.
+    expect(declaresNetworkDestination("const r = await fetch(url);\n")).toBe(false);
+    expect(declaresNetworkDestination('const r = await fetch(url, { method: "GET" });\n')).toBe(
+      false,
+    );
+  });
+
+  test("a POST that reaches no network is not this census's subject", () => {
+    // A route table, or a server reading an inbound method, without a call
+    // out. The pair of conditions is what keeps `src/mcp/http.ts` and the
+    // explorer's own loopback server out of population.
+    expect(declaresNetworkDestination('if (req.method === "POST") return handle(req);\n')).toBe(
+      false,
+    );
+    expect(declaresNetworkDestination('const route = { method: "POST" };\n')).toBe(false);
+    for (const path of ["src/mcp/http.ts", "src/core/brain/explorer.ts"]) {
+      const text = moduleText(path);
+      expect(`${path}: ${declaresNetworkDestination(text)}`).toBe(`${path}: false`);
+    }
+  });
+
+  test("a client that delegates its POST to an injected transport is seen", () => {
+    // The provider module names the endpoint and never calls `fetch`; the
+    // transport calls `fetch` and takes the method as a variable. Reading
+    // only the request-literal form leaves the pair invisible.
+    expect(
+      declaresNetworkDestination(
+        'const body = method === "POST" ? JSON.stringify(req.body) : null;\n' +
+          "  const res = await fetch(input.url, { method: input.method, body });\n",
+      ),
+    ).toBe(true);
+  });
+
+  test("the network rule finds the modules it was written for", () => {
+    // Named rather than counted: a regex narrowed by a later edit shows up
+    // as a missing path, not as a smaller number.
+    const network = SOURCE_TREE.filter((f) => declaresNetworkDestination(f.text)).map(
+      (f) => f.path,
+    );
+    expect(network).toContain("src/core/search/embeddings/openai-compat.ts");
+    expect(network.length).toBeGreaterThan(2);
+  });
 
   test("an identifier that merely ends in a destination name is not one", () => {
     expect(declaresDestination('  stdout: { type: "string" },\n')).toBe(false);
@@ -363,7 +589,7 @@ describe("the census cannot pass by finding nothing", () => {
     // and the failure above will name it. Pinned so the rule cannot be
     // widened into a backlog by accident.
     const byAmbiguousOnly = SOURCE_TREE.filter(
-      (f) => !DESTINATION_FLAG_RE.test(f.text) && declaresDestination(f.text),
+      (f) => !DESTINATION_FLAG_RE.test(f.text) && declaresFileDestination(f.text),
     ).map((f) => f.path);
     expect(byAmbiguousOnly).toEqual([]);
   });
@@ -373,8 +599,10 @@ describe("the census cannot pass by finding nothing", () => {
   });
 
   test("an undeclared module in population is reported by name", () => {
-    const intruder = "src/cli/brain/verbs/synthetic-export.ts";
-    const population = [...POPULATION, intruder];
-    expect(population.filter((path) => !DECLARED_MODULES.has(path))).toEqual([intruder]);
+    const intruder: CensusFile = {
+      path: "src/cli/brain/verbs/synthetic-export.ts",
+      text: '  out: { type: "string" },\n  writeFileSync(out, body, "utf8");\n',
+    };
+    expect(unlistedWith(intruder)).toEqual([intruder.path]);
   });
 });
