@@ -30,6 +30,7 @@ import { BRAIN_MOST_APPLIED_DEFAULTS, resolveMostApplied } from "./blocks/active
 import { BRAIN_NOTES_DEFAULTS, resolveNotes } from "./blocks/notes.ts";
 import { BRAIN_TEMPORAL_DEFAULTS, resolveTemporal } from "./blocks/temporal.ts";
 import { BRAIN_GUARDRAIL_DEFAULTS, resolveGuardrails } from "./blocks/guardrails.ts";
+import { BRAIN_MAINTENANCE_DEFAULTS, resolveMaintenance } from "./blocks/maintenance.ts";
 import {
   BRAIN_INTEGRITY_DEFAULTS,
   BRAIN_INTEGRITY_STRICT_FALLBACK,
@@ -242,6 +243,22 @@ export const loadSnapshotDerivedStorePolicySafe = makeAbsentTolerantLoader<Brain
     include: DEFAULT_BRAIN_CONFIG.snapshots.include_derived_store,
     maxBytes: DEFAULT_BRAIN_CONFIG.snapshots.derived_store_max_bytes,
   }),
+);
+
+/**
+ * Load + resolve the `maintenance:` block, falling back to
+ * `BRAIN_MAINTENANCE_DEFAULTS` when the config file is absent — which
+ * leaves the host-pressure gate unconfigured, exactly as an operator who
+ * has never run `o2b brain init` has never asked for it.
+ *
+ * An unreadable config raises, and that is the point: both knobs here
+ * decide whether heavy work starts, so answering with the defaults would
+ * run a pass the operator had gated and retry a task the operator's
+ * limit had refused, on a vault that otherwise looks healthy.
+ */
+export const loadMaintenanceConfigSafe = makeAbsentTolerantLoader(
+  resolveMaintenance,
+  BRAIN_MAINTENANCE_DEFAULTS,
 );
 
 /**

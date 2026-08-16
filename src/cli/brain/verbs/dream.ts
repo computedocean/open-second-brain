@@ -45,11 +45,13 @@ import {
 } from "../../../core/brain/dream-stage.ts";
 import {
   createSafeguard,
+  OPERATION,
   resolveSafeguardTimeoutMs,
   SafeguardTimeoutError,
 } from "../../../core/brain/safeguard.ts";
 import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { emitNextStep } from "../../advisory-rail.ts";
+import { attachProgress, reportProgressRefusal } from "../../progress-rail.ts";
 import { brainVerbContext, fail, ok, okJson, parse, parseOptionalIsoDate } from "../helpers.ts";
 
 // The runnable set is read from the step registry, never retyped: a
@@ -102,6 +104,7 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     strict: { type: "boolean" },
     step: { type: "string" },
     gate: { type: "string-array" },
+    progress: { type: "boolean" },
     json: { type: "boolean" },
   });
   const asJson = flags["json"] === true;
@@ -200,10 +203,16 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
   const { value: now, error: nowErr } = parseOptionalIsoDate(flags, "now");
   if (nowErr) return fail(nowErr);
 
+  // No signal: `dreamRun` is synchronous end to end, so a signal handler
+  // cannot run while it does (see `interrupt.ts`). The deadline is the
+  // only cooperative stop a dream pass has; SIGINT is left with its
+  // default meaning so the keystroke still kills the process, and every
+  // artifact a pass writes goes through `atomicWriteFileSync`, so being
+  // killed leaves no half-written note.
   const guard = () =>
     createSafeguard({
-      operation: "dream",
-      timeoutMs: resolveSafeguardTimeoutMs("dream", config ?? undefined),
+      operation: OPERATION.dream,
+      timeoutMs: resolveSafeguardTimeoutMs(OPERATION.dream, config ?? undefined),
     });
 
   if (wantsStep) {
@@ -233,11 +242,32 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     return 0;
   }
 
+  // The staged actions that RUN a pass watch the same five stages the
+  // inline run does. `DreamStageOptions` has declared `onProgress` and
+  // threaded it through all three of those entry points since U1; this is
+  // the caller that asks. A stream that reached only one of the two entry
+  // points would be the half-wired mechanism this release exists to
+  // remove.
+  //
+  // `discard` and `list` are excluded because they run no pass and have
+  // nothing to report, and `run` because it falls through this block to
+  // the inline pass below, which attaches its own. Attaching here for
+  // `run` too would build two observers for one pass and report a refusal
+  // twice.
+  const STAGED_PASSES = new Set(["stage", "validate", "apply"]);
+  const stagedObservation =
+    flags["progress"] === true && STAGED_PASSES.has(action)
+      ? attachProgress({ command: "brain", argv: ["dream", action], jsonRequested: asJson })
+      : null;
+  reportProgressRefusal(stagedObservation);
+  const stagedProgress =
+    stagedObservation?.sink !== undefined ? { onProgress: stagedObservation.sink } : {};
   try {
     if (action === "stage") {
       const bundle = stageDream(vault, {
         now: now ?? new Date(),
         safeguard: guard(),
+        ...stagedProgress,
         ...(agent ? { agentName: agent } : {}),
       });
       if (asJson) {
@@ -259,6 +289,7 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
       const stageOpts = {
         now: now ?? new Date(),
         safeguard: guard(),
+        ...stagedProgress,
         ...(agent ? { agentName: agent } : {}),
       };
       if (action === "validate") {
@@ -379,6 +410,15 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     }
   }
 
+  // Progress is opt-in: attaching a sink by default would change the
+  // stderr of every existing invocation, and this CLI's one streaming
+  // precedent (`o2b search index --verbose`) is opt-in for the same
+  // reason. The rail decides whether the stream can carry it at all.
+  const observation =
+    flags["progress"] === true
+      ? attachProgress({ command: "brain", argv: ["dream"], jsonRequested: asJson })
+      : null;
+  reportProgressRefusal(observation);
   let summary;
   try {
     summary = dream(vault, {
@@ -386,6 +426,7 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
       dryRun: Boolean(flags["dry-run"]),
       ...(agent ? { agentName: agent } : {}),
       safeguard: guard(),
+      ...(observation?.sink !== undefined ? { onProgress: observation.sink } : {}),
       ...(gates !== null ? { gates } : {}),
     });
   } catch (exc) {
@@ -395,7 +436,6 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     }
     return fail(`dream failed: ${(exc as Error).message ?? exc}`);
   }
-
   for (const w of summary.warnings ?? []) {
     process.stderr.write(`warning: ${w.code}: ${w.message}\n`);
   }

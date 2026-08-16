@@ -22,8 +22,65 @@
 
 import { discoverConfig } from "../config.ts";
 
-/** Operations that accept a safeguard. */
-export type SafeguardOperation = "dream" | "reindex" | "bridges" | "clusters" | "maintenance";
+/**
+ * The operations this repository calls long.
+ *
+ * It was a bare union until the progress spine needed to name the same
+ * population - a run that carries a deadline is exactly a run worth
+ * reporting on - and a second list would have drifted from this one.
+ * Promoted to the four-piece vocabulary the census enforces so the
+ * surfaces that name an operation read from one place.
+ *
+ * `maintenance` is the one member that is a DISPATCHER rather than a
+ * pass, and it is worth being exact about what that costs it, because
+ * "one vocabulary, every surface" is not true of it:
+ *
+ *   - it never reaches `progressCounter`. The lane forwards the caller's
+ *     sink to its four sub-operations, so every record names the pass
+ *     that emitted it - a deliberate choice, asserted by
+ *     `brain-maintenance-progress.test.ts`, not an omission;
+ *   - it never reaches {@link resolveSafeguardTimeoutMs} either.
+ *     `laneSafeguard` builds one deadline per task from that task's own
+ *     operation, so there is no lane-wide budget to resolve and
+ *     `safeguard_timeout_maintenance_seconds` is a key nothing reads.
+ *     It is not documented in `docs/cli-reference.md` for that reason;
+ *   - it IS the operation the lane's interrupt handle is opened for
+ *     (`interruptIsObservable` in `src/cli/interrupt.ts`), because the
+ *     lane awaits between tasks and so is the level at which a Ctrl-C
+ *     can actually be seen. That is its one producer.
+ */
+export const OPERATION = Object.freeze({
+  dream: "dream",
+  reindex: "reindex",
+  bridges: "bridges",
+  clusters: "clusters",
+  maintenance: "maintenance",
+  architect: "architect",
+} as const);
+
+export type Operation = (typeof OPERATION)[keyof typeof OPERATION];
+
+/** Membership list for {@link isOperation}. */
+export const OPERATIONS: ReadonlyArray<Operation> = Object.freeze([
+  OPERATION.dream,
+  OPERATION.reindex,
+  OPERATION.bridges,
+  OPERATION.clusters,
+  OPERATION.maintenance,
+  OPERATION.architect,
+]);
+
+/**
+ * Whether `value` names an operation this build understands. Takes
+ * `unknown` because it arrives from a config key a person typed or from a
+ * progress line a caller parsed.
+ */
+export function isOperation(value: unknown): value is Operation {
+  return typeof value === "string" && (OPERATIONS as ReadonlyArray<string>).includes(value);
+}
+
+/** Historical name for {@link Operation}, kept so call sites need no edit. */
+export type SafeguardOperation = Operation;
 
 /** Built-in fallback budget (mirage uses 600s; same scale fits here). */
 export const SAFEGUARD_DEFAULT_TIMEOUT_SECONDS = 600;

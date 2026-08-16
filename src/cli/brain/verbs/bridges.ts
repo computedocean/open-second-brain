@@ -27,6 +27,7 @@ import {
 import { appendMetric } from "../../../core/brain/metrics.ts";
 import {
   createSafeguard,
+  OPERATION,
   resolveSafeguardTimeoutMs,
   SafeguardTimeoutError,
 } from "../../../core/brain/safeguard.ts";
@@ -37,11 +38,12 @@ import { Store } from "../../../core/search/store.ts";
 import { SearchError } from "../../../core/search/types.ts";
 import { parseFrontmatter } from "../../../core/vault.ts";
 import { emitNextStep, type AdvisoryStream } from "../../advisory-rail.ts";
+import { attachProgress, reportProgressRefusal } from "../../progress-rail.ts";
 import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
 
 const USAGE =
-  "usage: o2b brain bridges discover [--max N] [--min-similarity X] | list | " +
+  "usage: o2b brain bridges discover [--max N] [--min-similarity X] [--progress] | list | " +
   "accept <source> <target> | dismiss <source> <target>  [--vault <path>] [--json]";
 
 export async function cmdBrainBridges(argv: string[]): Promise<number> {
@@ -49,6 +51,7 @@ export async function cmdBrainBridges(argv: string[]): Promise<number> {
     vault: { type: "string" },
     max: { type: "string" },
     "min-similarity": { type: "string" },
+    progress: { type: "boolean" },
     json: { type: "boolean" },
   });
   const asJson = flags["json"] === true;
@@ -146,6 +149,20 @@ export async function cmdBrainBridges(argv: string[]): Promise<number> {
     }
 
     const now = new Date();
+    // Progress is opt-in: attaching a sink by default would change the
+    // stderr of every existing invocation, and this CLI's one streaming
+    // precedent (`o2b search index --verbose`) is opt-in for the same
+    // reason. The rail decides whether the stream can carry it at all.
+    const observation =
+      flags["progress"] === true
+        ? attachProgress({ command: "brain", argv: ["bridges"], jsonRequested: asJson })
+        : null;
+    reportProgressRefusal(observation);
+    // No interrupt handle: `discoverBridgesRun` is synchronous end to end,
+    // so a signal handler cannot run while it does (see `interrupt.ts`).
+    // Leaving SIGINT alone keeps the keystroke lethal, which is the only
+    // way this scan can actually be stopped. Proposals are written in one
+    // atomic write after the scan, so a killed run leaves no half file.
     try {
       const dismissed = readDismissedBridges(vault);
       const report = discoverBridges(store, {
@@ -153,9 +170,10 @@ export async function cmdBrainBridges(argv: string[]): Promise<number> {
         ...(minSimilarity !== undefined ? { minSimilarity } : {}),
         dismissed,
         safeguard: createSafeguard({
-          operation: "bridges",
-          timeoutMs: resolveSafeguardTimeoutMs("bridges", config ?? undefined),
+          operation: OPERATION.bridges,
+          timeoutMs: resolveSafeguardTimeoutMs(OPERATION.bridges, config ?? undefined),
         }),
+        ...(observation?.sink !== undefined ? { onProgress: observation.sink } : {}),
       });
       const path = writeBridgeProposals(vault, report, { now });
       try {

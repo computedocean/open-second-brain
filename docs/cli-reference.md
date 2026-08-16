@@ -58,6 +58,56 @@ that can produce it - see [`install/copilot-cli.md`](../install/copilot-cli.md).
 Every other adapter verifies off disk, so it can report `ok`, `drift`, or
 `not-installed` but never `mcp-unreachable`.
 
+### `o2b doctor` exit codes
+
+| Code | Meaning |
+| ---- | -------- |
+| `0`  | Every check passed, and with `--readiness` every probe answered |
+| `1`  | At least one check FAILED, or with `--readiness` at least one probe proved its surface broken |
+| `6`  | With `--readiness`: no check failed, and at least one probe could not find out |
+
+Code `6` is a behaviour change for `--readiness` runs and is deliberately
+the number `o2b search check` already spends on a probe that did not
+complete; a test asserts the two cannot drift. A probe that exceeded its
+per-check budget used to be counted as a failure and exit `1`, so the same
+healthy machine exited `0` when idle and `1` when loaded - the verdict was
+a property of the load average rather than of the installation. Such a
+probe now reports `unknown` with the elapsed budget as its reason, and an
+unmeasured surface is not folded into the `0` that would claim it was
+checked either. A proved failure outranks an unmeasured probe, so `1`
+never hides behind `6`.
+
+The `--json` shape gains `readiness_summary` (`probes`, `failed`,
+`unknown`) beside the existing `readiness` array whenever `--readiness` is
+passed, so a caller reads the same three-way answer the exit code carries;
+`ok` is read off that exit code, and being two-valued it means only "not
+established as healthy" when false.
+
+### The codegraph partner check
+
+`o2b doctor` consults the optional [codegraph](https://github.com/colbymchenry/codegraph)
+partner when its CLI is on PATH and the working directory is a code
+project, by spawning `codegraph status -j <repo>` once per discovered
+project. That costs about 0.7 s against a warm `HOME` and about 5 s
+against a cold one, because the partner caches under `HOME`.
+
+`partner_codegraph_disabled: "true"` in the config file, or
+`OPEN_SECOND_BRAIN_PARTNER_CODEGRAPH_DISABLED=true` in the environment,
+turns that consultation off. Default off, so the doctor behaves exactly as
+before unless the switch is set. It is a config key rather than a flag
+because the fact it records ("the partner is installed on this machine and
+asking it costs seconds") is a property of a machine, and because the
+three callers of the doctor include the MCP `vault_health` tool and the
+OpenClaw extension, which take no flags. `o2b partner codegraph report` is
+unaffected: an answer the operator asked for directly is never suppressed
+by a switch about background cost.
+
+A doctor run with the switch on still prints a `code_graph` line saying
+which switch silenced it, so a check that did not run is distinguishable
+from one that ran and passed. A machine with no codegraph CLI, and a
+directory that is not a code project, still both print nothing at all -
+those two remain indistinguishable from each other in the doctor's output.
+
 ## Brain (observing memory)
 
 ```text
@@ -220,7 +270,7 @@ o2b brain git                 ingest <repo-path> [--max-count N] - read-only wal
                               status - per-repo watermarks and record counts
                               find [text] [--repo K] [--file F] [--author A] [--since S] [--until U] [--limit N] - query ingested history newest-first; no live git on the query path
                               mine [--repo K] - surface decision-shaped commits as draft ADR candidate notes under Brain/decisions/candidates/ (sha-stable identity, skip-existing)
-o2b brain architect           <project-path> - deterministic stdlib-only project scan rendered as architecture notes under Brain/projects/arch/<repo-key>/; generated content lives in o2b:begin/o2b:end sentinel regions, operator prose outside regions survives every re-scan byte-for-byte
+o2b brain architect           <project-path> [--progress] - deterministic stdlib-only project scan rendered as architecture notes under Brain/projects/arch/<repo-key>/; generated content lives in o2b:begin/o2b:end sentinel regions, operator prose outside regions survives every re-scan byte-for-byte
 ```
 
 All flags accept `--vault V` and `--json`. The ingest never modifies the scanned repository; every caller-supplied sha is validated against the full-40-hex grammar before it can reach a git argument.
@@ -272,16 +322,18 @@ o2b brain label               <path> <dimension>=<value> | --remove <dimension> 
 o2b brain attr                <path> <field>=<value> | --remove <field> | --show - per-type attribute fields; an undeclared field error lists the declared fields WITH descriptions
 o2b brain tiers               check | restore <path> [--field F] --apply | accept <path> [--field F] - staged repair for identity-tier frontmatter hand-edits
 o2b brain secret              set <name> [--env-var V] [--allow PATTERN]... [--from-env SRC] | list | rm <name> | run <name> -- <command...> - capability-gated custody; the value enters via stdin, never argv
-o2b brain maintenance         run [--force] [--window H-H] [--tz ZONE] [--busy-minutes N] [--busy-threshold N] | status [--limit N] - quiet-window lease-guarded lane for dream + reindex
+o2b brain maintenance         run [--force] [--retry <task>] [--window H-H] [--tz ZONE] [--busy-minutes N] [--busy-threshold N] [--progress] | status [--limit N] - quiet-window lease-guarded lane for dream + reindex
 ```
 
 The schema pack gains four additive ontology fields (`labels`, `link_constraints`, `attributes`, `frontmatter_tiers`) with audited mutations through `o2b brain schema apply`. Link constraints enforce at index materialization: a typed edge whose endpoint page types violate the declared pairs falls back to an untyped link, `o2b brain schema lint` lists each violation, and removing the constraint restores the edges on the next index run. Tier drift detection rides the same index pass - the snapshot keeps the expected value, so reindexes never absorb a hand-edit, and `brain_doctor` warns with the open count. Filter labelled recall with `o2b search <q> --property labels=<dim>/<value>`. Secrets protect against context leakage and vault sync exposure, not against root; every custody operation lands a no-values record in `Brain/log/secret-custody/`. A maintenance gate skip exits 0 so cron never alarms on a quiet hour.
 
+The lane's two vault-side knobs live in `Brain/_brain.yaml` under `maintenance:`, because they answer what the cron line cannot. `host_pressure_percent` adds a fourth gate: skip when the host's one-minute run queue stands at or above that percentage of the CPUs this process may use. Unset by default, which leaves the gate off. Where the metric is degenerate - a platform whose load average is a constant, or a cgroup with a CPU bandwidth quota, where the run queue is the whole host's - the gate stays **open** and the journal carries a separate `pressure:unmeasurable` row naming the reason, so an unreadable host is never reported as a quiet one. `failure_streak_limit` (default 3) refuses a lane task that has failed that many times in a row in the run journal, naming the streak; a single journaled success clears it. The refusal is per task - the other three still run under the same lease - and there are two ways past it: `--retry <task>` (repeatable) attempts just that task with every gate the operator configured still in force, and `--force` runs the whole lane past every soft gate and every refusal. A refused task is reported as `REFUSED`, never `FAILED`, and the run exits **7** rather than 1: nothing was attempted, so nothing failed, but a standing refusal is not the quiet hour that exits 0 either. An attempted failure still exits 1 and outranks a refusal in the same run. The `refused:streak` journal row carries the count it refused on, so the streak does not silently reset when its evidence rolls off the journal cap.
+
 ### Link and recall intelligence (since v0.45.0)
 
 ```text
-o2b brain bridges             discover [--max N] [--min-similarity X] | list | accept <source> <target> | dismiss <source> <target> - embedding-near link proposals over the vec index, reviewable artifact, accept writes one related: wikilink
-o2b brain clusters            run [--min-size N] [--batch-size N] [--if-stale] | list - graph-wide community detection; derived digests under Brain/clusters/, regenerated per run; --batch-size materializes in chunks with isolated, reported per-batch failures; --if-stale recomputes only when the freshness verdict is not `fresh` (see "Materialization freshness" below)
+o2b brain bridges             discover [--max N] [--min-similarity X] [--progress] | list | accept <source> <target> | dismiss <source> <target> - embedding-near link proposals over the vec index, reviewable artifact, accept writes one related: wikilink
+o2b brain clusters            run [--min-size N] [--batch-size N] [--if-stale] [--progress] | list - graph-wide community detection; derived digests under Brain/clusters/, regenerated per run; --batch-size materializes in chunks with isolated, reported per-batch failures; --if-stale recomputes only when the freshness verdict is not `fresh` (see "Materialization freshness" below)
 o2b brain vitals               [--orphan-threshold N] - aggregate governance scorecard over confirmed preferences: domain_diversity (scope entropy), connectivity_index (mean evidenced_by count), orphan_preferences (below threshold, default 2), gap_pressure (open concept-gap findings ÷ preference count, reused from doctor); records the vault_vitals metric
 o2b brain benchmark           run --dataset <path> [--k N] [--expand] - hit@k + MRR against the live hybrid recall; records the recall_benchmark metric
 o2b brain tune                run --dataset <path> [--k N] | status | reset - bounded self-tuning grid judged by the benchmark; persisted to Brain/search/tuning.json
@@ -356,7 +408,7 @@ not be read.
 ### Trusted recall and memory write surface (since v1.35.0)
 
 ```text
-o2b doctor                    gains --readiness: four functional probes (model-inference key resolvable, embedding provider loadable with model and dims, runtime-adapter construction, installed runtimes verified off disk through each adapter's own verify) with per-check timeouts and outcomes pass, fail with a reason, skipped-not-configured, or unknown-could-not-measure; a failure exits non-zero and an unknown does not; without the flag output stays byte-identical
+o2b doctor                    gains --readiness: four functional probes (model-inference key resolvable, embedding provider loadable with model and dims, runtime-adapter construction, installed runtimes verified off disk through each adapter's own verify) with per-check timeouts and outcomes pass, fail with a reason, skipped-not-configured, or unknown-could-not-measure; a failure and an unmeasured probe exit with different non-zero codes (see "`o2b doctor` exit codes" below); without the flag output stays byte-identical
 o2b brain morning-brief       renders recalled items as one chronological Recent activity timeline with a per-item structural type marker and a relative age label; the underlying JSON data arrays are unchanged
 ```
 
@@ -667,7 +719,23 @@ Verbs that carry it today: `o2b status`, `o2b brain init`, `bridges list|discove
 
 **When there is no command.** About two thirds of the doctor's issue codes resolve to none, because the repair is a judgement over content or an edit whose target shape the finding cannot supply. Those are not silent: `o2b brain doctor` prints `no exit: <code> - <reason>` once per reported code, and `--json` (and MCP `brain_doctor`) carries the same reasons in an additive `no_exit` object beside the issue streams - once per code rather than repeated on each record, because a reason is about a class. Every doctor code is one or the other; `tests/core/brain/doctor-exit-census.test.ts` enumerates them from the detector and fails on a code that is neither, so an unregistered code can no longer mean "nobody got round to it". The key and the lines are absent whenever every reported code has an exit, and on a clean vault.
 
-Long-running operations (dream, `o2b search index | reindex`, bridges discover, clusters run, the maintenance lane) run under a cooperative safeguard deadline: `safeguard_timeout_seconds` (default 600, `0` disables, env `OPEN_SECOND_BRAIN_SAFEGUARD_TIMEOUT`) with per-operation overrides like `safeguard_timeout_dream_seconds`. A tripped deadline aborts at the next checkpoint - between atomic writes - and reports `{ok:false, timed_out:true}` on exit 1; maintenance-lane task results carry `timed_out` per task. The frozen-surface policy lives in `docs/stability.md`; the 0.x to 1.0.0 migration table in `docs/updating.md`.
+Long-running operations (dream, `o2b search index | reindex | vector-backfill`, bridges discover, clusters run, architect, the maintenance lane) run under a cooperative safeguard deadline: `safeguard_timeout_seconds` (default 600, `0` disables, env `OPEN_SECOND_BRAIN_SAFEGUARD_TIMEOUT`) with per-operation overrides like `safeguard_timeout_dream_seconds`. A tripped deadline aborts at the next checkpoint - between atomic writes - and reports `{ok:false, timed_out:true}` on exit 1; maintenance-lane task results carry `timed_out` per task. The frozen-surface policy lives in `docs/stability.md`; the 0.x to 1.0.0 migration table in `docs/updating.md`.
+
+**Watching one.** The same verbs take `--progress`, which writes one newline-delimited JSON record per checkpoint to **stderr** - `{"schema":"o2b.progress.v1","operation":…,"kind":…,"stage":…,"completed":N}`, where `kind` is `started`, `advanced`, `finished` or `stopped`, and `total` is present only where a denominator is known before the loop starts (the embedding phase knows its pending count; the index walk consumes a generator and cannot). A CLI progress stream never carries `refused` - no counter emits it; it is an MCP-only shape on a different transport, so a CLI reader that handles it writes dead code. `stage` is an identifier from the operation's own phase vocabulary, never a sentence. Stdout is untouched, so a `--json` payload is byte-identical with and without the flag, and `o2b search index --verbose` keeps its separate per-file stream unchanged - the two answer different questions. Progress is opt-in for the same reason `--verbose` is; when a stream cannot carry it the verb says `progress: not emitted (<reason>)` rather than writing into a buffer nobody will read in time. `o2b brain maintenance run --progress` forwards the stream of whichever task is running rather than counting its own four steps, so every record names the operation that emitted it. `o2b search reindex --progress` opens a `lock` stage before it waits for the writer lock (that wait can be the length of a competing rebuild) and does not report `finished` until after the `swap` stage that renames the staging build over the live index - the run is not over when the build is. `o2b search vector-backfill --progress` reports under `reindex` too, because the pass IS that run's embedding phase on its own: a `plan` stage while it counts, then the shared `embed` stage with the pending count as its denominator.
+
+Which emitters those verbs actually have is not taken on trust. `tests/cli/progress-emitter-census.test.ts` enumerates every `progressCounter(` call site in `src/` from the source, maps each to the entry point that reaches it, then RUNS each entry point against a fixture and requires records carrying that site's operation and stage to arrive with a terminator. A call site no entry point reaches is a failure, which is how `vector-backfill` - which had grown the whole spine in core with no flag to reach it - was found.
+
+**Stopping one, and what Ctrl-C actually does.** This differs per verb, and the difference is a property of the operation rather than a gap in the wiring. A cooperative interrupt is delivered to a JavaScript signal handler, and a signal handler runs on the event loop; an operation that never yields to the event loop therefore cannot observe one, and merely *registering* a handler would suppress the default terminate and make the keystroke do nothing at all.
+
+| Verb | Ctrl-C / SIGTERM |
+| --- | --- |
+| `o2b search index`, `o2b search reindex` | Stops the run at the next checkpoint - between files, between embed batches, never mid-write - and exits **130** (SIGINT) or **143** (SIGTERM). A stopped rebuild leaves the live index exactly as it found it, because the staging build is abandoned before the swap. |
+| `o2b search vector-backfill` | Stops **between embed batches** and exits **130** / **143**; vectors already written stay written, because each chunk commits as it is computed. The dry run and the planning query are synchronous SQLite between two awaits, so a keystroke landing there is not observed at a checkpoint - it ends the process on release instead, which is the same outcome the un-suppressed keystroke would have had. |
+| `o2b brain maintenance run` | Stops the lane at a task boundary and exits **130** / **143**. The lane journals the stop and releases its lease, so the vault is never left leased. |
+| `o2b brain dream` (including `stage`/`validate`/`apply`), `o2b brain bridges discover`, `o2b brain clusters run`, `o2b brain architect` | **Terminates the process immediately**, the ordinary shell behaviour. These four passes are synchronous end to end, so no cooperative stop is possible and none is claimed. Every artifact they write is written atomically, so a killed pass leaves no half-written note - it leaves the vault as it was before the pass, or after the last completed write. Their deadline (`safeguard_timeout_*_seconds`, above) is the only cooperative stop they have. |
+| `o2b search watch` | Exits **0**, unchanged: stopping is how that command ends. |
+
+For the two verbs that do hold a handle, a second interrupt is not intercepted and falls through to the default handler, so a wedged run is always killable by pressing the key twice. And an interrupt that arrives while such a verb is in a region with no checkpoint - opening a store, writing a report - is not swallowed: the verb prints `interrupted: SIGINT arrived while … stopping now` and ends with the signal's code rather than returning 0. A run the operator stopped never exits 0.
 
 ## Vault scope
 
@@ -788,7 +856,12 @@ o2b search reindex            Rebuild the SQLite + FTS5 index from scratch
                               --interval <N>m|h|d sets that recipe's cadence, default 30m; an interval
                               cron cannot express (seconds, 60m+, 24h+, 28d+) is refused with the
                               reason rather than rendered as a schedule that means something else
-o2b search index              Incrementally update the index; --embeddings computes vectors
+                              --self-heal <run-id> records this run's terminal outcome (or its
+                              failure, by name) on the self_heal_reindex metrics surface under that
+                              id; set by the detached post-upgrade rebuild, whose streams are all
+                              ignored, and whose parent mints the id so the two rows pair without a
+                              machine-local pid
+o2b search index              Incrementally update the index; --embeddings computes vectors, --progress watches it
                               --force-cost bypasses the embedding cost gate (since v0.36.0)
 o2b search vector-backfill    Run the vector phase ALONE for indexed chunks that have no vector -
                               no vault walk, no re-chunking, no frontmatter pass (since v1.43.0).
@@ -796,6 +869,7 @@ o2b search vector-backfill    Run the vector phase ALONE for indexed chunks that
                               configured semantic capability tier, and contacts no provider.
                               --apply is the only path that reaches a provider or writes a vector
                               --force-cost bypasses the embedding cost gate for that run
+                              --progress watches it; Ctrl-C stops it between embed batches
                               --json emits dry_run, capability_tier, capability_code, chunks_total,
                               pending, embedded, retries, plus estimated_cost_usd only when the
                               model's price is known - a missing price is an absent key, never 0
@@ -941,7 +1015,17 @@ is the same one the cost gate uses, applied to the text as it will be sent
 (instruction prefix included). With the key unset the field is absent and
 batching is byte-identical to the fixed `embedding_batch_size` stride; a
 single text whose own estimate exceeds the budget is sent alone rather than
-dropped or split. `search_fusion_mode`
+dropped or split.
+`embedding_concurrency` (`OPEN_SECOND_BRAIN_EMBEDDING_CONCURRENCY`, default 4)
+bounds embedding requests in flight for one embedding identity - provider,
+model and configured dimension - against one resolved endpoint, across the
+whole process rather than one call. Two models configured against the same
+host are two identities and therefore two budgets, so that host sees up to
+`embedding_concurrency x identities` at once: size the knob against the
+budget the provider actually meters. Two configurations that ask for
+different values on the same identity and endpoint are refused by name
+rather than reconciled to one of them.
+`search_fusion_mode`
 (default `linear`) may be set to `rrf` to fuse the keyword and semantic
 lanes by reciprocal rank (`search_rrf_k`, default 60); `linear` keeps
 ranking bit-identical.

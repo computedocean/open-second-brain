@@ -7,16 +7,32 @@
  */
 
 import { formatDegradationNotice } from "../../../core/integrity/degradation.ts";
-import { createSafeguard, resolveSafeguardTimeoutMs } from "../../../core/brain/safeguard.ts";
+import {
+  createSafeguard,
+  resolveSafeguardTimeoutMs,
+  SafeguardAbortError,
+} from "../../../core/brain/safeguard.ts";
 import {
   chunkWindowDiagnosticCode,
   indexVault,
   reindexVault,
+  SearchError,
   serializeChunkWindowCensus,
 } from "../../../core/search/index.ts";
 import type { ChunkWindowCensus, IndexStats } from "../../../core/search/index.ts";
+import {
+  recordSelfHealOutcome,
+  SELF_HEAL_REINDEX_OUTCOME,
+} from "../../../core/maintenance/self-heal-reindex.ts";
 import { nextCommandField } from "../../../core/brain/next-step.ts";
+import { OPERATION } from "../../../core/brain/safeguard.ts";
 import { emitNextSteps } from "../../advisory-rail.ts";
+import { onInterrupt, reportInterrupted } from "../../interrupt.ts";
+import {
+  attachProgress,
+  reportProgressRefusal,
+  type ProgressAttachment,
+} from "../../progress-rail.ts";
 import { CronTemplateError, renderCronTemplate } from "../../search-cron-template.ts";
 import {
   flagBoolean,
@@ -34,7 +50,7 @@ import {
  * pass over a large vault is the same class of long write as a rebuild, so
  * one configurable deadline covers both.
  */
-const SAFEGUARD_OPERATION = "reindex";
+const SAFEGUARD_OPERATION = OPERATION.reindex;
 
 /** Terminal state both builders reach when the index covers every document. */
 const INDEX_BUILT = "search-index-built";
@@ -55,11 +71,39 @@ const EVENT_ANCHORS_PENDING = "event-anchors-pending";
 /** Default flush cadence for the generated `reindex --cron-template`. */
 const DEFAULT_CRON_INTERVAL = "30m";
 
+/** Top-level command both builders live under, for the rails. */
+const SEARCH_COMMAND = "search";
+
 function reindexSafeguard(flags: SearchVerbFlags): ReturnType<typeof createSafeguard> {
   return createSafeguard({
     operation: SAFEGUARD_OPERATION,
     timeoutMs: resolveSafeguardTimeoutMs(SAFEGUARD_OPERATION, flagString(flags, "config")),
   });
+}
+
+/**
+ * Attach the progress rail for one builder run, and say at once when the
+ * stream cannot carry it.
+ *
+ * Progress is opt-in: attaching a sink by default would change the stderr
+ * of every existing invocation, and the older stream on this very command
+ * - `--verbose` - is opt-in for the same reason. The two are different
+ * channels answering different questions and both are additive, so
+ * neither suppresses the other.
+ *
+ * Written once for both builders: they take the same decision from the
+ * same flags, and two copies would be two chances for one of them to
+ * observe a run the other would not.
+ */
+function observeIndexRun(flags: SearchVerbFlags, verb: string): ProgressAttachment | null {
+  if (!flagBoolean(flags, "progress")) return null;
+  const attachment = attachProgress({
+    command: SEARCH_COMMAND,
+    argv: [verb],
+    jsonRequested: flagBoolean(flags, "json"),
+  });
+  reportProgressRefusal(attachment);
+  return attachment;
 }
 
 /**
@@ -129,28 +173,57 @@ export async function cmdSearchIndex(argv: ReadonlyArray<string>): Promise<numbe
     "force-cost": { type: "boolean" },
     concurrency: { type: "string" },
     verbose: { type: "boolean" },
+    progress: { type: "boolean" },
     json: { type: "boolean" },
   });
   const cfg = resolveConfig(flags);
 
   const verbose = flagBoolean(flags, "verbose");
-  const stats = await indexVault(cfg, {
-    safeguard: reindexSafeguard(flags),
-    embeddings: flagBoolean(flags, "embeddings"),
-    force: flagBoolean(flags, "force"),
-    forceCost: flagBoolean(flags, "force-cost"),
-    onFile: (e) => {
-      if (verbose) {
-        const msg = e.message ? ` ${e.message}` : "";
-        process.stderr.write(`${e.kind}\t${e.path}${msg}\n`);
-      }
-    },
-  });
+  const observation = observeIndexRun(flags, "index");
+  const interrupt = onInterrupt(OPERATION.reindex);
+  let stats: IndexStats;
+  try {
+    stats = await indexVault(cfg, {
+      safeguard: reindexSafeguard(flags),
+      embeddings: flagBoolean(flags, "embeddings"),
+      force: flagBoolean(flags, "force"),
+      forceCost: flagBoolean(flags, "force-cost"),
+      // The cancellation seam `indexVault` already declares and checks -
+      // between files and between embed batches, never mid-write - with
+      // nothing production-side to trip it until now.
+      signal: interrupt.signal,
+      onFile: (e) => {
+        if (verbose) {
+          const msg = e.message ? ` ${e.message}` : "";
+          process.stderr.write(`${e.kind}\t${e.path}${msg}\n`);
+        }
+      },
+      ...(observation?.sink !== undefined ? { onProgress: observation.sink } : {}),
+    });
+  } catch (err) {
+    if (err instanceof SafeguardAbortError) {
+      return reportInterrupted(interrupt, err, flagBoolean(flags, "json"));
+    }
+    throw err;
+  } finally {
+    interrupt.release();
+  }
 
   reportIndexRun(stats, cfg, argv, flagBoolean(flags, "json"));
   return 0;
 }
 
+/**
+ * Rebuild the index from scratch.
+ *
+ * `--self-heal <run-id>` marks the run as the automatic post-upgrade
+ * rebuild that `ensureVaultCurrent` spawns detached, with every stream
+ * ignored because there is no terminal to write to. It changes nothing
+ * about the rebuild; it only makes the run's terminal outcome - success or
+ * the failure by name - land on the `self_heal_reindex` metrics surface
+ * under the run id the parent minted, which is the only place such a run
+ * can be read from afterwards and the only thing its two rows pair on.
+ */
 export async function cmdSearchReindex(argv: ReadonlyArray<string>): Promise<number> {
   const { flags } = parseFlags(argv, {
     ...VAULT_FLAGS,
@@ -159,8 +232,10 @@ export async function cmdSearchReindex(argv: ReadonlyArray<string>): Promise<num
     concurrency: { type: "string" },
     json: { type: "boolean" },
     verbose: { type: "boolean" },
+    progress: { type: "boolean" },
     "cron-template": { type: "boolean" },
     interval: { type: "string" },
+    "self-heal": { type: "string" },
   });
   if (flagBoolean(flags, "cron-template")) {
     const intervalRaw = flagString(flags, "interval") ?? DEFAULT_CRON_INTERVAL;
@@ -176,17 +251,110 @@ export async function cmdSearchReindex(argv: ReadonlyArray<string>): Promise<num
       throw err;
     }
   }
-  const cfg = resolveConfig(flags);
-  const stats = await reindexVault(cfg, {
-    safeguard: reindexSafeguard(flags),
-    embeddings: flagBoolean(flags, "embeddings"),
-    forceCost: flagBoolean(flags, "force-cost"),
-    onFile: flagBoolean(flags, "verbose")
-      ? (e) => process.stderr.write(`${e.kind}\t${e.path}\n`)
-      : undefined,
-  });
+  const selfHeal = flagString(flags, "self-heal");
+  const startedAt = Date.now();
+  // Read before the config, and the config read is inside the recording:
+  // `resolveConfig` used to run outside it, so a self-heal child that died
+  // on an unresolvable `--config` left its parent's spawn row unpaired -
+  // evidence a reader was told to interpret as a child that vanished.
+  const cfg = resolveSelfHealConfig(flags, selfHeal, startedAt);
+  const observation = observeIndexRun(flags, "reindex");
+  const interrupt = onInterrupt(OPERATION.reindex);
+  let stats: IndexStats;
+  try {
+    stats = await reindexVault(cfg, {
+      safeguard: reindexSafeguard(flags),
+      embeddings: flagBoolean(flags, "embeddings"),
+      forceCost: flagBoolean(flags, "force-cost"),
+      signal: interrupt.signal,
+      onFile: flagBoolean(flags, "verbose")
+        ? (e) => process.stderr.write(`${e.kind}\t${e.path}\n`)
+        : undefined,
+      ...(observation?.sink !== undefined ? { onProgress: observation.sink } : {}),
+    });
+  } catch (err) {
+    // The only report a self-heal run's failure ever gets. Recorded before
+    // the rethrow so the row exists whatever the caller's stderr is
+    // pointed at, and the rethrow is unchanged so an operator running this
+    // by hand still sees the error and the exit code they always saw.
+    //
+    // A stopped rebuild is recorded here too, and correctly: the staging
+    // database was abandoned and never swapped in, so this run left the
+    // live index exactly as it found it - which is a rebuild that did not
+    // happen, whoever asked for it to stop.
+    if (selfHeal !== undefined) {
+      recordSelfHealOutcome(
+        cfg.vault,
+        SELF_HEAL_REINDEX_OUTCOME.failed,
+        selfHeal,
+        Date.now() - startedAt,
+        describeFailure(err),
+      );
+    }
+    if (err instanceof SafeguardAbortError) {
+      return reportInterrupted(interrupt, err, flagBoolean(flags, "json"));
+    }
+    throw err;
+  } finally {
+    interrupt.release();
+  }
+  if (selfHeal !== undefined) {
+    recordSelfHealOutcome(
+      cfg.vault,
+      SELF_HEAL_REINDEX_OUTCOME.completed,
+      selfHeal,
+      Date.now() - startedAt,
+    );
+  }
   reportIndexRun(stats, cfg, argv, flagBoolean(flags, "json"));
   return 0;
+}
+
+/**
+ * `resolveConfig`, with a self-heal child's failure recorded before it is
+ * rethrown.
+ *
+ * The vault comes off the `--vault` flag rather than the resolved config,
+ * because the config is the thing that just failed - and the parent always
+ * passes `--vault`, so the value is there for exactly the runs that own a
+ * spawn row. A child invoked WITHOUT `--vault` whose config will not
+ * resolve still records nothing: there is no vault to record into, and
+ * inventing one would write a row into a directory nobody asked about.
+ * That residue is named in `self-heal-reindex.ts`, case 3.
+ *
+ * The error is always rethrown, unchanged: this adds a row, it does not
+ * soften a failure.
+ */
+function resolveSelfHealConfig(
+  flags: SearchVerbFlags,
+  selfHealRunId: string | undefined,
+  startedAt: number,
+): ResolvedSearchConfig {
+  try {
+    return resolveConfig(flags);
+  } catch (err) {
+    const vault = flagString(flags, "vault");
+    if (selfHealRunId !== undefined && vault !== undefined) {
+      recordSelfHealOutcome(
+        vault,
+        SELF_HEAL_REINDEX_OUTCOME.failed,
+        selfHealRunId,
+        Date.now() - startedAt,
+        describeFailure(err),
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * One line naming what failed. A {@link SearchError} leads with its CODE:
+ * the row is read back by an operator and by tests, and a code survives a
+ * message reword where the prose does not.
+ */
+function describeFailure(err: unknown): string {
+  if (err instanceof SearchError) return `${err.code}: ${err.message}`;
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**

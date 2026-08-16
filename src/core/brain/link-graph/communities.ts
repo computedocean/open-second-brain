@@ -30,6 +30,7 @@ import type { Store } from "../../search/store.ts";
 import { getGraphSnapshot } from "./graph-index.ts";
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
 import { isoSecond } from "../time.ts";
+import { OPERATION, progressCounter, withProgress, type ProgressCounter } from "../progress.ts";
 import { formatFrontmatter, parseFrontmatter } from "../../vault.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 
@@ -67,15 +68,40 @@ export interface DetectCommunitiesOptions {
    * per propagation sweep.
    */
   readonly safeguard?: import("../safeguard.ts").Safeguard;
+  /**
+   * Live progress observer (nothing-runs-unwatched, U1). Emitted at the
+   * same boundaries the deadline is checked at; absence means nobody
+   * asked and the pass behaves exactly as before.
+   */
+  readonly onProgress?: import("../progress.ts").ProgressSink;
 }
+
+/** The one stage this pass has: it propagates labels, sweep by sweep. */
+const COMMUNITY_STAGE = "sweep";
 
 /**
  * Deterministic label propagation over the store's resolved link
  * graph. Read-only.
  */
 export function detectCommunities(store: Store, opts: DetectCommunitiesOptions = {}): Community[] {
-  const minSize = Math.max(2, opts.minSize ?? COMMUNITY_DEFAULT_MIN_SIZE);
   const maxIterations = Math.max(1, opts.maxIterations ?? COMMUNITY_MAX_ITERATIONS);
+  const progress = progressCounter(OPERATION.clusters, opts.onProgress);
+  // `maxIterations` is a CEILING, not a denominator: propagation stops as
+  // soon as no label changes, so the run usually ends well short of it.
+  // Reported anyway, because a ceiling a reader can see is better than a
+  // counter with no scale at all - and the stream's `finished` event is
+  // what says the pass ended, not the counter reaching the total.
+  progress.start(COMMUNITY_STAGE, maxIterations);
+  return withProgress(progress, () => detectCommunitiesRun(store, opts, progress, maxIterations));
+}
+
+function detectCommunitiesRun(
+  store: Store,
+  opts: DetectCommunitiesOptions,
+  progress: ProgressCounter,
+  maxIterations: number,
+): Community[] {
+  const minSize = Math.max(2, opts.minSize ?? COMMUNITY_DEFAULT_MIN_SIZE);
   opts.safeguard?.checkpoint();
 
   // Resolved undirected adjacency + pathById come from the memoized
@@ -93,6 +119,7 @@ export function detectCommunities(store: Store, opts: DetectCommunitiesOptions =
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // Cooperative deadline: abort between sweeps (read-only pass).
     opts.safeguard?.checkpoint();
+    progress.advance(COMMUNITY_STAGE);
     let changed = false;
     const next = new Map<number, number>();
     for (const node of nodes) {

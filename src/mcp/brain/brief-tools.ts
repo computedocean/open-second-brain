@@ -48,7 +48,10 @@ import {
   coercePositiveInteger,
   dispatchByView,
   localizeEnvelope,
+  toolSafeguard,
 } from "./shared.ts";
+import type { ProgressSink } from "../../core/brain/progress.ts";
+import { OPERATION } from "../../core/brain/safeguard.ts";
 
 async function toolBrainMorningBrief(
   ctx: ServerContext,
@@ -309,6 +312,7 @@ async function toolBrainMonthlyReview(
 async function toolBrainOperatorSummary(
   ctx: ServerContext,
   args: Record<string, unknown>,
+  onProgress?: ProgressSink,
 ): Promise<Record<string, unknown>> {
   const topRaw = args["top_actions"];
   let topActionsN: number | undefined;
@@ -358,7 +362,18 @@ async function toolBrainOperatorSummary(
   let dreamError: string | undefined;
   if (includeDream) {
     try {
-      dreamSummary = dream(ctx.vault, { dryRun: true });
+      // The one view behind this dispatcher that runs a consolidation
+      // pass. It is a DRY RUN, and it still walks the whole Brain tree,
+      // so it is the slow half of an operator summary on a large vault.
+      dreamSummary = dream(ctx.vault, {
+        dryRun: true,
+        // A dry run is still a full synchronous pass over the Brain tree,
+        // so it is bounded on the same terms as `brain_dream` itself -
+        // the budget the operator set for `dream` governs every MCP call
+        // that reaches one, not just the tool that carries its name.
+        safeguard: toolSafeguard(ctx, OPERATION.dream),
+        ...(onProgress !== undefined ? { onProgress } : {}),
+      });
     } catch (err) {
       // Surface the failure so callers know the dashboard is missing
       // verification + dream signals; do not silently produce a
@@ -428,7 +443,14 @@ async function toolBrainToday(
 }
 
 const BRIEF_VIEW_HANDLERS: Readonly<
-  Record<string, (ctx: ServerContext, args: Record<string, unknown>) => Promise<unknown> | unknown>
+  Record<
+    string,
+    (
+      ctx: ServerContext,
+      args: Record<string, unknown>,
+      onProgress?: ProgressSink,
+    ) => Promise<unknown> | unknown
+  >
 > = Object.freeze({
   morning: toolBrainMorningBrief,
   daily: toolBrainDailyBrief,
@@ -457,7 +479,11 @@ const BRIEF_VIEW_HANDLERS: Readonly<
  */
 const AGENT_SCOPE_VIEWS: ReadonlySet<string> = new Set(["morning", "digest"]);
 
-async function toolBrainBrief(ctx: ServerContext, args: Record<string, unknown>): Promise<unknown> {
+async function toolBrainBrief(
+  ctx: ServerContext,
+  args: Record<string, unknown>,
+  onProgress?: ProgressSink,
+): Promise<unknown> {
   const view = typeof args["view"] === "string" ? args["view"] : "";
   const scopeSupplied =
     AGENT_SCOPE_ARG_NAME in args &&
@@ -473,7 +499,7 @@ async function toolBrainBrief(ctx: ServerContext, args: Record<string, unknown>)
         `owner scoping is supported by view=${[...AGENT_SCOPE_VIEWS].join(", view=")}`,
     );
   }
-  return localizeEnvelope(ctx, await dispatchByView(BRIEF_VIEW_HANDLERS, ctx, args));
+  return localizeEnvelope(ctx, await dispatchByView(BRIEF_VIEW_HANDLERS, ctx, args, onProgress));
 }
 
 export const BRIEF_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([

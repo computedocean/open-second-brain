@@ -458,6 +458,38 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         autoRepairable: false,
       },
       {
+        // How long since a state-changing pass left a recovery point.
+        // The exit is the LISTING verb rather than a command that makes
+        // one: a snapshot is a side effect of dream, upgrade and the
+        // memory import, so "take a snapshot" is not a thing an operator
+        // does, and the listing is what answers the question the finding
+        // raises - when the last recovery point was taken and for what.
+        // Spelled as a literal, not imported from the check that produces
+        // it: importing a `*_CODE` identifier from this module into a
+        // doctor check would make the census follow the import back and
+        // read every registry entry below as a doctor code. Same reason
+        // `recall-channel-silent` is a literal here.
+        code: "recovery-point-stale",
+        issueClass: "newest recovery point older than the liveness window",
+        nextCommand: "o2b brain snapshot log",
+        autoRepairable: false,
+      },
+      {
+        // An announced decommission of the configured embedding model,
+        // inside the warning window. The exit is the curated catalog for
+        // the same reason `search-chunk-window-undeclared` points there:
+        // the act this finding asks for is CHOOSING a replacement model,
+        // and switching models is a config key no verb in this tool
+        // writes. The re-embed that follows the edit is named in the
+        // warning's own prose rather than invented as the command here,
+        // because running it before the key changes would rebuild the
+        // index against the model that is going away.
+        code: "embedding-model-sunset-announced",
+        issueClass: "configured embedding model has an announced decommission date",
+        nextCommand: "o2b search provider presets",
+        autoRepairable: false,
+      },
+      {
         code: "git-history-absent",
         issueClass: "no ingested git history",
         nextCommand: "o2b brain git ingest <repo-path>",

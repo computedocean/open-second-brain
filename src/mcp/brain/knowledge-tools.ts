@@ -25,6 +25,8 @@ import {
   materializeClusterNotes,
 } from "../../core/brain/link-graph/communities.ts";
 import { appendMetric } from "../../core/brain/metrics.ts";
+import { OPERATION } from "../../core/brain/safeguard.ts";
+import type { ProgressSink } from "../../core/brain/progress.ts";
 import { parseFrontmatter } from "../../core/vault.ts";
 import { createTriggers } from "../../core/brain/triggers/store.ts";
 import {
@@ -62,7 +64,7 @@ import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { AGENT_SCOPE_SCHEMA, coerceAgentScope, coerceStr, coerceBool } from "../coerce.ts";
-import { coercePositiveInteger } from "./shared.ts";
+import { coercePositiveInteger, toolSafeguard } from "./shared.ts";
 
 /** Forward-looking projection envelope; read-only fold. */
 function toolBrainForesight(
@@ -93,6 +95,7 @@ function toolBrainForesight(
 async function toolBrainBridges(
   ctx: ServerContext,
   args: Record<string, unknown>,
+  onProgress?: ProgressSink,
 ): Promise<Record<string, unknown>> {
   const op = args["operation"];
   if (op !== "discover" && op !== "list" && op !== "accept" && op !== "dismiss") {
@@ -171,6 +174,8 @@ async function toolBrainBridges(
       ...(max !== undefined ? { maxProposals: max as number } : {}),
       ...(minSimilarity !== undefined ? { minSimilarity } : {}),
       dismissed,
+      safeguard: toolSafeguard(ctx, OPERATION.bridges),
+      ...(onProgress ? { onProgress } : {}),
     });
     writeBridgeProposals(ctx.vault, report, { now });
     try {
@@ -205,6 +210,7 @@ async function toolBrainBridges(
 async function toolBrainClusters(
   ctx: ServerContext,
   args: Record<string, unknown>,
+  onProgress?: ProgressSink,
 ): Promise<Record<string, unknown>> {
   const op = args["operation"];
   if (op !== "run" && op !== "list") {
@@ -249,10 +255,11 @@ async function toolBrainClusters(
   const store = await Store.open(searchConfig, { mode: "read" });
   const now = new Date();
   try {
-    const communities = detectCommunities(
-      store,
-      minSize !== undefined ? { minSize: minSize as number } : {},
-    );
+    const communities = detectCommunities(store, {
+      ...(minSize !== undefined ? { minSize: minSize as number } : {}),
+      safeguard: toolSafeguard(ctx, OPERATION.clusters),
+      ...(onProgress ? { onProgress } : {}),
+    });
     const materialized = materializeClusterNotes(ctx.vault, communities, {
       store,
       now,

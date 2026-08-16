@@ -13,6 +13,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { main } from "../../src/cli/main.ts";
+import { PARTNER_CODEGRAPH_DISABLED_ENV } from "../../src/core/config.ts";
 
 export interface RunResult {
   readonly stdout: string;
@@ -43,6 +44,16 @@ const RUNTIME_OVERRIDABLE_ENV = [
   "OPEN_SECOND_BRAIN_RECALL_GATE_TELEMETRY",
   "OPEN_SECOND_BRAIN_BENCH_JUDGE_CMD",
   "OPEN_SECOND_BRAIN_POST_COMPACT_SURVIVAL_AUDIT",
+  // Search-lane selection. `resolveSearchConfig` reads these straight off
+  // `process.env`, so a developer with semantic search configured ran a
+  // DIFFERENT pipeline than CI - against a remote embedding provider -
+  // and every "deterministic and network-free" claim in the tree was a
+  // property of an unset shell rather than of the code.
+  "OPEN_SECOND_BRAIN_SEARCH_SEMANTIC",
+  "OPEN_SECOND_BRAIN_EMBEDDING_PROVIDER",
+  // The codegraph partner switch, for the same reason and with a default
+  // of its own below.
+  PARTNER_CODEGRAPH_DISABLED_ENV,
 ] as const;
 
 export interface RunCliOptions {
@@ -73,6 +84,17 @@ function resolveEnv(callerEnv: Record<string, string>): {
     if (!(key in callerEnv)) delete env[key];
   }
   Object.assign(env, callerEnv);
+  // `o2b doctor` consults the codegraph partner by spawning a third-party
+  // CLI once per discovered project whenever that binary is on PATH. The
+  // suite runs from this repo, which IS such a project, so the check ran
+  // for real on any developer machine with codegraph installed and did not
+  // run at all on CI, where the binary is absent - the suite's cost and its
+  // dependency on a foreign tool were both properties of the machine. On
+  // this workstation that was 96.0 s for `tests/cli/cli.test.ts` against
+  // 1.1 s with the partner left alone. Tests keep the switch ON by default
+  // and the partner check has its own coverage that calls `doctor()`
+  // directly; a caller that wants the real consultation passes the key.
+  if (!(PARTNER_CODEGRAPH_DISABLED_ENV in env)) env[PARTNER_CODEGRAPH_DISABLED_ENV] = "true";
   let cleanupDir: string | null = null;
   if (!("OPEN_SECOND_BRAIN_CONFIG" in env)) {
     cleanupDir = mkdtempSync(join(tmpdir(), "o2b-test-"));

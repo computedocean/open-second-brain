@@ -134,6 +134,15 @@ function dreamOutputRows(brainRoot: string): string[] {
       const rel = relative(brainRoot, abs).split(sep).join("/");
       if (rel.startsWith(".snapshots/") || rel.startsWith("log/dream-runs/")) continue;
       if (rel === "vault-id.json") continue;
+      // `_brain.yaml` is bootstrap output, not dream output - the pass
+      // reads it and nothing writes the decision back (`dream.ts:194`).
+      // It was inside this digest until a release that added commented
+      // config keys moved the number without touching a single byte the
+      // pass authored, which is a false alarm on a guard whose whole
+      // value is that it never fires falsely. Verified before excluding:
+      // with the config file out, main and this branch produce identical
+      // rows for every other file.
+      if (rel === "_brain.yaml") continue;
       const path = rel.replace(/^log\/(\d{4}-\d{2}-\d{2})\.[0-9a-f]{8}\./, "log/$1.");
       const text = readFileSync(abs, "utf8")
         .replace(/^vault_name: .*$/gm, "vault_name: <name>")
@@ -179,15 +188,15 @@ describe("a rollback keeps what it discards", () => {
     // restore's deletion, which is what makes this recoverable at all.
     expect(out.recoveryPoint.runId.startsWith(BRAIN_SNAPSHOT_REASON.manual)).toBe(true);
     expect(existsSync(out.recoveryPoint.path)).toBe(true);
-    expect(listSnapshots(vault).map((s) => s.run_id)).toContain(out.recoveryPoint.runId);
+    expect(listSnapshots(vault).snapshots.map((s) => s.run_id)).toContain(out.recoveryPoint.runId);
   });
 
   test("the recovery point is taken after extraction, so a corrupt archive mints nothing", () => {
     // Ordering matters: a rollback that cannot read its target must not
     // leave an archive of a tree it never touched.
-    const before = listSnapshots(vault).length;
+    const before = listSnapshots(vault).snapshots.length;
     expect(() => restoreSnapshotWithRecoveryPoint(vault, "manual-absent", { now: NOW })).toThrow();
-    expect(listSnapshots(vault).length).toBe(before);
+    expect(listSnapshots(vault).snapshots.length).toBe(before);
   });
 
   test("a direct restore says it proved nothing rather than staying silent", () => {
@@ -206,10 +215,18 @@ describe("the dream pass runs behind the gate, not beside it", () => {
     // this exact fixture against the tree WITHOUT this unit and pasted
     // here; it then had to keep matching with the unit applied. A
     // recomputed expectation would prove nothing at all.
+    //
+    // Re-measured once, in nothing-runs-unwatched, when `_brain.yaml`
+    // left the row set: the digest had moved because a commented config
+    // key made the bootstrapped template longer, which is not a byte the
+    // pass authored. The replacement literal was taken from `main` with
+    // the same exclusion applied, and this branch reproduces it - so it
+    // is still a number from a tree without the units it guards, not a
+    // number this branch invented about itself.
     seedSignal("tidy");
     dream(vault, { now: NOW, agentName: "tester" });
     expect(dreamOutputDigest(join(vault, "Brain"))).toBe(
-      "6ef6ceba9a49583ab15fef3d9f9889429e7cd82b00ba44cb571f0d7ef81500d8",
+      "1944a3340e6aee531205e0e3042ca957b23cb67a9254d10b649d49a51e504446",
     );
   });
 
@@ -240,7 +257,7 @@ describe("the dream pass runs behind the gate, not beside it", () => {
   test("the archive still carries the dream run id, not a second id of its own", () => {
     seedSignal("tidy");
     const summary = dream(vault, { now: NOW, agentName: "tester" });
-    const ids = listSnapshots(vault).map((s) => s.run_id);
+    const ids = listSnapshots(vault).snapshots.map((s) => s.run_id);
     expect(ids).toContain(summary.run_id);
     // Exactly one archive per run. A gate that minted its own id beside
     // dream's would leave two, and the workrun would name neither.
@@ -262,7 +279,7 @@ describe("the dream pass runs behind the gate, not beside it", () => {
   test("a dry run still takes no snapshot at all", () => {
     seedSignal("tidy");
     dream(vault, { now: NOW, dryRun: true, agentName: "tester" });
-    expect(listSnapshots(vault)).toEqual([]);
+    expect(listSnapshots(vault).snapshots).toEqual([]);
   });
 });
 
@@ -284,7 +301,7 @@ describe("the prune has a floor and says what it did", () => {
     expect(result.refusal).toBe(SNAPSHOT_PRUNE_REFUSAL.belowRetentionFloor);
     expect(result.deleted).toEqual([]);
     // The whole point: the archives are still there.
-    expect(listSnapshots(vault).length).toBe(3);
+    expect(listSnapshots(vault).snapshots.length).toBe(3);
   });
 
   test("the floor is the smallest retention that keeps a way back", () => {

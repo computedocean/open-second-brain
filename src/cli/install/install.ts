@@ -28,13 +28,16 @@
 import { homedir } from "node:os";
 
 import { parseFlags } from "../argparse.ts";
-import { defaultConfigPath, discoverConfig } from "../../core/config.ts";
+import { defaultConfigPath, discoverConfig, resolveVault } from "../../core/config.ts";
 import { defaultRegistry } from "../../core/install/registry.ts";
 // The canonical adapter set registers itself into `defaultRegistry` at
 // module-load time via this barrel (single source of the adapter list).
 import "../../core/install/adapters/all.ts";
 
 import { buildPayload, PayloadError } from "../../core/install/payload.ts";
+import { renderDataOwnership } from "../../core/install/ownership.ts";
+import type { DataOwnership } from "../../core/install/ownership.ts";
+import { measureDataOwnership } from "../../core/install/ownership-measure.ts";
 import { InstallError } from "../../core/install/types.ts";
 import type { ApplyOpts, InstallEnv, VerifyResult } from "../../core/install/types.ts";
 import {
@@ -43,6 +46,7 @@ import {
   renderDetectJson,
   renderDetectTable,
   renderPlan,
+  renderPlanJson,
   renderVerifyJson,
   renderVerifyTable,
 } from "./render.ts";
@@ -110,9 +114,33 @@ function parseInstallArgs(argv: string[]): ParsedInstallArgs {
 
 class UsageError extends Error {}
 
+/**
+ * The vault this verb installs FOR, resolved through the one chain the
+ * rest of the CLI uses.
+ *
+ * `--vault` comes first because it is the operator naming the directory in
+ * the same breath as the command; everything below it is
+ * {@link resolveVault} verbatim - `VAULT_DIR`, the project pointer, the
+ * active profile, then the config `vault` key - so the path written into
+ * an agent's MCP entry is the path every other verb operates on.
+ *
+ * This verb used to carry its own chain (`--vault` then the config key
+ * then `VAULT_DIR`), which put `VAULT_DIR` LAST where the canonical
+ * resolver puts it FIRST and consulted neither pointers nor profiles. On a
+ * machine with both settings the installer wrote one vault into the MCP
+ * config while `o2b status` read another, and nothing reported the split.
+ *
+ * The absent case stays the empty string rather than `null`: every caller
+ * here refuses it by name (`runCheck`, {@link loadPayload}) and an
+ * `InstallEnv.vault` is typed `string`.
+ */
+export function resolveInstallVault(explicitVault: string | null, configPath: string): string {
+  return explicitVault ?? resolveVault(configPath) ?? "";
+}
+
 function buildInstallEnv(args: ParsedInstallArgs): InstallEnv {
   const cfg = discoverConfig(args.config).data;
-  const vault = args.vault ?? cfg["vault"] ?? process.env["VAULT_DIR"] ?? "";
+  const vault = resolveInstallVault(args.vault, args.config);
   const env = { ...process.env } as Record<string, string>;
   if (cfg["agent_name"]) env["VAULT_AGENT_NAME"] = cfg["agent_name"];
   if (cfg["timezone"]) env["VAULT_TIMEZONE"] = cfg["timezone"];
@@ -142,7 +170,12 @@ function buildApplyOpts(
 
 function loadPayload(args: ParsedInstallArgs, env: InstallEnv) {
   const cfg = discoverConfig(args.config).data;
-  const vault = env.vault || cfg["vault"];
+  // `env.vault` is already {@link resolveInstallVault}'s answer, and that
+  // chain ends on the same `vault` config key this used to re-read as a
+  // fallback. Keeping the second read would mean an empty `env.vault`
+  // could still produce a payload built against a key the canonical
+  // resolver had just declined - a third precedence, in one function.
+  const vault = env.vault;
   if (!vault) {
     throw new UsageError(
       "o2b install: vault not configured. Pass --vault <path>, set VAULT_DIR, or run `o2b init`.",
@@ -152,6 +185,31 @@ function loadPayload(args: ParsedInstallArgs, env: InstallEnv) {
     vault,
     agent_name: cfg["agent_name"] ?? process.env["VAULT_AGENT_NAME"] ?? null,
     timezone: cfg["timezone"] ?? process.env["VAULT_TIMEZONE"] ?? null,
+  });
+}
+
+/**
+ * The data-ownership close, for a run that established something.
+ *
+ * Built here rather than inside a renderer so BOTH surfaces consume one
+ * value: the human block and the `data_ownership` JSON field are two views
+ * of this record, which is what stops them being added separately - the
+ * failure mode the install verb already had, where the human `--check`
+ * table is pinned byte-for-byte against the install documents and the JSON
+ * twin was pinned by nothing.
+ *
+ * Every measurement the statement needs is taken by
+ * {@link measureDataOwnership}, which the onboarding checklist calls too -
+ * the two surfaces cannot disagree about where the index landed or which
+ * outbound integrations are configured, because they ask the same
+ * function. This verb supplies only what it alone owns: the resolved vault
+ * and the live adapter registry.
+ */
+function ownershipFor(env: InstallEnv, configPath: string): DataOwnership {
+  return measureDataOwnership({
+    vault: env.vault,
+    configPath,
+    adapterTargets: defaultRegistry.targets(),
   });
 }
 
@@ -224,7 +282,7 @@ function runTarget(args: ParsedInstallArgs): number {
   // Plan-only (no --apply, no --check) — print and return.
   if (!args.apply) {
     if (args.json) {
-      process.stdout.write(JSON.stringify({ schema_version: 1, plan }, null, 2) + "\n");
+      process.stdout.write(renderPlanJson(plan));
     } else {
       process.stdout.write(renderPlan(plan));
     }
@@ -233,10 +291,15 @@ function runTarget(args: ParsedInstallArgs): number {
 
   try {
     const result = adapter.apply(plan, payload, env, opts);
+    // An apply that returned changed the machine, so the close fires
+    // unconditionally here - unlike verify, where exit 0 also covers a
+    // runtime nobody installed.
+    const ownership = ownershipFor(env, args.config);
     if (args.json) {
-      process.stdout.write(renderApplyJson(result));
+      process.stdout.write(renderApplyJson(result, ownership));
     } else {
       process.stdout.write(renderApplyResult(result));
+      process.stdout.write(renderDataOwnership(ownership));
     }
     return INSTALL_EXIT.ok;
   } catch (e) {
@@ -280,10 +343,16 @@ function runCheck(args: ParsedInstallArgs): number {
   }
   const results: VerifyResult[] = [];
   for (const a of targets) results.push(a.verify(env));
+  // Exit 0 is NOT the trigger. `not-installed` is also 0, deliberately -
+  // the operator never asked for that runtime - so a close fired on the
+  // code would be the entire output of a run where the install did
+  // nothing, congratulating an operator on a brain nothing points at.
+  const ownership = results.some((r) => r.status === "ok") ? ownershipFor(env, args.config) : null;
   if (args.json) {
-    process.stdout.write(renderVerifyJson(results));
+    process.stdout.write(renderVerifyJson(results, ownership));
   } else {
     process.stdout.write(renderVerifyTable(results));
+    if (ownership !== null) process.stdout.write(renderDataOwnership(ownership));
   }
   return exitCodeForVerify(results);
 }

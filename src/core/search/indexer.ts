@@ -64,6 +64,12 @@ import { normalizeSchemaToken } from "../brain/schema-vocab.ts";
 import type { DegradationNotice } from "../integrity/degradation.ts";
 import { parseFrontmatterTextWithNotices } from "../vault.ts";
 import { appendMetric } from "../brain/metrics.ts";
+import {
+  OPERATION,
+  progressCounter,
+  withProgressAsync,
+  type ProgressCounter,
+} from "../brain/progress.ts";
 import { throwIfAborted } from "../brain/safeguard.ts";
 import { extractEntities } from "./entities.ts";
 import { compareStamps, formatStampMismatch, type StampMismatch } from "../integrity/stamp.ts";
@@ -121,6 +127,17 @@ export interface IndexVaultOptions {
    * completion, so an aborted run leaves a consistent partial index.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Live progress observer (nothing-runs-unwatched, U1). Distinct from
+   * {@link IndexVaultOptions.onFile}, which reports WHAT happened to each
+   * file for the `--verbose` human stream; this reports HOW FAR the run
+   * has got, in the one shape every long operation here uses.
+   *
+   * The walk phase carries no denominator and cannot: `walkVault` is a
+   * generator, and counting first costs a second full traversal. The
+   * embed phase carries one, because its pending list is an array.
+   */
+  readonly onProgress?: import("../brain/progress.ts").ProgressSink;
 }
 
 /** Site recorded on the frontmatter notices an index run collects. */
@@ -300,8 +317,33 @@ export async function indexVault(
   return indexInto(config, opts);
 }
 
+/**
+ * @param outerProgress The RUN's counter when the caller owns it.
+ * `reindexVault` does, because its run is not over when this build is:
+ * the rebuild only becomes real at the swap. A build reporting into a
+ * borrowed counter must not terminate it - the owner does that, on the
+ * far side of the work this build does not know about.
+ */
 async function indexInto(
   config: ResolvedSearchConfig,
+  opts?: IndexVaultOptions,
+  storeOverride?: Store,
+  outerProgress?: ProgressCounter,
+): Promise<IndexStats> {
+  if (outerProgress !== undefined) {
+    outerProgress.start(INDEX_STAGE.walk);
+    return await indexIntoRun(config, outerProgress, opts, storeOverride);
+  }
+  const progress = progressCounter(OPERATION.reindex, opts?.onProgress);
+  progress.start(INDEX_STAGE.walk);
+  return await withProgressAsync(progress, () =>
+    indexIntoRun(config, progress, opts, storeOverride),
+  );
+}
+
+async function indexIntoRun(
+  config: ResolvedSearchConfig,
+  progress: ProgressCounter,
   opts?: IndexVaultOptions,
   storeOverride?: Store,
 ): Promise<IndexStats> {
@@ -326,6 +368,7 @@ async function indexInto(
       // Per-file document upserts are transactional, so a tripped
       // guard leaves a consistent (partially refreshed) index.
       opts?.safeguard?.checkpoint();
+      progress.advance(INDEX_STAGE.walk);
       // On-demand cancellation, same boundary as the deadline.
       throwIfAborted(opts?.signal, "index");
       // Mark seen FIRST. If anything downstream throws (read fault,
@@ -565,6 +608,7 @@ async function indexInto(
         forceCost: opts?.forceCost === true,
         ...(opts?.safeguard !== undefined ? { safeguard: opts.safeguard } : {}),
         ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
+        progress,
       });
       stats.backend = "semantic";
       stats.deferredReason = null;
@@ -788,6 +832,27 @@ async function formatChunkWindowMeasured(
  * standalone vector backfill without either knowing about the other;
  * `MutableStats` satisfies it structurally.
  */
+/**
+ * The spans an index run has. `walk` cannot carry a denominator -
+ * `walkVault` is a generator and counting first costs a second full
+ * traversal - while `embed` always can, because its pending list is an
+ * array before the loop starts. One event shape carries all of them.
+ *
+ * `lock` and `swap` belong to a REBUILD only, and both exist because a
+ * rebuild is not over when its build is. `lock` covers the wait on
+ * `acquireWriterLock`, which can be the length of a competing reindex and
+ * which used to emit nothing at all - the silence this release calls
+ * indistinguishable from a hang. `swap` covers the two renames that make
+ * the staging build real; before it, the stream reported `finished` while
+ * the live index was still the old one.
+ */
+const INDEX_STAGE = Object.freeze({
+  lock: "lock",
+  walk: "walk",
+  embed: "embed",
+  swap: "swap",
+} as const);
+
 export interface EmbeddingPhaseTally {
   embeddingsComputed: number;
   embeddingsRetries: number;
@@ -798,6 +863,19 @@ export interface EmbeddingPhaseOptions {
   readonly forceCost?: boolean;
   readonly safeguard?: import("../brain/safeguard.ts").Safeguard;
   readonly signal?: AbortSignal;
+  /**
+   * The RUN's progress counter, not a sink of its own.
+   *
+   * This phase is the half of an index run that can report a fraction -
+   * the pending list is an array before the loop starts - but it is a
+   * PHASE, not a run: it is called both from `indexInto` and standalone
+   * by the vector backfill. Given a sink it would build a second counter,
+   * and a stream carrying two terminators cannot say which one ended the
+   * run. So the caller that owns the run owns the counter, and this phase
+   * borrows it. That is why `progress-census.test.ts` carries a written
+   * exemption for this interface rather than a sink.
+   */
+  readonly progress?: import("../brain/progress.ts").ProgressCounter;
 }
 
 /**
@@ -822,6 +900,7 @@ export async function runEmbeddingPhase(
   const forceCost = opts.forceCost === true;
   const safeguard = opts.safeguard;
   const signal = opts.signal;
+  const progress = opts.progress;
   if (!config.semantic.enabled) {
     throw new SearchError(
       "EMBEDDING_DISABLED",
@@ -876,12 +955,14 @@ export async function runEmbeddingPhase(
   // `embedding_concurrency`.
   const superBatch = batchSize * Math.max(1, config.semantic.concurrency);
 
+  progress?.start(INDEX_STAGE.embed, pending.length);
   for (let i = 0; i < pending.length; i += superBatch) {
     // Cooperative deadline: embedding batches are the other long
     // phase of an index run - abort between batches, never mid-batch.
     safeguard?.checkpoint();
     throwIfAborted(signal, "index");
     const batch = pending.slice(i, i + superBatch);
+    progress?.advance(INDEX_STAGE.embed, batch.length);
     const texts = batch.map((p) => p.content);
     const vectors = await provider.embed(texts, "passage");
     stats.embeddingsRetries += provider.consumeRetryCount?.() ?? 0;
@@ -921,10 +1002,35 @@ export async function reindexVault(
   config: ResolvedSearchConfig,
   opts?: IndexVaultOptions,
 ): Promise<IndexStats> {
+  // The rebuild owns the run's counter from before the lock wait to after
+  // the swap, and hands it to the staging build rather than letting that
+  // build open one of its own. Two reasons, and they are the same reason
+  // twice: a rebuild is not finished when its build is. `indexVault`'s
+  // own counter terminated at the end of the build, so a caller tailing
+  // the stream read `finished` while the live index was still the old one
+  // and the rename that makes the rebuild real had not been attempted -
+  // and if that rename then failed (ENOSPC, EPERM, a cross-device
+  // `dbPath`), the command exited non-zero after a terminator that said
+  // the run had finished.
+  const progress = progressCounter(OPERATION.reindex, opts?.onProgress);
+  return await withProgressAsync(progress, () => reindexInto(config, progress, opts));
+}
+
+async function reindexInto(
+  config: ResolvedSearchConfig,
+  progress: ProgressCounter,
+  opts?: IndexVaultOptions,
+): Promise<IndexStats> {
   const newPath = config.dbPath + ".new";
   const bakPath = config.dbPath + ".bak";
 
   mkdirSync(dirname(config.dbPath), { recursive: true });
+
+  // Opened BEFORE the wait, not after it. `acquireWriterLock` can block
+  // for the whole duration of a competing reindex, and a stream that
+  // emits nothing while it does is the state this release names as
+  // indistinguishable from a hang.
+  progress.start(INDEX_STAGE.lock, 1);
 
   // Hold the writer lock on the LIVE index path for the whole rebuild +
   // swap. Keyed on `config.dbPath` (not the `.new` staging path), so a
@@ -935,6 +1041,7 @@ export async function reindexVault(
   // live index (INDEX_UNREADABLE, silent data loss). The staging-DB opens
   // below lock a different path (`.new`), so there is no self-deadlock.
   const release = await acquireWriterLock(config.dbPath);
+  progress.advance(INDEX_STAGE.lock);
   try {
     // Build into the temp file with an override config.
     const tempConfig: ResolvedSearchConfig = Object.freeze({
@@ -966,7 +1073,15 @@ export async function reindexVault(
 
     // `force: false` on resume lets the fastpath skip the files the
     // partial build already committed; a fresh build forces every file.
-    const stats = await indexVault(tempConfig, { ...opts, force: !resume });
+    // `onProgress` is dropped from the forwarded options: the build
+    // reports into THIS run's counter, passed explicitly, rather than
+    // opening a second one over the same sink.
+    const stats = await indexInto(
+      tempConfig,
+      { ...opts, force: !resume, onProgress: undefined },
+      undefined,
+      progress,
+    );
 
     // Clear the marker so the swapped-in live index carries no staging
     // state. Only present when resume was enabled.
@@ -980,9 +1095,11 @@ export async function reindexVault(
     // restoreFromBakIfMissing in store.ts), so it cannot restore the stale
     // `.bak` over the freshly built index; a genuine crash leaves the lock
     // stale and the .bak restore on the next Store.open recovers.
+    progress.start(INDEX_STAGE.swap, 1);
     tryUnlink(bakPath);
     tryRename(config.dbPath, bakPath); // no-op (ENOENT) on fresh reindex
     renameSync(newPath, config.dbPath); // must succeed — `newPath` was just built
+    progress.advance(INDEX_STAGE.swap);
     return stats;
   } finally {
     await release();

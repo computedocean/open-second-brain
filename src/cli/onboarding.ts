@@ -16,6 +16,13 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { discoverConfig } from "../core/config.ts";
+import { defaultRegistry } from "../core/install/registry.ts";
+// The canonical adapter set registers itself on import of this barrel; the
+// ownership statement enumerates the runtime configs those adapters own,
+// so it has to see the same list the installer does.
+import "../core/install/adapters/all.ts";
+import type { DataOwnership } from "../core/install/ownership.ts";
+import { measureDataOwnership } from "../core/install/ownership-measure.ts";
 import { resolveSearchConfig } from "../core/search/index.ts";
 import {
   collectRuntimeNotices,
@@ -40,6 +47,22 @@ export interface OnboardingChecklist {
   readonly notices: ReadonlyArray<RuntimeNotice>;
   /** True when every required (non-optional) step is satisfied. */
   readonly complete: boolean;
+  /**
+   * What the operator owns and where it is, as a structured record.
+   *
+   * It rides HERE because this checklist is the one machine-readable
+   * next-action surface that already serialises whole (`o2b onboarding
+   * --json`), and an agent deciding what to do next is exactly the reader
+   * who needs to know that the vault is the artifact and what does not
+   * travel inside it.
+   *
+   * Deliberately NOT rendered into the human checklist: the prose form is
+   * the close `o2b install --apply` and a passing `o2b install --check`
+   * print, and repeating it on every `o2b init` would turn a statement
+   * into noise. Both surfaces read this same record, so neither can gain
+   * a field the other lacks.
+   */
+  readonly data_ownership: DataOwnership;
 }
 
 export interface OnboardingOptions {
@@ -168,7 +191,17 @@ export function buildOnboardingChecklist(
     ...(opts.env !== undefined ? { env: opts.env } : {}),
   });
 
-  return { vault, steps, notices, complete };
+  // Measured by the same function the install verb's close calls, so the
+  // two surfaces cannot answer differently about where the search index
+  // landed or which outbound integrations are configured. This checklist
+  // supplies only the vault and the live adapter registry.
+  const data_ownership = measureDataOwnership({
+    vault,
+    ...(opts.configPath === undefined ? {} : { configPath: opts.configPath }),
+    adapterTargets: defaultRegistry.targets(),
+  });
+
+  return { vault, steps, notices, complete, data_ownership };
 }
 
 /** Render the checklist as a human-readable block for the CLI. */

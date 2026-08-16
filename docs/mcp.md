@@ -48,6 +48,100 @@ schemas are out of scope for that audit - their vocabulary declares
 union-typed fields with no `type` on purpose, and responses are validated
 against them at request time instead.
 
+### Progress notifications
+
+A client asks for liveness on a long call by putting a token on the
+request, `params._meta.progressToken`. Per the specification the token is
+a string or an integer; anything else — a boolean, `null`, an object, a
+fractional number — is refused with `-32602` naming what arrived, rather
+than coerced into a value the client could not match back to its request.
+A request with no `_meta`, or a `_meta` carrying other members but no
+`progressToken`, asks for nothing and is answered exactly as before.
+
+**What each transport does with the token:**
+
+| Transport | With a token | With no token |
+|---|---|---|
+| stdio | Emits `notifications/progress` frames as the operation runs, all of them ahead of the response frame | No notification frames at all |
+| HTTP | Answers the call normally and carries a typed refusal on `result._meta` | No `_meta` on the result |
+
+stdio owns a duplex newline-delimited stream, so it can write a frame
+nobody asked for. Each frame carries the spec's own `progressToken`,
+`progress` and (when the operation knows a denominator) `total`, so a
+client that knows nothing about Open Second Brain still renders a bar.
+The typed event travels beside them under
+`params._meta["open-second-brain/progress"]`: `schema`, `operation`,
+`kind`, `stage`, `completed`, optional `total` and `reason`. `stage` is
+an identifier from the emitting operation's own vocabulary, never a
+sentence — the sentence is rendered at the edge.
+
+The HTTP transport answers one request with one response and closes it
+(see "Run from the CLI" below), so it cannot carry a notification at all.
+Accepting the token and silently dropping the events would advertise
+liveness support that does not exist, so the response carries a refusal
+instead:
+
+```json
+{
+  "result": {
+    "content": [ ... ],
+    "structuredContent": { ... },
+    "isError": false,
+    "_meta": {
+      "open-second-brain/progress": {
+        "schema": "o2b.progress.v1",
+        "kind": "refused",
+        "reason": "transport-single-response",
+        "progressToken": "tok-42"
+      }
+    }
+  }
+}
+```
+
+It rides on `_meta` — MCP's reserved place for implementation metadata,
+and the reciprocal of where the request carried the token — because the
+two alternatives corrupt a payload a caller parses: `structuredContent`
+is validated against the tool's `outputSchema`, and `content[0].text` is
+that same payload rendered. The refusal is visible to a client that asked
+for progress and entirely absent for one that did not.
+
+**Which tools report.** The MCP surface that can genuinely run for
+minutes is `brain_dream`, `brain_bridges`, `brain_clusters` and
+`brain_maintenance`. Index management verbs (`index`, `reindex`,
+`check`) are deliberately not exposed over MCP, so they are not on this
+list. `brain_maintenance` is a dispatcher over the other four
+operations and forwards the sink to each task, so its events name the
+task that emitted them (`dream`, `reindex`, `bridges`, `clusters`) rather
+than the lane. Two more reach a consolidation pass without carrying its
+name and report on the same terms: `brain_brief` with `view: "operator"`,
+whose operator summary runs a dry-run pass, and
+`brain_review_candidates`, whose projection is that same dry run
+reshaped.
+
+**Which tools are bounded.** Every call that reaches one of those long
+operations runs under a cooperative deadline resolved from
+`safeguard_timeout_<operation>_seconds`, then `safeguard_timeout_seconds`,
+then the built-in default. Bounded and observed are the same population,
+with one stated exception — the row below marked **none**:
+
+| tool | long operation it reaches | deadline | reports |
+| --- | --- | --- | --- |
+| `brain_dream` (`run`) | `dream`, twice when `expect`/`strict` asks for a guard preview | `dream` — one budget for the whole call, preview included | yes |
+| `brain_dream` (`stage`/`validate`/`apply`) | `dream`, through the staged bundle | `dream` | yes |
+| `brain_dream` (`step`) | one step (`scan` or `heal-enrich`), not a pass | **none** — the step functions take no guard | no |
+| `brain_bridges` (`discover`) | `bridges` | `bridges` | yes |
+| `brain_clusters` (`run`) | `clusters` | `clusters` | yes |
+| `brain_maintenance` (`run`) | all four, sequentially | one fresh guard per task; a tripped task is a `timed_out` row, not an aborted call | yes, in its tasks' voices |
+| `brain_brief` (`view: "operator"`) | `dream`, dry run | `dream` | yes |
+| `brain_review_candidates` | `dream`, dry run | `dream` | yes |
+
+The deadline is cooperative, not preemptive: `dream()` and the graph
+sweeps are synchronous, so nothing can interrupt them from outside — past
+the deadline the operation's next checkpoint throws, at a boundary where
+writes are already atomic. Setting `safeguard_timeout_dream_seconds: 0`
+disables the deadline for every row above whose budget is `dream`.
+
 ## Tool Highlights
 
 The full server currently advertises 110 tools; the 18 deprecated predecessor
@@ -288,7 +382,9 @@ to start without `--api-key`, checks the key on every request using a generic
 constant-time comparison, and returns the same `401 Unauthorized` body for a
 missing or wrong key. JSON responses are the default; clients that send
 `Accept: text/event-stream` receive a single SSE `message` event for the same
-JSON-RPC response.
+JSON-RPC response — one event, then the connection closes, which is why a
+progress token sent over HTTP is refused by name rather than honoured (see
+"Progress notifications" above).
 
 ## Runtime capability window
 
