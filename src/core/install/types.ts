@@ -10,6 +10,12 @@
  * field semantics.
  */
 
+import type {
+  InstallTargetId,
+  ResolvedSessionRoot,
+  SessionRuntimeId,
+} from "../runtime/host-facts.ts";
+
 // ---------- Constant sets (runtime checkable) ----------
 
 export const ADAPTER_STATUSES = new Set([
@@ -130,21 +136,58 @@ export interface VerifyResult {
   readonly fix_hint: string | null;
 }
 
+/**
+ * Where one runtime keeps its session logs on the host `env` describes.
+ *
+ * The `format` this used to carry was a four-member union
+ * (`"claude-jsonl" | "codex-json" | "cursor-sqlite" | "unknown"`) that was
+ * the only occurrence of those literals anywhere in the tree and named
+ * none of the adapters `src/core/brain/sessions/` ships. It could not be
+ * joined to anything, which is what a union with no implementations and
+ * no call sites always turns out to mean. Each root now carries a real
+ * {@link SessionAdapterId} - or `null` beside a NAMED non-session format,
+ * for a store like Cursor's `state.vscdb` that this build can find and
+ * cannot parse.
+ */
 export interface SessionPathsResult {
-  readonly target: string;
-  readonly paths: ReadonlyArray<string>;
-  readonly format: "claude-jsonl" | "codex-json" | "cursor-sqlite" | "unknown";
+  readonly target: InstallTargetId;
+  /** Which {@link SESSION_ROOTS} entry these roots are. */
+  readonly runtime: SessionRuntimeId;
+  /** The declared roots, resolved against `env`, in declared order. */
+  readonly roots: ReadonlyArray<ResolvedSessionRoot>;
 }
 
 export interface InstallAdapter {
-  readonly target: string;
+  /**
+   * Which runtime this adapter installs into.
+   *
+   * A member of the closed {@link InstallTargetId} vocabulary rather than
+   * a bare string: the id is carried through the manifest, the ownership
+   * statement and the `--target` argument, and until this was typed the
+   * only thing standing between a typo and all three was a registry
+   * lookup that misses at the very end of that journey.
+   * `tests/core/architecture/host-facts-census.test.ts` holds the
+   * vocabulary and the registered population equal in both directions.
+   */
+  readonly target: InstallTargetId;
   readonly label: string;
   detect(env: InstallEnv): DetectResult;
   plan(payload: McpPayload, env: InstallEnv): InstallPlan;
   apply(plan: InstallPlan, payload: McpPayload, env: InstallEnv, opts: ApplyOpts): ApplyResult;
   uninstall(env: InstallEnv, opts: ApplyOpts & { fromSnippet?: boolean }): UninstallResult;
   verify(env: InstallEnv): VerifyResult;
-  sessionPaths?(env: InstallEnv): SessionPathsResult | null;
+  /**
+   * Where this runtime keeps its session logs, or `null` when it keeps
+   * none.
+   *
+   * REQUIRED, and that is the whole point of it. As an optional member it
+   * had zero implementations and zero call sites for four releases, and
+   * an absent member cannot be told apart from a runtime with nothing to
+   * say. `null` is the stated answer for `generic`, `aider` and `pi`;
+   * every implementation reads {@link SESSION_ROOTS} through
+   * `sessionPathsFor` rather than knowing its own paths.
+   */
+  sessionPaths(env: InstallEnv): SessionPathsResult | null;
 }
 
 // ---------- Errors ----------

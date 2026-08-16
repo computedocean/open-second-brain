@@ -21,8 +21,8 @@
  * the same with `new Date()`.
  */
 
-import { readFileSync } from "node:fs";
-
+import { readLines } from "./read-lines.ts";
+import { SESSION_TIMESTAMP_UNKNOWN } from "./types.ts";
 import type { SessionAdapter, SessionToolCall, SessionTurn } from "./types.ts";
 
 interface HermesToolCall {
@@ -60,7 +60,7 @@ function buildTurn(obj: Record<string, unknown>, fallbackIndex: number): Session
   const timestamp =
     typeof obj["timestamp"] === "string" && obj["timestamp"].length > 0
       ? (obj["timestamp"] as string)
-      : new Date(0).toISOString();
+      : SESSION_TIMESTAMP_UNKNOWN;
 
   const text =
     typeof obj["content"] === "string" && obj["content"].length > 0
@@ -113,9 +113,8 @@ export const hermesAdapter: SessionAdapter = {
     return Array.isArray(o["tools"]);
   },
   async *iterate(path: string): AsyncIterable<SessionTurn> {
-    const text = readFileSync(path, "utf8");
     let i = 0;
-    for (const line of text.split("\n")) {
+    for await (const line of readLines(path)) {
       i++;
       const trimmed = line.trim();
       if (trimmed === "") continue;

@@ -19,6 +19,7 @@ import {
   setConfigValue,
   validateTimezoneName,
 } from "../core/config.ts";
+import { BrainConfigError } from "../core/brain/policy/errors.ts";
 import { EGRESS_OUTCOME, redactForEgress } from "../core/egress/guard.ts";
 import { listSecretReferences } from "../core/secret-ref.ts";
 import { BRAIN_INDEX_REL } from "../core/brain/paths.ts";
@@ -34,6 +35,8 @@ import { handleBrainSubcommand } from "./brain.ts";
 import { handleDisciplineSubcommand } from "./discipline.ts";
 import { handlePartnerSubcommand } from "./partner.ts";
 import { handleSearchSubcommand } from "./search.ts";
+import { handleStateSubcommand } from "./state.ts";
+import { installMcpSignalDrain, type McpSignalDrainHandle } from "./mcp-drain.ts";
 import { handleVaultSubcommand } from "./vault.ts";
 import {
   NoVaultConfiguredError,
@@ -71,6 +74,11 @@ import { buildToolTable } from "../mcp/tools.ts";
 import { evaluateToolCapabilities, type RuntimeCapabilityWindow } from "../mcp/capabilities.ts";
 import { resolveToolSurface, toolSurfaceProfileNames } from "../mcp/profiles.ts";
 import { TOOL_SCOPE, TOOL_SCOPES, isToolScope, type ToolScope } from "../mcp/tool-contract.ts";
+import {
+  INSTALL_TARGET_IDS,
+  isInstallTargetId,
+  type InstallTargetId,
+} from "../core/runtime/host-facts.ts";
 
 // ── Subcommands ─────────────────────────────────────────────────────────────
 
@@ -601,6 +609,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
     scope: { type: "string" },
     "writer-only": { type: "boolean" },
     "tool-profile": { type: "string" },
+    "host-target": { type: "string" },
     probe: { type: "boolean" },
     json: { type: "boolean" },
     transport: { type: "string", default: "stdio" },
@@ -630,6 +639,22 @@ async function cmdMcp(argv: string[]): Promise<number> {
     process.stderr.write(`o2b mcp: --writer-only conflicts with --scope ${explicitScope}\n`);
     return 2;
   }
+
+  // Which runtime launched this server. Written into the generated
+  // registration by the install adapter, and read back only by the
+  // capability report, which cites that host's published tool ceiling.
+  // An unrecognised value is refused rather than dropped: silently
+  // ignoring it would report the ceiling as unchecked on a host that
+  // publishes one, which is the exact silence this flag exists to end.
+  const hostTargetFlag = flags["host-target"] as string | undefined;
+  if (hostTargetFlag !== undefined && !isInstallTargetId(hostTargetFlag)) {
+    process.stderr.write(
+      `o2b mcp: invalid --host-target value: ${hostTargetFlag}; ` +
+        `expected one of: ${INSTALL_TARGET_IDS.join(", ")}\n`,
+    );
+    return 2;
+  }
+  const hostTarget = hostTargetFlag as InstallTargetId | undefined;
 
   const config = (flags["config"] as string | undefined) ?? defaultConfigPath();
   const transport = flags["transport"] as string;
@@ -685,6 +710,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
       serverName,
       json: Boolean(flags["json"]),
       capabilityWindow,
+      hostTarget,
     });
   }
 
@@ -706,7 +732,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
     const handle = await startHttp(
       { vault, configPath: config, repoRoot },
       { host, port, apiKey },
-      { scope, serverName, capabilityWindow },
+      { scope, serverName, capabilityWindow, hostTarget },
     );
     // Log the actually-bound endpoint. With the default --port 0 the OS
     // assigns an ephemeral port, so the requested `port` value ("0") would
@@ -714,20 +740,43 @@ async function cmdMcp(argv: string[]): Promise<number> {
     process.stderr.write(
       `[mcp] ${serverName} ${SERVER_VERSION} listening on ${handle.url} (vault=${vault})\n`,
     );
-    // `closed` rather than `resolve`: this module imports `resolve` from
-    // `node:path`, and shadowing it here hid that import inside the closure.
-    await new Promise<void>((closed) => handle.server.once("close", closed));
-    return 0;
+    // A served transport outlives every other verb in this CLI, so it is
+    // the one place a shutdown signal has work to do: stop accepting,
+    // finish what is running, then let the registered `exit` hooks
+    // checkpoint the index and release the locks. Released in a `finally`
+    // because the listeners are process-global.
+    const signals = installMcpSignalDrain({ close: () => handle.close() });
+    try {
+      // `closed` rather than `resolve`: this module imports `resolve` from
+      // `node:path`, and shadowing it here hid that import inside the closure.
+      await new Promise<void>((closed) => handle.server.once("close", closed));
+    } finally {
+      signals.release();
+    }
+    return signals.exitCode() ?? 0;
   }
 
   process.stderr.write(
     `[mcp] ${serverName} ${SERVER_VERSION} listening on stdio (vault=${vault})\n`,
   );
-  return await serveStdio(
-    { vault, configPath: config, repoRoot },
-    {},
-    { scope, serverName, capabilityWindow },
-  );
+  // A holder rather than a `let`, because the assignment happens inside a
+  // callback: the compiler cannot see that it ran and would narrow a bare
+  // binding to `null` at both reads below.
+  const stdio: { signals: McpSignalDrainHandle | null } = { signals: null };
+  try {
+    const code = await serveStdio(
+      { vault, configPath: config, repoRoot },
+      {
+        onStart: (transport) => {
+          stdio.signals = installMcpSignalDrain({ close: () => transport.close() });
+        },
+      },
+      { scope, serverName, capabilityWindow, hostTarget },
+    );
+    return stdio.signals?.exitCode() ?? code;
+  } finally {
+    stdio.signals?.release();
+  }
 }
 
 function parseCapabilityWindow(
@@ -759,6 +808,7 @@ async function runMcpProbe(args: {
   serverName: string;
   json: boolean;
   capabilityWindow: RuntimeCapabilityWindow | undefined;
+  hostTarget: InstallTargetId | undefined;
 }): Promise<number> {
   // The probe is an in-process MCP handshake: it counts the tools the
   // server would advertise and exits. Used by `o2b install --check`
@@ -775,6 +825,7 @@ async function runMcpProbe(args: {
       scope: args.scope,
       serverName: args.serverName,
       window: args.capabilityWindow,
+      hostTarget: args.hostTarget,
     });
     if (args.json) {
       process.stdout.write(
@@ -998,6 +1049,8 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
         return await handleDisciplineSubcommand(rest);
       case "search":
         return await handleSearchSubcommand(rest);
+      case "state":
+        return await handleStateSubcommand(rest);
       case "vault":
         return await handleVaultSubcommand(rest);
       case "partner":
@@ -1018,6 +1071,21 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
     }
     if (exc instanceof ConfigReadError) {
       return reportConfigReadError(exc, command, rest);
+    }
+    if (exc instanceof BrainConfigError) {
+      // Joins `NoVaultConfiguredError` on exit 1 for the reason stated at
+      // {@link reportConfigReadError}: nothing is wrong with the argv, the
+      // machine cannot answer. The message already names the file and the
+      // field, because {@link BrainConfigError} composes both.
+      //
+      // Reached from `o2b install` and `o2b update`, where the settings
+      // ladder reads `<vault>/Brain/_brain.yaml` and REFUSES an unreadable
+      // one rather than regenerating a default the operator never chose.
+      // The refusal is right; printing it as a stack trace was not, and it
+      // took every other target's status down with it - `detectAll` walks
+      // ten adapters and one of them reads that file.
+      process.stderr.write(`error: ${exc.message}\n`);
+      return 1;
     }
     throw exc;
   }

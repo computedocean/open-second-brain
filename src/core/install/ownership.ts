@@ -290,6 +290,22 @@ export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Ma
       "backing verdict and the measurements as parameters and returns text",
   ],
   [
+    "src/core/install/settings.ts",
+    "the only out-of-vault path it builds is the machine-local config.yaml already enumerated " +
+      "by the machine_config row, and it builds that path only to READ the third tier of the " +
+      "install-settings ladder. It resolves the location from the adapter's own InstallEnv " +
+      "rather than from process.env so apply and verify reconstruct from the same inputs; it " +
+      "creates no file and removes none",
+  ],
+  [
+    "src/core/install/host-probe.ts",
+    "it builds no path at all: the only home it touches is `InstallEnv.home`, copied into the " +
+      "environment of a read-only `<host> mcp list` subprocess so the host answers about the " +
+      "machine being verified rather than the ambient one. The probe starts no model turn, needs " +
+      "no key, writes nothing, and whatever the host reads under that home belongs to the " +
+      "runtime_config_blocks row the adapters already declare",
+  ],
+  [
     "src/cli/install/install.ts",
     "the only out-of-vault path it builds is `InstallEnv.home`, which it hands to the adapters; " +
       "every file written from it belongs to the runtime_config_blocks row, and this verb writes " +
@@ -348,6 +364,41 @@ export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Ma
     "a read-only transcript scanner: it locates the runtime's own session logs and workspace " +
       "state under the home directory and reads them. The runtime wrote those files and owns " +
       "them; this module creates nothing and deletes nothing there",
+  ],
+  [
+    "src/cli/brain/verbs/export.ts",
+    "the transcript export streams each redacted record to a spool as it is produced rather " +
+      "than building the corpus in memory, and the spool sits beside --out so the finish is a " +
+      "rename on one filesystem; only when the operator named no destination does it fall back " +
+      "to the temp directory, and either way the file is renamed into place or unlinked before " +
+      "the command returns. Nothing durable is left outside the vault",
+  ],
+  [
+    "src/core/state/migrate.ts",
+    "it reads the home directory once, as a REFUSAL: a destination equal to $HOME itself is " +
+      "rejected, because state scattered across a home directory stops being one tree an " +
+      "operator can move, back up or delete as a unit. It never builds a path under the home " +
+      "directory, and every location it does move comes from the declared state-surface " +
+      "inventory, whose rows are enumerated in their own census",
+  ],
+  [
+    "src/core/runtime/host-facts.ts",
+    "it DECLARES where each agent runtime keeps its own session logs, as pure functions of an " +
+      "injected home and environment. The runtimes wrote those files and own them; this module " +
+      "opens nothing, writes nothing, and resolves no path until a caller hands it a machine",
+  ],
+  [
+    "src/core/install/session-paths.ts",
+    "it answers `InstallAdapter.sessionPaths` by resolving the session roots `host-facts.ts` " +
+      "declares against the home and environment already carried on `InstallEnv`. The agent " +
+      "runtimes wrote those logs and own them; this module opens nothing and writes nothing",
+  ],
+  [
+    "src/core/brain/sessions/discover.ts",
+    "it READS the declared session roots of every agent runtime on this machine to hash what it " +
+      "finds. The only thing it writes is the import ledger, which lives inside the vault under " +
+      "the derived store and is enrolled as a row in the state-surface inventory; nothing it " +
+      "creates is left outside the vault",
   ],
   [
     "src/core/brain/gates/durability.ts",

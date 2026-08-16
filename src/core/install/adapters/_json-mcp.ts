@@ -20,8 +20,11 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
+import type { InstallTargetId } from "../../runtime/host-facts.ts";
+import { handshakeNote, probeHost, probeRefutedVerdict, probeRefutes } from "../host-probe.ts";
 import { payloadWithRuntimeIdentity } from "../identity.ts";
 import { mergeMcpServers, removeMcpServers, OSB_KEY_FULL, OSB_KEY_WRITER } from "../json-merge.ts";
+import { payloadForHost } from "../payload-host.ts";
 import { recordEntry, readManifest, removeEntry } from "../manifest.ts";
 import { deepJsonEquals, expectedPayloadFromEnv, payloadKeyEquals } from "../payload-equals.ts";
 import {
@@ -35,20 +38,15 @@ import {
   type ManifestEntry,
   type McpPayload,
   type McpServerEntry,
+  type SessionPathsResult,
   type UninstallResult,
   type VerifyResult,
 } from "../types.ts";
-
-/**
- * Stated on every clean `verify` so an `ok` cannot be read as "the
- * runtime answered". One constant, because the sentence is a property of
- * this adapter body and every target that reuses it must say it the same
- * way.
- */
-const NO_HANDSHAKE_NOTE = "configuration comparison; no MCP handshake attempted";
+import { sessionPathsFor } from "../session-paths.ts";
 
 export interface JsonMcpAdapterSpec {
-  readonly target: string;
+  /** The runtime this spec installs into; becomes `InstallAdapter.target`. */
+  readonly target: InstallTargetId;
   readonly label: string;
   /** Top-level key under which MCP servers live. Default `mcpServers`. */
   readonly topLevelKey?: string;
@@ -89,6 +87,36 @@ export interface JsonMcpAdapterSpec {
 /** Apply the runtime-identity rule to the payload when the spec opted in. */
 function identifyPayload(spec: JsonMcpAdapterSpec, payload: McpPayload): McpPayload {
   return spec.runtimeIdentity ? payloadWithRuntimeIdentity(payload, spec.target) : payload;
+}
+
+/**
+ * The payload as this target's config file must hold it: the host's own
+ * dimensions (tool profile, host id) then the runtime-identity rule.
+ *
+ * Both transforms are pure functions of the spec and the `InstallEnv`,
+ * and every path that touches the file - plan, apply, verify - goes
+ * through this one function. That is what keeps re-construction honest:
+ * a transform applied on apply but not on verify would report drift
+ * against bytes this adapter had just written itself.
+ */
+function payloadForSpec(
+  spec: JsonMcpAdapterSpec,
+  payload: McpPayload,
+  env: InstallEnv,
+): McpPayload {
+  return identifyPayload(spec, payloadForHost(spec.target, payload, env));
+}
+
+/**
+ * The same composition as {@link payloadForSpec}, rebuilt from the
+ * `InstallEnv` alone - the verify side of re-construction. It exists so
+ * the two sides cannot be assembled in different orders by accident:
+ * `verify` once applied the identity rule and not the host rule, which
+ * made every runtime-identity adapter report drift against the file it
+ * had just written.
+ */
+function expectedPayloadForSpec(spec: JsonMcpAdapterSpec, env: InstallEnv): McpPayload {
+  return identifyPayload(spec, expectedPayloadFromEnv(env, spec.target));
 }
 
 function readFileOrEmpty(path: string): string {
@@ -265,8 +293,13 @@ export function createJsonMcpAdapter(spec: JsonMcpAdapterSpec): InstallAdapter {
       };
     },
 
-    plan(payload: McpPayload, env: InstallEnv): InstallPlan {
+    plan(rawPayload: McpPayload, env: InstallEnv): InstallPlan {
       const path = spec.resolveConfigPath(env);
+      // The PREVIEW prints the args that will actually be written, not
+      // the un-transformed canonical ones: a plan whose command line
+      // differs from the applied one is a plan the operator cannot use
+      // to review the change.
+      const payload = payloadForSpec(spec, rawPayload, env);
       const preview =
         `json-merge two keys into ${topKey} at ${path}: ` +
         `${OSB_KEY_FULL} → ${payload.full.command} ${payload.full.args.join(" ")}; ` +
@@ -285,7 +318,7 @@ export function createJsonMcpAdapter(spec: JsonMcpAdapterSpec): InstallAdapter {
       opts: ApplyOpts,
     ): ApplyResult {
       const path = spec.resolveConfigPath(env);
-      const payload = identifyPayload(spec, rawPayload);
+      const payload = payloadForSpec(spec, rawPayload, env);
       const onDisk = readOnDisk(spec, env, payload);
       const manifestEntry = readManifest(env.vault).installs[spec.target];
 
@@ -384,6 +417,15 @@ export function createJsonMcpAdapter(spec: JsonMcpAdapterSpec): InstallAdapter {
       return { target: spec.target, removed_keys, removed_paths, skipped };
     },
 
+    /**
+     * Read off `RUNTIME_FACTS`, not off the spec. Every JSON-MCP host's
+     * session store is already declared there, and a `sessionRoots` field
+     * on {@link JsonMcpAdapterSpec} would be a second place to spell it.
+     */
+    sessionPaths(env: InstallEnv): SessionPathsResult | null {
+      return sessionPathsFor(spec.target, env);
+    },
+
     verify(env: InstallEnv): VerifyResult {
       const path = spec.resolveConfigPath(env);
       const stored = readManifest(env.vault).installs[spec.target];
@@ -434,7 +476,7 @@ export function createJsonMcpAdapter(spec: JsonMcpAdapterSpec): InstallAdapter {
           fix_hint: spec.fixHintForDrift ?? `o2b install --target ${spec.target} --apply`,
         };
       }
-      const expected = identifyPayload(spec, expectedPayloadFromEnv(env));
+      const expected = expectedPayloadForSpec(spec, env);
       const equals = resolveEntryEquals(spec);
       if (
         !equals(block[OSB_KEY_FULL] as Record<string, unknown> | undefined, expected.full) ||
@@ -447,24 +489,37 @@ export function createJsonMcpAdapter(spec: JsonMcpAdapterSpec): InstallAdapter {
           fix_hint: spec.fixHintForDrift ?? `o2b install --target ${spec.target} --apply`,
         };
       }
-      // The `ok` below is a CONFIGURATION comparison and nothing more, and
-      // it now says so. This is where an optional `probeMcp(env)` seam used
-      // to sit: declared on the spec, called here, and implemented by zero
-      // adapters in the tree, so every JSON-MCP runtime reported `ok` on the
-      // strength of two matching JSON keys while the branch that could have
-      // said otherwise was unreachable. The seam is deleted rather than
-      // implemented because implementing it here would mean this process
-      // spawning each runtime's MCP server to speak a handshake to itself,
-      // which proves that WE can run `o2b`, not that Cursor or Gemini CLI
-      // loaded the entry - and no caller wanted that answer today. Liveness
-      // stays reachable where a runtime genuinely exposes it: `copilot-cli`
-      // asks `copilot mcp list` and returns `mcp-unreachable` from a real
-      // failure. An operator reading this verdict is owed the distinction,
-      // so the detail carries it instead of a bare "both OSB keys present".
+      // The config matches. What that is EVIDENCE of depends on the host,
+      // and the fact table is what decides: a target whose `RUNTIME_FACTS`
+      // row declares a `hostProbe` gets asked, and the answer - or the
+      // named reason there is none - replaces the blanket note. Nothing in
+      // this body spawns a runtime's own MCP server to speak a handshake
+      // to itself: that would prove WE can run `o2b`, not that Cursor
+      // loaded the entry. It asks the host's own CLI what it has
+      // registered, which is the only question a host can answer about
+      // itself, and no row in this body's population declares one today -
+      // so they keep the blanket note, and keep it honestly.
+      const probe = probeHost(spec.target, env);
+      if (probeRefutes(probe)) {
+        // The file was just compared and matches, so the shared rule reads
+        // this as a host that has not reloaded it - never as a lost
+        // registration.
+        const verdict = probeRefutedVerdict({
+          target: spec.target,
+          label: spec.label,
+          artifactMatches: true,
+        });
+        return {
+          target: spec.target,
+          status: verdict.status,
+          details: [`${path}: matches the canonical payload, but ${handshakeNote(probe)}`],
+          fix_hint: verdict.fixHint,
+        };
+      }
       return {
         target: spec.target,
         status: "ok",
-        details: [`${path}: both OSB keys match the canonical payload (${NO_HANDSHAKE_NOTE})`],
+        details: [`${path}: both OSB keys match the canonical payload (${handshakeNote(probe)})`],
         fix_hint: null,
       };
     },

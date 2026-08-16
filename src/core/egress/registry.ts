@@ -141,15 +141,32 @@ export const EGRESS_SITES = Object.freeze({
       "full, because the `<private>` region marker is this product's only content-derived " +
       "privacy primitive and these composers are content composers, not visibility filters.",
   },
-  "brain-preference-export": {
-    id: "brain-preference-export",
+  "brain-export": {
+    id: "brain-export",
     verb: "o2b brain export",
     module: "src/cli/brain/verbs/export.ts",
     redaction: R.sharedRedactor,
     reason:
       "preference principles are free text an agent wrote, and the llms-txt form is " +
       "meant to be pasted into a foreign prompt - the destination least likely to be " +
-      "read before it is shared.",
+      "read before it is shared. One entry covers all three of the verb's formats " +
+      "because the census keys on the MODULE and the destination is declared once, in " +
+      "the verb: the JSON and transcript forms are redacted as TREES and serialised " +
+      "afterwards, llms-txt as text. What proves each branch scans is a per-handler " +
+      "check in the census, not the guard-call count - counting guards against " +
+      "DESTINATIONS is an inequality, and this module declares one destination against " +
+      "three guards, so a fourth handler that scanned nothing would satisfy it. The " +
+      "transcript form is the widest of the three by far - whole recorded " +
+      "conversations with whichever runtime wrote them, which is where a key pasted " +
+      "into a prompt actually lives. Its records are guarded ONE AT A TIME, so a " +
+      "single oversized turn cannot put a machine's whole corpus past the scan window, " +
+      "and a refusal names the conversation rather than the run - by its basename, " +
+      "except when the basename is itself the secret-shaped identifier, where it is " +
+      "named by runtime and start instant instead. The transcript branch is also the " +
+      "one caller that passes `foreignIdentifiers`, because its `session_id` and " +
+      "`turn_id` were named by the harness that wrote the transcript rather than by " +
+      "this vault, so the guard's vendor-prefix-only rule for identifiers - an " +
+      "argument about ids this build constructs - does not cover them.",
   },
   "config-export": {
     id: "config-export",

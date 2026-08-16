@@ -52,7 +52,15 @@ import {
 import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { emitNextStep } from "../../advisory-rail.ts";
 import { attachProgress, reportProgressRefusal } from "../../progress-rail.ts";
-import { brainVerbContext, fail, ok, okJson, parse, parseOptionalIsoDate } from "../helpers.ts";
+import {
+  brainVerbContext,
+  describeErrorChain,
+  fail,
+  ok,
+  okJson,
+  parse,
+  parseOptionalIsoDate,
+} from "../helpers.ts";
 
 // The runnable set is read from the step registry, never retyped: a
 // usage line that advertises a step the pass refuses is its own dead end.
@@ -216,9 +224,28 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     });
 
   if (wantsStep) {
+    // A step is a whole run on this surface, so it is guarded and
+    // watched like one: `scan` walks the Brain tree and `heal-enrich`
+    // reads and rewrites every user page, and neither had a deadline or
+    // a sink before. The step itself owns the counter - the two units
+    // report under their own stage names - so this attaches the rail and
+    // forwards, exactly as the maintenance lane does over its tasks.
+    const stepObservation =
+      flags["progress"] === true
+        ? // The rail is told what was actually dispatched, not a label
+          // for it: `brain.ts` hands this verb the tail AFTER `dream`, and
+          // `["dream", "step"]` named a positional this verb has never had
+          // - `--step` is a flag. The two sibling call sites below pass
+          // the real action for the same reason.
+          attachProgress({ command: "brain", argv: ["dream", ...argv], jsonRequested: asJson })
+        : null;
+    reportProgressRefusal(stepObservation);
     let result: DreamStepResult;
     try {
-      result = runDreamStep(vault, stepRequest);
+      result = runDreamStep(vault, stepRequest, {
+        safeguard: guard(),
+        ...(stepObservation?.sink !== undefined ? { onProgress: stepObservation.sink } : {}),
+      });
     } catch (exc) {
       if (exc instanceof DreamStepNotRunnableError) {
         return refuse(exc.message, asJson, {
@@ -229,7 +256,19 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
       }
       const message = `dream step ${stepRequest} failed: ${(exc as Error).message ?? exc}`;
       if (asJson) {
-        okJson({ ok: false, step: stepRequest, message });
+        // The same marker the staged-action catch and the inline-pass
+        // catch emit, for the same reason and on the same contract
+        // (`docs/cli-reference.md`, "Long-running operations"): a machine
+        // caller has to be able to tell a budget it can raise or retry
+        // past from a defect it cannot. This branch is the one the step
+        // deadline was added for, so it was the one place a timeout came
+        // back indistinguishable from a crash.
+        okJson({
+          ok: false,
+          step: stepRequest,
+          ...(exc instanceof SafeguardTimeoutError ? { timed_out: true } : {}),
+          message,
+        });
         return 1;
       }
       return fail(message);
@@ -434,7 +473,7 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
       okJson({ ok: false, timed_out: true, message: exc.message });
       return 1;
     }
-    return fail(`dream failed: ${(exc as Error).message ?? exc}`);
+    return fail(`dream failed: ${describeErrorChain(exc)}`);
   }
   for (const w of summary.warnings ?? []) {
     process.stderr.write(`warning: ${w.code}: ${w.message}\n`);

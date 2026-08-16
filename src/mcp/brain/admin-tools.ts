@@ -33,8 +33,19 @@ import { appendMetric } from "../../core/brain/metrics.ts";
 import type { ProgressSink } from "../../core/brain/progress.ts";
 import { requiredStringArg, toolSafeguard } from "./shared.ts";
 import { currentLease } from "../../core/brain/maintenance/lease.ts";
-import { listJournal } from "../../core/brain/maintenance/journal.ts";
-import { runMaintenance, type DailyWindow } from "../../core/brain/maintenance/lane.ts";
+import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../core/brain/maintenance/journal.ts";
+import {
+  isLaneTask,
+  LANE_TASK,
+  LANE_TASKS,
+  MAINTENANCE_BUSY_MINUTES,
+  MAINTENANCE_BUSY_MINUTES_MAX,
+  MAINTENANCE_BUSY_THRESHOLD,
+  MAINTENANCE_BUSY_THRESHOLD_MAX,
+  runMaintenance,
+  type DailyWindow,
+  type LaneTask,
+} from "../../core/brain/maintenance/lane.ts";
 import { writeFrontmatterAtomic } from "../../core/vault.ts";
 import { resolveNotePath } from "../../core/brain/note-path.ts";
 import type { FrontmatterMap } from "../../core/types.ts";
@@ -42,6 +53,7 @@ import { parseFrontmatter } from "../../core/vault.ts";
 import { dream } from "../../core/brain/dream.ts";
 import { isoSecond } from "../../core/brain/time.ts";
 import { normalizeAgentArgument } from "../../core/agent-identity.ts";
+import { coerceInt, coerceStrList } from "../coerce.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
@@ -254,6 +266,20 @@ async function toolBrainSecrets(
 
 // ----- brain_maintenance (t_166d1226) ------------------------------------------
 
+/**
+ * Bound for `retry_tasks`: naming more tasks than the lane dispatches is
+ * a mistake, not a request.
+ *
+ * The `maxItems` this feeds into the schema is ADVERTISEMENT, not
+ * enforcement - nothing in the request path validates a JSON Schema.
+ * `src/mcp/argument-guard.ts` checks argument NAMES and `coerceStrList`
+ * enforces no length of its own, so a 1000-entry array reached the lane
+ * with the schema saying it could not. The handler checks the length
+ * itself for that reason; the schema keeps the number so a client that
+ * does validate refuses before spending a round trip.
+ */
+const MAX_RETRY_TASKS = LANE_TASKS.length;
+
 /** Quiet-window, lease-guarded heavy maintenance lane. */
 async function toolBrainMaintenance(
   ctx: ServerContext,
@@ -266,9 +292,13 @@ async function toolBrainMaintenance(
   }
   const now = new Date();
   if (op === "status") {
+    // The journal depth is the caller's, as it is on the CLI. It was
+    // hardcoded at ten here, so an agent reading a lane that had refused
+    // a task days ago could not see far enough back to find the failures
+    // behind the streak - the one thing the journal is kept for.
     return {
       lease: currentLease(ctx.vault, { now }),
-      journal: listJournal(ctx.vault, 10),
+      journal: listJournal(ctx.vault, coerceInt(args, "limit", 10, 1, MAINTENANCE_JOURNAL_CAP)),
     };
   }
   let window: DailyWindow | undefined;
@@ -293,6 +323,46 @@ async function toolBrainMaintenance(
     const tz = typeof args["tz"] === "string" ? (args["tz"] as string) : "UTC";
     window = { startHour, endHour, tz };
   }
+  // The busy gate, on the CLI's terms: same two knobs, same defaults, so
+  // an agent that wants a wider quiet window does not have to reach for
+  // `force` - which switches off three gates it never meant to touch.
+  const busy = {
+    minutes: coerceInt(
+      args,
+      "busy_minutes",
+      MAINTENANCE_BUSY_MINUTES,
+      1,
+      MAINTENANCE_BUSY_MINUTES_MAX,
+    ),
+    threshold: coerceInt(
+      args,
+      "busy_threshold",
+      MAINTENANCE_BUSY_THRESHOLD,
+      1,
+      MAINTENANCE_BUSY_THRESHOLD_MAX,
+    ),
+  };
+  // Refused BY NAME, exactly as the CLI refuses a `--retry` typo: a name
+  // this lane does not dispatch retries nothing, and silently accepting
+  // it would leave the caller reading a refusal it believed it had just
+  // asked past.
+  const requestedRetries = coerceStrList(args, "retry_tasks");
+  if (requestedRetries.length > MAX_RETRY_TASKS) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      `brain_maintenance run: retry_tasks accepts at most ${MAX_RETRY_TASKS} entries ` +
+        `(one per lane task: ${LANE_TASKS.join(", ")}), got ${requestedRetries.length}`,
+    );
+  }
+  const unknownRetries = requestedRetries.filter((name) => !isLaneTask(name));
+  if (unknownRetries.length > 0) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      `brain_maintenance run: retry_tasks names no lane task: ${unknownRetries.join(", ")} ` +
+        `(tasks: ${LANE_TASKS.join(", ")})`,
+    );
+  }
+  const retryTasks: ReadonlyArray<LaneTask> = requestedRetries.filter(isLaneTask);
   const agentArg = args["agent"];
   const agent =
     normalizeAgentArgument(typeof agentArg === "string" ? agentArg : null) ??
@@ -306,8 +376,10 @@ async function toolBrainMaintenance(
   // -> default. The lane is the only surface that wants a guard PER
   // TASK rather than per call, so it names the shared factory four
   // times instead of holding one guard.
-  const laneSafeguard = (operation: "dream" | "reindex" | "bridges" | "clusters") =>
-    toolSafeguard(ctx, operation);
+  // A lane task IS one of the guarded operations, so the task name is the
+  // budget key. The union that used to be retyped here is gone: both
+  // surfaces read `LANE_TASK`, whose values come from `OPERATION`.
+  const laneSafeguard = (operation: LaneTask) => toolSafeguard(ctx, operation);
   // The lane is a dispatcher over four long operations, not a fifth one,
   // so it forwards the caller's sink to each task rather than counting
   // tasks itself: every event names the operation that emitted it, which
@@ -317,19 +389,21 @@ async function toolBrainMaintenance(
     now,
     holder: `${agent}@${process.pid}`,
     force: args["force"] === true,
+    busy,
+    ...(retryTasks.length > 0 ? { retryTasks } : {}),
     ...(window !== undefined ? { window } : {}),
     tasks: [
       {
-        name: "dream",
+        name: LANE_TASK.dream,
         run: async () => {
-          dream(ctx.vault, { now, safeguard: laneSafeguard("dream"), ...laneProgress });
+          dream(ctx.vault, { now, safeguard: laneSafeguard(LANE_TASK.dream), ...laneProgress });
         },
       },
       {
-        name: "reindex",
+        name: LANE_TASK.reindex,
         run: async () => {
           await indexVault(searchConfig, {
-            safeguard: laneSafeguard("reindex"),
+            safeguard: laneSafeguard(LANE_TASK.reindex),
             ...laneProgress,
           });
         },
@@ -339,13 +413,13 @@ async function toolBrainMaintenance(
       // edges; both are fail-soft without embeddings, and a metrics
       // write failure never fails the task.
       {
-        name: "bridges",
+        name: LANE_TASK.bridges,
         run: async () => {
           const store = await Store.open(searchConfig, { mode: "read" });
           try {
             const report = discoverBridges(store, {
               dismissed: readDismissedBridges(ctx.vault),
-              safeguard: laneSafeguard("bridges"),
+              safeguard: laneSafeguard(LANE_TASK.bridges),
               ...laneProgress,
             });
             writeBridgeProposals(ctx.vault, report, { now });
@@ -369,12 +443,12 @@ async function toolBrainMaintenance(
         },
       },
       {
-        name: "clusters",
+        name: LANE_TASK.clusters,
         run: async () => {
           const store = await Store.open(searchConfig, { mode: "read" });
           try {
             const communities = detectCommunities(store, {
-              safeguard: laneSafeguard("clusters"),
+              safeguard: laneSafeguard(LANE_TASK.clusters),
               ...laneProgress,
             });
             const materialized = materializeClusterNotes(ctx.vault, communities, { store, now });
@@ -476,12 +550,44 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_maintenance",
     description:
-      "Quiet-window, lease-guarded heavy maintenance lane: run executes dream, reindex, bridges, and clusters stale-first behind the local-time window, busy gate, and an expiring lease (force bypasses the soft gates, never the lease); status renders the lease holder and recent journal.",
+      "Quiet-window, lease-guarded heavy maintenance lane: run executes dream, reindex, bridges and clusters stale-first behind the window, busy, host-pressure and streak gates and an expiring lease (force bypasses all of those but the lease); status renders the lease holder and recent journal.",
     inputSchema: {
       type: "object",
       properties: {
         operation: { type: "string", enum: ["run", "status"], description: "Tool operation." },
-        force: { type: "boolean", description: "Bypass window and busy gates (run)." },
+        force: {
+          type: "boolean",
+          // The old text said "window and busy gates" and had been wrong
+          // since the pressure gate and the streak refusal were added.
+          // A caller reaching for the widest escape has to be told what
+          // it actually switches off.
+          description:
+            "Bypass the window, busy and host-pressure gates and every streak refusal - never the lease (run). retry_tasks passes one task's streak with the gates kept.",
+        },
+        retry_tasks: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: MAX_RETRY_TASKS,
+          description: `Tasks to retry past their streak refusal, this run only; gates still apply. Known: ${LANE_TASKS.join(", ")}. An unknown name is refused.`,
+        },
+        busy_minutes: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAINTENANCE_BUSY_MINUTES_MAX,
+          description: `Busy-gate lookback in minutes (run; default ${MAINTENANCE_BUSY_MINUTES}).`,
+        },
+        busy_threshold: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAINTENANCE_BUSY_THRESHOLD_MAX,
+          description: `Recent queries in the lookback that count as busy (run; default ${MAINTENANCE_BUSY_THRESHOLD}).`,
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAINTENANCE_JOURNAL_CAP,
+          description: "Journal rows to return, newest first (status; default 10).",
+        },
         window_start_hour: {
           type: "integer",
           minimum: 0,

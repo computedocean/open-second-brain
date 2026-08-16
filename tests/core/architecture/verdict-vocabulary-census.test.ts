@@ -367,6 +367,30 @@ import {
   MIRROR_OUTCOME,
   MIRROR_OUTCOMES,
 } from "../../../src/core/brain/shared-namespace.ts";
+import {
+  INSTALL_TARGET_ID,
+  INSTALL_TARGET_IDS,
+  isInstallTargetId,
+  isSessionRuntimeId,
+  isToolCeilingKind,
+  SESSION_RUNTIME_ID,
+  SESSION_RUNTIME_IDS,
+  TOOL_CEILING_KIND,
+  TOOL_CEILING_KINDS,
+} from "../../../src/core/runtime/host-facts.ts";
+import { CONFIG_ORIGIN, CONFIG_ORIGINS, isConfigOrigin } from "../../../src/core/validate.ts";
+import { EXPORT_FORMAT, EXPORT_FORMATS, isExportFormat } from "../../../src/core/brain/export.ts";
+import {
+  isStateReachability,
+  isStateSurfaceId,
+  isStateTier,
+  STATE_REACHABILITIES,
+  STATE_REACHABILITY,
+  STATE_SURFACE_ID,
+  STATE_SURFACE_IDS,
+  STATE_TIER,
+  STATE_TIERS,
+} from "../../../src/core/state/surfaces.ts";
 import { lexCode } from "../../helpers/source-lexer.ts";
 
 interface VocabularyUnderCensus {
@@ -1088,6 +1112,96 @@ const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
     members: MIRROR_OUTCOMES,
     guard: isMirrorOutcome,
   },
+  {
+    // U9. The runtimes `o2b install --target` can name. They were bare
+    // strings validated only by a registry-lookup miss, which is a check
+    // that runs after the value has already been carried through the
+    // adapter contract, the manifest and the ownership statement - so a
+    // typo was a value the type system had no opinion about anywhere.
+    name: "INSTALL_TARGET_ID",
+    values: INSTALL_TARGET_ID,
+    members: INSTALL_TARGET_IDS,
+    guard: isInstallTargetId,
+  },
+  {
+    // U9. The runtimes whose session logs this build can LOCATE. Neither
+    // the install-target set nor the session-adapter set: Claude Code is
+    // not installable and writes the largest transcript store on a
+    // typical machine, Cursor is locatable and unparsable, and Hermes is
+    // parsable at no path this build knows. The value round-trips through
+    // the import ledger on disk, which is what the guard is for.
+    name: "SESSION_RUNTIME_ID",
+    values: SESSION_RUNTIME_ID,
+    members: SESSION_RUNTIME_IDS,
+    guard: isSessionRuntimeId,
+  },
+  {
+    // U9. What this build can say about one host's per-workspace MCP tool
+    // limit. `unknown` and `unbounded` are separate members and that
+    // separation IS the unit: collapsing them would let a host nobody
+    // checked be read as one that publishes no limit, one layer above the
+    // fail-open profile selection that made the card true.
+    name: "TOOL_CEILING_KIND",
+    values: TOOL_CEILING_KIND,
+    members: TOOL_CEILING_KINDS,
+    guard: isToolCeilingKind,
+  },
+  {
+    // U9. Which layer produced a resolved configuration value. Four
+    // members rather than three because a vault carries a COMMITTED
+    // configuration that travels with it, next to the machine-local one
+    // that does not - and for generated install content the committed
+    // tier OUTRANKS the machine, so collapsing the two would make the
+    // only interesting provenance question unanswerable.
+    name: "CONFIG_ORIGIN",
+    values: CONFIG_ORIGIN,
+    members: CONFIG_ORIGINS,
+    guard: isConfigOrigin,
+  },
+  {
+    // U9. The durable locations this build keeps inside a vault. Closed
+    // because the inventory hands the id back to a caller that may ask
+    // for one surface by name; a bare `string` there would make a typo a
+    // silently empty answer rather than a compile error.
+    name: "STATE_SURFACE_ID",
+    values: STATE_SURFACE_ID,
+    members: STATE_SURFACE_IDS,
+    guard: isStateSurfaceId,
+  },
+  {
+    // U9. What losing one surface costs. Two members because derived
+    // machine state and vault content have genuinely different recovery
+    // stories, and an inventory that folded them into one bucket could
+    // not tell an operator which deletions are reversible.
+    name: "STATE_TIER",
+    values: STATE_TIER,
+    members: STATE_TIERS,
+    guard: isStateTier,
+  },
+  {
+    // U9. What this run established about one surface. `absent` and
+    // `unchecked` are separate members for the reason ORIGIN_REACH keeps
+    // its two apart: "it is not there" and "I could not look" are
+    // different repairs, and a permission error read as an absent file
+    // sends an operator to recreate what is already on disk.
+    name: "STATE_REACHABILITY",
+    values: STATE_REACHABILITY,
+    members: STATE_REACHABILITIES,
+    guard: isStateReachability,
+  },
+  {
+    // U11. What `o2b brain export --format` accepts. It shipped as a bare
+    // type alias that NOTHING imported, while the verb compared the raw
+    // argv string against two inline literals - a contract declared with
+    // nothing behind it, which is the defect class this release closes.
+    // The guard is now the boundary the argv value crosses, and the frozen
+    // object is the dispatch table's key set, so a format with no handler
+    // is a compile error rather than a silent fall-through.
+    name: "EXPORT_FORMAT",
+    values: EXPORT_FORMAT,
+    members: EXPORT_FORMATS,
+    guard: isExportFormat,
+  },
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1352,7 +1466,7 @@ const SCANNED = scanVocabularies(SOURCE_TREE);
  * How many four-piece vocabularies `src/` currently holds. Measured, and
  * kept as an equality rather than a floor - see the population test.
  */
-const VOCABULARY_POPULATION = 63;
+const VOCABULARY_POPULATION = 71;
 const REGISTERED = new Map(CENSUS.map((entry) => [entry.name, entry] as const));
 
 describe("verdict vocabulary census", () => {

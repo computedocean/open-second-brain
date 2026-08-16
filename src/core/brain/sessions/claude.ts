@@ -24,8 +24,8 @@
  * sub-agent transcript parses as an ordinary session of its parent.
  */
 
-import { readFileSync } from "node:fs";
-
+import { readLines } from "./read-lines.ts";
+import { SESSION_TIMESTAMP_UNKNOWN } from "./types.ts";
 import type { SessionAdapter, SessionToolCall, SessionTurn } from "./types.ts";
 
 interface ClaudeBlock {
@@ -65,7 +65,7 @@ function turnFromLine(obj: unknown, fallbackIndex: number): SessionTurn | null {
   const timestamp =
     typeof o["timestamp"] === "string" && o["timestamp"].length > 0
       ? o["timestamp"]
-      : new Date(0).toISOString();
+      : SESSION_TIMESTAMP_UNKNOWN;
 
   const message = o["message"];
   if (message === null || typeof message !== "object") {
@@ -122,10 +122,8 @@ export const claudeAdapter: SessionAdapter = {
     return hasClaudeShape;
   },
   async *iterate(path: string): AsyncIterable<SessionTurn> {
-    const text = readFileSync(path, "utf8");
-    const lines = text.split("\n");
     let i = 0;
-    for (const line of lines) {
+    for await (const line of readLines(path)) {
       i++;
       const trimmed = line.trim();
       if (trimmed === "") continue;

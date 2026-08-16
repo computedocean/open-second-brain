@@ -22,12 +22,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
+import { UnsupportedPlatformError } from "../../config.ts";
+import type { InstallTargetId } from "../../runtime/host-facts.ts";
 import { GROK_HOOKS_FILENAME, grokHooksJson, grokMcpServers } from "../grok-asset.ts";
 import { hasMcpServers, removeMcpServers, upsertMcpServers } from "../grok-config.ts";
 import { OSB_KEY_FULL, OSB_KEY_WRITER } from "../json-merge.ts";
 import { readManifest, recordEntry, removeEntry } from "../manifest.ts";
+import { payloadForHost } from "../payload-host.ts";
 import { expectedPayloadFromEnv } from "../payload-equals.ts";
 import { defaultRegistry } from "../registry.ts";
+import { installSettingsSource, resolveInstallHookTimeoutSeconds } from "../settings.ts";
 import type {
   ApplyOpts,
   ApplyResult,
@@ -38,9 +42,11 @@ import type {
   McpPayload,
   UninstallResult,
   VerifyResult,
+  SessionPathsResult,
 } from "../types.ts";
+import { sessionPathsFor } from "../session-paths.ts";
 
-const TARGET = "grok";
+const TARGET: InstallTargetId = "grok";
 const LABEL = "Grok Build";
 const FIX_HINT = "o2b install --target grok --apply";
 const SERVER_NAMES = [OSB_KEY_FULL, OSB_KEY_WRITER] as const;
@@ -73,14 +79,31 @@ interface DesiredState {
   readonly currentHooks: string;
 }
 
+/**
+ * The resolved `install.hook_timeout_seconds` for this env.
+ *
+ * Read on BOTH the apply and the verify path, from the same
+ * `InstallEnv`, because verification here is re-construction: a value
+ * only one of the two could see would make a fresh apply report drift.
+ * An unreadable `<vault>/Brain/_brain.yaml` raises out of here rather
+ * than resolving the default - the refusal this generator owes an
+ * operator whose settings exist and are not in force.
+ */
+function hookTimeoutSeconds(env: InstallEnv): number {
+  return resolveInstallHookTimeoutSeconds(installSettingsSource(env)).value;
+}
+
 /** Compute the target config.toml + hooks content for the current env/payload. */
-function desired(payload: McpPayload, env: InstallEnv): DesiredState {
+function desired(rawPayload: McpPayload, env: InstallEnv): DesiredState {
   const currentToml = readFileOrEmpty(configPath(env));
   const currentHooks = readFileOrEmpty(hooksPath(env));
+  // The same host transform `syncState` re-computes from the env alone,
+  // so an applied install is in sync with what verification expects.
+  const payload = payloadForHost(TARGET, rawPayload, env);
   return {
     currentToml,
     nextToml: upsertMcpServers(currentToml, grokMcpServers(payload)),
-    hooksContent: grokHooksJson(payload),
+    hooksContent: grokHooksJson(payload, hookTimeoutSeconds(env)),
     currentHooks,
   };
 }
@@ -89,9 +112,9 @@ function desired(payload: McpPayload, env: InstallEnv): DesiredState {
 function syncState(env: InstallEnv): { mcpOk: boolean; hooksOk: boolean; anyPresent: boolean } {
   const toml = readFileOrEmpty(configPath(env));
   const hooks = readFileOrEmpty(hooksPath(env));
-  const payload = expectedPayloadFromEnv(env);
+  const payload = expectedPayloadFromEnv(env, TARGET);
   const mcpOk = hasMcpServers(toml, grokMcpServers(payload));
-  const hooksOk = hooks === grokHooksJson(payload);
+  const hooksOk = hooks === grokHooksJson(payload, hookTimeoutSeconds(env));
   const anyMcp = SERVER_NAMES.some((n) => toml.includes(`[mcp_servers.${n}]`));
   return { mcpOk, hooksOk, anyPresent: anyMcp || hooks.length > 0 };
 }
@@ -100,8 +123,34 @@ export const grokAdapter = {
   target: TARGET,
   label: LABEL,
 
+  /**
+   * The status vocabulary has a member for "this machine is not one this
+   * build has a layout for", and `detect` owes it rather than a throw.
+   *
+   * The reachable path to that condition is new: `syncState` resolves the
+   * hook timeout, which resolves the machine-local config path, which
+   * refuses on a platform with no `$HOME/.config` convention and no
+   * operator override. Before this adapter read a setting, `detect` could
+   * not fail that way; after it, an unsupported platform turned a
+   * read-only status query into an exception that also took down
+   * `detectAll`'s other nine targets.
+   */
   detect(env: InstallEnv): DetectResult {
-    const { mcpOk, hooksOk, anyPresent } = syncState(env);
+    let state: { mcpOk: boolean; hooksOk: boolean; anyPresent: boolean };
+    try {
+      state = syncState(env);
+    } catch (exc) {
+      if (exc instanceof UnsupportedPlatformError) {
+        return {
+          target: TARGET,
+          status: "unsupported-on-this-platform",
+          configPath: null,
+          notes: [exc.message],
+        };
+      }
+      throw exc;
+    }
+    const { mcpOk, hooksOk, anyPresent } = state;
     const status = !anyPresent ? "not-installed" : mcpOk && hooksOk ? "installed" : "drift";
     return { target: TARGET, status, configPath: configPath(env), notes: [] };
   },
@@ -198,6 +247,14 @@ export const grokAdapter = {
 
     if (!opts.dryRun && skipped.length === 0) removeEntry(env.vault, TARGET);
     return { target: TARGET, removed_keys: removedKeys, removed_paths: removedPaths, skipped };
+  },
+
+  /**
+   * Where this runtime keeps session logs, from the one declaration.
+   * `Grok persists one ACP update stream per session under $GROK_HOME/sessions/<encoded-cwd>/<id>/.`
+   */
+  sessionPaths(env: InstallEnv): SessionPathsResult | null {
+    return sessionPathsFor(TARGET, env);
   },
 };
 

@@ -60,6 +60,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       flag("scope", "string"),
       flag("writer-only", "boolean"),
       flag("tool-profile", "string"),
+      flag("host-target", "string"),
       flag("probe", "boolean"),
       flag("allow-tool", "string-array"),
       flag("disable-tool", "string-array"),
@@ -68,7 +69,24 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
     command("help", "Print command help or the command manifest"),
     command("completions", "Print shell completion script for o2b", [flag("shell", "string")]),
     command("install-cli", "Create symlinks for o2b and vault-log"),
-    command("install", "Multi-runtime install orchestrator"),
+    // The whole flag set, not only the two the friction mode added:
+    // `tests/cli/help-surface-parity.test.ts` renders the human help from
+    // this list, so declaring one flag on a verb that parses twelve would
+    // advertise a surface narrower than the verb's own argument parser.
+    command("install", "Multi-runtime install orchestrator", [
+      flag("target", "string"),
+      flag("apply", "boolean"),
+      flag("check", "boolean"),
+      flag("friction", "boolean"),
+      flag("base", "string"),
+      flag("compare", "string"),
+      flag("dry-run", "boolean"),
+      flag("force", "boolean"),
+      flag("out", "string"),
+      flag("format", "string"),
+      flag("vault", "string"),
+      flag("config", "string"),
+    ]),
     command("update", "Update Open Second Brain across detected runtimes", [
       flag("target", "string"),
       flag("dry-run", "boolean"),
@@ -164,7 +182,16 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         ),
         command("rollback", "Restore Brain from a snapshot"),
         command("upgrade", "Migrate release-owned Brain files"),
-        command("export", "Export active preferences"),
+        command("export", "Export active preferences or a session-transcript dataset", [
+          flag("vault", "string"),
+          flag("format", "string"),
+          flag("transcripts", "string"),
+          flag("runtime", "string"),
+          flag("since", "string"),
+          flag("until", "string"),
+          flag("out", "string"),
+          flag("force", "boolean"),
+        ]),
         command("explorer", "Open or export Brain graph explorer"),
         command("doctor", "Check Brain invariants"),
         command("status", "Unified operator status snapshot with next-command hints", [
@@ -243,7 +270,30 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("agent", "string"),
           flag("json", "boolean"),
         ]),
-        command("import-session", "Replay registered agent sessions"),
+        // Every flag the parser accepts, following the `o2b install`
+        // precedent from earlier in this release: advertising a narrower
+        // surface than the parser takes is the discoverability dead end
+        // `manifest-completeness.test.ts` exists to prevent, and this
+        // verb declared none of the thirteen it already parsed.
+        command("import-session", "Replay registered agent sessions", [
+          flag("vault", "string"),
+          flag("format", "string"),
+          flag("since", "string"),
+          flag("dry-run", "boolean"),
+          flag("agent", "string"),
+          flag("recall", "boolean"),
+          flag("recall-session-id", "string"),
+          flag("recall-summary-group-size", "string"),
+          flag("ingest-scope", "string"),
+          flag("filter-role", "string-array"),
+          flag("filter-text", "string"),
+          flag("preserve-event-time", "boolean"),
+          flag("discover", "boolean"),
+          flag("status", "boolean"),
+          flag("all", "boolean"),
+          flag("progress", "boolean"),
+          flag("json", "boolean"),
+        ]),
         command("handoff", "Write an operator-readable session handoff note"),
         command("intention", "Manage scoped current-intention chains"),
         command("project", "Link project directories to their owning vault"),
@@ -607,6 +657,48 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("inspect", "Inspect one vault-relative path"),
         command("profile", "Manage named vault profiles"),
         command("map", "Print vault-map role tokens"),
+      ],
+    ),
+    command(
+      "state",
+      "In-vault state surface verbs",
+      [],
+      [
+        command(
+          "status",
+          "Report every state surface in the vault with its path, reachability, and the override that placed it",
+          [flag("vault", "string"), flag("config", "string"), flag("json", "boolean")],
+        ),
+        command(
+          "migrate",
+          "Plan (or, with --apply --yes, perform) a digest-bound move of the vault's state to another directory",
+          [
+            flag("to", "string"),
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("dry-run", "boolean"),
+            flag("apply", "boolean"),
+            flag("yes", "boolean"),
+            flag("json", "boolean"),
+          ],
+        ),
+        command(
+          "rollback",
+          "Restore a migration's manifest-bound files whose digests still match, refusing anything changed since",
+          [
+            flag("from", "string"),
+            // `--to` rescues a vault that moved after the migration, which
+            // is the one case the rollback plan refuses by name. Leaving it
+            // undeclared hid the remedy from `o2b help --json` and from
+            // shell completions - the two places an operator looks when the
+            // refusal tells them a flag exists.
+            flag("to", "string"),
+            flag("dry-run", "boolean"),
+            flag("apply", "boolean"),
+            flag("yes", "boolean"),
+            flag("json", "boolean"),
+          ],
+        ),
       ],
     ),
     command(

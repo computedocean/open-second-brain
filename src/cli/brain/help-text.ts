@@ -58,7 +58,8 @@ Brain verbs (observing memory):
   unprotect        Remove OSB-managed deny rules for the chosen target (--target)
   merge            Merge two near-duplicate preferences (<keep> <drop>; --dry-run, --force)
   upgrade          Migrate release-owned files forward (--dry-run by default; --apply --yes)
-  export           Dump active preferences (--format json|llms-txt [--out <path>])
+  export           Dump preferences or a transcript dataset
+                   (--format json|llms-txt|transcripts-jsonl [--out <path>])
   okf-export       Write a portable Open Knowledge Format bundle (--out <dir> [--force])
   okf-import       Import an OKF bundle (<dir>; staged as review candidates, --trusted writes direct)
   explorer         Launch the loopback HTML explorer; --export <path> writes a single offline file
@@ -677,6 +678,8 @@ export const VERB_HELP: Record<string, string> = {
     "                                [--ingest-scope <label>] [--filter-role <role> ...] [--filter-text <substring>]\n" +
     "                                [--preserve-event-time]\n" +
     "                                [--recall-session-id <id>] [--recall-summary-group-size <n>] [--json]\n" +
+    "       o2b brain import-session --status [--vault <vault>] [--progress] [--json]\n" +
+    "       o2b brain import-session --discover [--all] [--vault <vault>] [--progress] [--json]\n" +
     "Extract signals from a registered agent session .jsonl file (or\n" +
     "directory of .jsonl files). Two extraction paths run in parallel:\n" +
     "@osb markers in user/assistant messages, and replay of brain_feedback\n" +
@@ -688,7 +691,15 @@ export const VERB_HELP: Record<string, string> = {
     "import wall-clock, so backfilling an old log stays historically\n" +
     "faithful. Turns with an absent/unparseable/future timestamp fall back\n" +
     "to now.\n" +
-    "Autodetect failure exits 2 — pass --format to override.\n",
+    "Autodetect failure exits 2 — pass --format to override.\n" +
+    "--status sweeps the session roots this build declares and reports, per\n" +
+    "runtime, how many logs were found, how many are already imported, and\n" +
+    "the gap between them. --discover lists the gap without importing it;\n" +
+    "--discover --all imports it. Coverage is keyed by content hash in\n" +
+    "<vault>/.open-second-brain/session-import-ledger.json, so a log whose\n" +
+    "bytes have not changed is reported as imported without being re-parsed.\n" +
+    "A <path> and --discover/--status are mutually exclusive and refuse by\n" +
+    "name; --all on its own does the same.\n",
   merge:
     "usage: o2b brain merge <keep-pref-id> <drop-pref-id>\n" +
     "                       [--dry-run] [--force] [--vault <path>] [--json]\n" +
@@ -703,12 +714,22 @@ export const VERB_HELP: Record<string, string> = {
     "--force skips the interactive prompt but does NOT bypass invariant\n" +
     "guards (topic/scope mismatch, pin parity).\n",
   export:
-    "usage: o2b brain export --format json|llms-txt [--vault <path>]\n" +
-    "                         [--out <path>] [--force]\n" +
+    "usage: o2b brain export --format json|llms-txt|transcripts-jsonl\n" +
+    "                         [--vault <path>] [--out <path>] [--force]\n" +
+    "       o2b brain export --format transcripts-jsonl --transcripts <file|dir>\n" +
+    "                         [--runtime <id>] [--since <iso>] [--until <iso>]\n" +
     "Read-only dump of active preferences (confirmed | unconfirmed |\n" +
     "quarantine) from Brain/preferences/. Retired and signal entries\n" +
     "are not included. JSON is single-line; llms-txt follows the\n" +
     "llmstxt.org H1 + summary + H2-section shape.\n" +
+    "transcripts-jsonl reads no vault: it emits one JSON conversation\n" +
+    "record per line from the session logs under --transcripts, with\n" +
+    "ordered role/text messages and the names (never the inputs) of the\n" +
+    "tools each turn called. --runtime keeps one adapter's transcripts;\n" +
+    "--since / --until select whole conversations by their START, so a\n" +
+    "kept conversation is never sliced across the window edge.\n" +
+    "Every format is scanned by the shared egress guard before a byte is\n" +
+    "written, and a secret-shaped identifier refuses the export outright.\n" +
     "Default sink is stdout; --out writes to <path> (refuses to\n" +
     "overwrite without --force).\n",
   upgrade:

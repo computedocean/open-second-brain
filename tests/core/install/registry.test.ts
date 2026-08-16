@@ -9,11 +9,17 @@ import type {
   UninstallResult,
   VerifyResult,
 } from "../../../src/core/install/types.ts";
+import type { InstallTargetId } from "../../../src/core/runtime/host-facts.ts";
 
-function makeFakeAdapter(target: string): InstallAdapter {
+function makeFakeAdapter(target: InstallTargetId): InstallAdapter {
   return {
     target,
     label: target,
+    // The seam is required on every adapter; a double that answers
+    // `null` is a runtime with no session store, which is what a double is.
+    sessionPaths(): null {
+      return null;
+    },
     detect(env: InstallEnv): DetectResult {
       void env;
       return { target, status: "not-installed", configPath: null, notes: [] };
@@ -61,10 +67,10 @@ describe("install registry", () => {
 
   test("register + get round-trip", () => {
     const reg = createRegistry();
-    const a = makeFakeAdapter("test");
+    const a = makeFakeAdapter("generic");
     reg.register(a);
-    expect(reg.get("test")).toBe(a);
-    expect(reg.list().map((x) => x.target)).toEqual(["test"]);
+    expect(reg.get("generic")).toBe(a);
+    expect(reg.list().map((x) => x.target)).toEqual(["generic"]);
   });
 
   test("register rejects duplicate target", () => {
@@ -75,24 +81,24 @@ describe("install registry", () => {
 
   test("detectAll returns one entry per registered adapter", () => {
     const reg = createRegistry();
-    reg.register(makeFakeAdapter("a"));
-    reg.register(makeFakeAdapter("b"));
+    reg.register(makeFakeAdapter("aider"));
+    reg.register(makeFakeAdapter("kiro"));
     const out = reg.detectAll(makeEnv());
-    expect(out.map((d) => d.target).toSorted()).toEqual(["a", "b"]);
+    expect(out.map((d) => d.target).toSorted()).toEqual(["aider", "kiro"]);
   });
 
   test("list returns adapters in registration order", () => {
     const reg = createRegistry();
-    reg.register(makeFakeAdapter("b"));
-    reg.register(makeFakeAdapter("a"));
-    reg.register(makeFakeAdapter("c"));
-    expect(reg.list().map((x) => x.target)).toEqual(["b", "a", "c"]);
+    reg.register(makeFakeAdapter("kiro"));
+    reg.register(makeFakeAdapter("aider"));
+    reg.register(makeFakeAdapter("grok"));
+    expect(reg.list().map((x) => x.target)).toEqual(["kiro", "aider", "grok"]);
   });
 
   test("targets() returns target names only", () => {
     const reg = createRegistry();
-    reg.register(makeFakeAdapter("a"));
-    reg.register(makeFakeAdapter("b"));
-    expect(reg.targets()).toEqual(["a", "b"]);
+    reg.register(makeFakeAdapter("aider"));
+    reg.register(makeFakeAdapter("kiro"));
+    expect(reg.targets()).toEqual(["aider", "kiro"]);
   });
 });

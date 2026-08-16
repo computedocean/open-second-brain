@@ -16,9 +16,11 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import { grokAdapter } from "../../../../src/core/install/adapters/grok.ts";
+import { INSTALL_HOOK_TIMEOUT_SECONDS_DEFAULT } from "../../../../src/core/brain/policy/blocks/install.ts";
 import { grokMcpServers, grokHooksJson } from "../../../../src/core/install/grok-asset.ts";
 import { hasMcpServers } from "../../../../src/core/install/grok-config.ts";
 import { buildPayload } from "../../../../src/core/install/payload.ts";
+import { payloadForHost } from "../../../../src/core/install/payload-host.ts";
 import { readManifest } from "../../../../src/core/install/manifest.ts";
 
 let vault: string;
@@ -95,7 +97,11 @@ describe("grok adapter - apply", () => {
   test("writes both MCP servers into config.toml with an absolute bun command", () => {
     apply();
     const toml = readFileSync(configPath(), "utf8");
-    expect(hasMcpServers(toml, grokMcpServers(payload()))).toBe(true);
+    // The written tables carry this host's dimensions, so the comparison
+    // has to be against the same transform the adapter applies.
+    expect(hasMcpServers(toml, grokMcpServers(payloadForHost("grok", payload(), env())))).toBe(
+      true,
+    );
     expect(toml).toContain("[mcp_servers.open-second-brain]");
     expect(toml).toContain("[mcp_servers.open-second-brain-writer]");
     // absolute command (the running bun), the repo entry point, and the vault.
@@ -117,7 +123,9 @@ describe("grok adapter - apply", () => {
 
   test("writes the lifecycle hooks file verbatim", () => {
     apply();
-    expect(readFileSync(hooksPath(), "utf8")).toBe(grokHooksJson(payload()));
+    expect(readFileSync(hooksPath(), "utf8")).toBe(
+      grokHooksJson(payload(), INSTALL_HOOK_TIMEOUT_SECONDS_DEFAULT),
+    );
   });
 
   test("manifest records the mcp keys and the hooks path", () => {
@@ -155,7 +163,9 @@ describe("grok adapter - apply", () => {
     apply();
     writeFileSync(hooksPath(), "{}\n");
     apply();
-    expect(readFileSync(hooksPath(), "utf8")).toBe(grokHooksJson(payload()));
+    expect(readFileSync(hooksPath(), "utf8")).toBe(
+      grokHooksJson(payload(), INSTALL_HOOK_TIMEOUT_SECONDS_DEFAULT),
+    );
   });
 });
 

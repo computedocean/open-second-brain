@@ -29,19 +29,23 @@ import {
   createSafeguard,
   OPERATION,
   resolveSafeguardTimeoutMs,
-  type Operation,
 } from "../../../core/brain/safeguard.ts";
 import { isoSecond } from "../../../core/brain/time.ts";
 import { Store } from "../../../core/search/store.ts";
 import { currentLease, MAINTENANCE_LEASE_NAME } from "../../../core/brain/maintenance/lease.ts";
 import {
+  isLaneTask,
+  LANE_TASK,
   MAINTENANCE_BUSY_MINUTES,
+  MAINTENANCE_BUSY_MINUTES_MAX,
   MAINTENANCE_BUSY_THRESHOLD,
+  MAINTENANCE_BUSY_THRESHOLD_MAX,
   runMaintenance,
   type DailyWindow,
+  type LaneTask,
   type MaintenanceTask,
 } from "../../../core/brain/maintenance/lane.ts";
-import { listJournal } from "../../../core/brain/maintenance/journal.ts";
+import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../../core/brain/maintenance/journal.ts";
 import { resolveAgentName } from "../../../core/config.ts";
 import { indexVault, resolveSearchConfig } from "../../../core/search/index.ts";
 import { onInterrupt } from "../../interrupt.ts";
@@ -87,9 +91,6 @@ export const MAINTENANCE_EXIT = Object.freeze({
 
 export type MaintenanceExit = (typeof MAINTENANCE_EXIT)[keyof typeof MAINTENANCE_EXIT];
 
-/** The four long operations the lane dispatches, in its own order. */
-type LaneOperation = Extract<Operation, "dream" | "reindex" | "bridges" | "clusters">;
-
 export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
   const { flags, positional } = parse(argv, {
     vault: { type: "string" },
@@ -116,10 +117,17 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
 
   try {
     if (op === "status") {
+      // Bounded on the journal's own ring size, which is also the bound
+      // `brain_maintenance` enforces. Unbounded here, `--limit 100000`
+      // was accepted on this surface and refused on the other for the
+      // same lane; and the ring cannot hold more than its cap anyway, so
+      // a larger number was never a request the journal could answer.
       const limitRaw = flags["limit"] as string | undefined;
       const limit = limitRaw !== undefined ? Number(limitRaw) : 10;
-      if (!Number.isInteger(limit) || limit < 1) {
-        process.stderr.write("brain maintenance status: --limit must be a positive integer\n");
+      if (!Number.isInteger(limit) || limit < 1 || limit > MAINTENANCE_JOURNAL_CAP) {
+        process.stderr.write(
+          `brain maintenance status: --limit must be an integer between 1 and ${MAINTENANCE_JOURNAL_CAP}\n`,
+        );
         return MAINTENANCE_EXIT.usage;
       }
       const lease = currentLease(vault, { name: MAINTENANCE_LEASE_NAME, now });
@@ -153,11 +161,24 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
       }
       window = { startHour, endHour, tz: (flags["tz"] as string | undefined) ?? "UTC" };
     }
-    const busyMinutes = numberFlag(flags["busy-minutes"], MAINTENANCE_BUSY_MINUTES);
-    const busyThreshold = numberFlag(flags["busy-threshold"], MAINTENANCE_BUSY_THRESHOLD);
+    // Same ceilings the MCP tool's schema declares and its handler
+    // enforces, read from the same constants beside the defaults: one
+    // lane must not accept through one door what it refuses at the other.
+    const busyMinutes = numberFlag(
+      flags["busy-minutes"],
+      MAINTENANCE_BUSY_MINUTES,
+      MAINTENANCE_BUSY_MINUTES_MAX,
+    );
+    const busyThreshold = numberFlag(
+      flags["busy-threshold"],
+      MAINTENANCE_BUSY_THRESHOLD,
+      MAINTENANCE_BUSY_THRESHOLD_MAX,
+    );
     if (busyMinutes === null || busyThreshold === null) {
       process.stderr.write(
-        "brain maintenance run: --busy-minutes/--busy-threshold must be positive integers\n",
+        `brain maintenance run: --busy-minutes must be an integer between 1 and ` +
+          `${MAINTENANCE_BUSY_MINUTES_MAX} and --busy-threshold between 1 and ` +
+          `${MAINTENANCE_BUSY_THRESHOLD_MAX}\n`,
       );
       return MAINTENANCE_EXIT.usage;
     }
@@ -202,7 +223,10 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     // One fresh deadline per lane task: each long pass gets its own
     // budget (per-op key -> global -> default), created lazily so the
     // clock starts when the task starts, not when the lane is gated.
-    const laneSafeguard = (operation: LaneOperation) =>
+    // A lane task IS one of the guarded operations - `LANE_TASK` reads its
+    // values out of `OPERATION` - so the task name is the budget key, and
+    // the union this used to retype locally is gone from both surfaces.
+    const laneSafeguard = (operation: LaneTask) =>
       createSafeguard({
         operation,
         timeoutMs: resolveSafeguardTimeoutMs(operation, config ?? undefined),
@@ -211,20 +235,24 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     let result: Awaited<ReturnType<typeof runMaintenance>>;
     try {
       // Built once and read twice - the lane runs these, and `--retry` is
-      // checked against their names. A second hard-coded list of the same
-      // four names is a list that can disagree with this one.
+      // checked against their names. That intent is unchanged; what
+      // changed is where the names come from. They were four literals
+      // here and four more in `admin-tools.ts`, and the two lists drifted
+      // apart twice, so both are now built from `LANE_TASK` and `--retry`
+      // validates against the vocabulary rather than against whichever
+      // list happens to be nearest.
       //
       // Inside the `try`, because the check below can return: a return
       // between `onInterrupt()` and the `try` would skip `release`.
       const laneTasks: ReadonlyArray<MaintenanceTask> = [
         {
-          name: "dream",
+          name: LANE_TASK.dream,
           run: async () => {
             dream(vault, { now, safeguard: laneSafeguard(OPERATION.dream), ...laneProgress });
           },
         },
         {
-          name: "reindex",
+          name: LANE_TASK.reindex,
           run: async () => {
             await indexVault(searchConfig, {
               safeguard: laneSafeguard(OPERATION.reindex),
@@ -237,7 +265,7 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
         // reindex so they see fresh edges. Both are fail-soft inside:
         // a vault without embeddings simply proposes nothing.
         {
-          name: "bridges",
+          name: LANE_TASK.bridges,
           run: async () => {
             const store = await Store.open(searchConfig, { mode: "read" });
             try {
@@ -267,7 +295,7 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
           },
         },
         {
-          name: "clusters",
+          name: LANE_TASK.clusters,
           run: async () => {
             const store = await Store.open(searchConfig, { mode: "read" });
             try {
@@ -297,10 +325,8 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
           },
         },
       ];
-      const retryTasks = stringArrayFlag(flags["retry"]);
-      const unknownRetries = retryTasks.filter(
-        (name) => !laneTasks.some((task) => task.name === name),
-      );
+      const requested = stringArrayFlag(flags["retry"]);
+      const unknownRetries = requested.filter((name) => !isLaneTask(name));
       if (unknownRetries.length > 0) {
         // Named, not ignored: a typo that silently retried nothing would
         // leave the operator reading a refusal they thought they had just
@@ -311,6 +337,7 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
         );
         return MAINTENANCE_EXIT.usage;
       }
+      const retryTasks = requested.filter(isLaneTask);
       result = await runMaintenance(vault, {
         now,
         holder,
@@ -372,8 +399,9 @@ function stringArrayFlag(raw: unknown): string[] {
     : [];
 }
 
-function numberFlag(raw: unknown, fallback: number): number | null {
+/** An integer flag inside `1..max`, its default, or null when refused. */
+function numberFlag(raw: unknown, fallback: number, max: number): number | null {
   if (raw === undefined) return fallback;
   const value = Number(raw);
-  return Number.isInteger(value) && value > 0 ? value : null;
+  return Number.isInteger(value) && value > 0 && value <= max ? value : null;
 }
