@@ -191,6 +191,29 @@ function vaultTree(at: string): Record<string, string> {
  */
 const WALL_CLOCK_STAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|(?<![.\d])\d{2}:\d{2}:\d{2}Z/g;
 
+/**
+ * Today in UTC, which is the date both writers stamp: storage timestamps
+ * are canonical UTC everywhere and `present-time.ts` converts only at the
+ * presentation boundary, so the signal filename and the daily log carry
+ * this date and not the fixture's event date.
+ *
+ * Derived, not pinned. The literal that stood here was the day the test
+ * was written, so the assertion held for one day and failed on every day
+ * after it - and it failed on the byte-identity test, whose job is to
+ * catch a redactor difference between two import paths.
+ *
+ * Read at the moment of use rather than at module load, which is as tight
+ * as this can be closed: the date is stamped by two CLI SUBPROCESSES and
+ * nothing here can hand them a clock. A run that straddles 00:00 UTC is
+ * already unsound whatever the expectation says - the two runs would
+ * stamp two different dates and the byte-identity comparison would fail
+ * on the log filename - so the residual window is the two runs' own
+ * span, not this file's.
+ */
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
 function withoutWallClock(tree: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, body] of Object.entries(tree)) {
@@ -421,6 +444,7 @@ describe("the ledger records what happened, and only what happened", () => {
 describe("the privacy posture is the one importSession already holds", () => {
   test("the discovered import and the explicit-path import write identical bytes everywhere but the clock", async () => {
     const path = claudeLog("one.jsonl", "alpha");
+    const today = todayUtc();
 
     const explicit = join(tmp, "explicit-vault");
     bootstrapVault(explicit);
@@ -437,7 +461,7 @@ describe("the privacy posture is the one importSession already holds", () => {
     // an equality with nothing on either side of it proves nothing about
     // a redactor - so what each run produced is pinned before the two are
     // compared.
-    expect(inboxSignals(vault)).toEqual(["sig-2026-08-16-alpha.md"]);
+    expect(inboxSignals(vault)).toEqual([`sig-${today}-alpha.md`]);
     expect(inboxSignals(explicit)).toEqual(inboxSignals(vault));
     const sweptTree = vaultTree(vault);
     const explicitTree = vaultTree(explicit);
@@ -449,9 +473,9 @@ describe("the privacy posture is the one importSession already holds", () => {
     // the discovered path would most plausibly land, because the log is
     // what records the transcript that was read.
     for (const required of [
-      "Brain/inbox/sig-2026-08-16-alpha.md",
-      `Brain/log/2026-08-16.${PARITY_DEVICE_ID}.md`,
-      `Brain/log/2026-08-16.${PARITY_DEVICE_ID}.jsonl`,
+      `Brain/inbox/sig-${today}-alpha.md`,
+      `Brain/log/${today}.${PARITY_DEVICE_ID}.md`,
+      `Brain/log/${today}.${PARITY_DEVICE_ID}.jsonl`,
       relative(vault, sessionLedgerPath(vault)),
     ]) {
       expect(`${required} written: ${namesOf(sweptTree).includes(required)}`).toBe(
