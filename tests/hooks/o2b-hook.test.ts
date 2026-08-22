@@ -10,7 +10,15 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,6 +82,38 @@ describe("o2b-hook resilience", () => {
     const r = runHook(WRAPPER, ["boom"], { CLAUDE_PLUGIN_ROOT: root });
     expect(r.status).toBe(0);
     expect(r.status).not.toBe(2);
+  });
+
+  test("adopts ~/.bun/bin when a minimal PATH hides an installed Bun", () => {
+    // The wrapper does not source scripts/_bun-precheck.sh, so it carries its
+    // own copy of that PATH repair. Without it a gateway-spawned hook skips
+    // over a Bun sitting one directory away (issue #173).
+    const root = freshRoot("probe");
+    const home = mkdtempSync(join(tmpdir(), "o2bhome-"));
+    tmps.push(home);
+    const bunBin = join(home, ".bun", "bin");
+    mkdirSync(bunBin, { recursive: true });
+    symlinkSync(process.execPath, join(bunBin, "bun"));
+    chmodSync(bunBin, 0o755);
+
+    // The wrapper's own utilities and provably no bun, so the only Bun the
+    // child can reach is the one the repair is supposed to find.
+    const bin = mkdtempSync(join(tmpdir(), "o2bbin-iso-"));
+    tmps.push(bin);
+    for (const name of ["bash", "realpath", "dirname", "cat", "tr", "head"]) {
+      const resolved = Bun.which(name);
+      if (!resolved) throw new Error(`test prerequisite missing from this machine: ${name}`);
+      symlinkSync(resolved, join(bin, name));
+    }
+    expect(Bun.which("bun", { PATH: bin })).toBeNull();
+
+    const r = spawnSync("bash", [WRAPPER, "probe"], {
+      env: { HOME: home, PATH: bin, CLAUDE_PLUGIN_ROOT: root },
+      encoding: "utf8",
+    });
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain("bun not on PATH");
+    expect(r.stdout).toContain("PROBE_OK:probe");
   });
 
   test("CLAUDE_PLUGIN_ROOT wins over a stale wrapper location (heals broken install)", () => {

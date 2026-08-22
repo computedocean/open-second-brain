@@ -20,6 +20,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -35,6 +37,22 @@ logger = logging.getLogger(__name__)
 # it opens the store for writing and the integrity scan runs.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 REQUEST_TIMEOUT_ENV = "OPEN_SECOND_BRAIN_MCP_TIMEOUT"
+
+# The child's stderr is where the runtime says why it refused to start ("error:
+# 'bun' is not on PATH."), and the JSON-RPC channel only ever reports the
+# consequence ("unexpected EOF"). Keep the tail of it so the exception can
+# carry the cause. Bounded twice over - by line count and by total bytes - so a
+# child that floods stderr cannot grow the parent's memory.
+STDERR_TAIL_LINES = 20
+STDERR_TAIL_MAX_BYTES = 8 * 1024
+# Stderr is read in fixed-size chunks rather than by line. `readline` returns
+# only at a newline or at EOF, so a child emitting one enormous unterminated
+# record would be held whole in the parent before any truncation could apply -
+# which is the exact failure this buffer exists to rule out.
+STDERR_CHUNK_BYTES = 4096
+# Time allowed for the drain thread to finish after the child is torn down,
+# so the excerpt includes the last thing the child managed to write.
+_STDERR_DRAIN_JOIN_SECONDS = 1.0
 
 
 def resolve_request_timeout() -> float | None:
@@ -209,6 +227,12 @@ class McpBrainBridge:
 
     ``spawn`` is injectable so tests substitute a fake process and never need a
     live Bun runtime. A crashed channel is restarted once on the next call.
+
+    ``env`` is the complete environment the child runs with; ``None`` means
+    inherit this process's. A Hermes gateway can start the provider with a
+    ``PATH`` too small to contain Bun, and the ``o2b`` wrapper refuses to run
+    when its own ``command -v bun`` misses - so the caller that resolved an
+    absolute Bun passes an environment carrying that Bun's directory.
     """
 
     def __init__(
@@ -219,12 +243,18 @@ class McpBrainBridge:
         command: tuple[str, ...] = ("o2b", "mcp"),
         spawn: Any = None,
         cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self._vault = vault
         self._repo_root = repo_root
         self._command = command
         self._spawn = spawn or self._default_spawn
         self._cwd = cwd
+        self._env = dict(env) if env is not None else None
+        # deque append/clear are atomic under the GIL, so the drain thread
+        # writes it and start() reads it with no extra lock.
+        self._stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        self._stderr_thread: threading.Thread | None = None
         # A gateway may serve several AIAgents concurrently, but one shared
         # bridge has one request/response stream. Serialise lifecycle and RPC
         # operations so request ids and stdout frames cannot interleave.
@@ -303,6 +333,7 @@ class McpBrainBridge:
             stderr=subprocess.PIPE,
             bufsize=0,
             cwd=self._cwd,
+            env=self._env,
         )
         stderr_thread = threading.Thread(
             target=self._drain_stderr,
@@ -310,34 +341,93 @@ class McpBrainBridge:
             daemon=True,
             name="o2b-mcp-stderr-drain",
         )
+        self._stderr_thread = stderr_thread
         stderr_thread.start()
         return process
 
-    @staticmethod
-    def _drain_stderr(process: Any) -> None:
-        """Read stderr line-by-line until the child exits; discard contents.
+    def _append_stderr_line(self, raw: bytes) -> None:
+        """Record one child stderr line, decoded and clipped to the budget."""
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if line:
+            self._stderr_tail.append(line[:STDERR_TAIL_MAX_BYTES])
+
+    def _drain_stderr(self, process: Any) -> None:
+        """Read stderr until the child exits, keeping a bounded tail of it.
 
         Runs in a daemon thread so a misbehaving child (one that floods
         stderr) cannot wedge the parent. Without this, a `stderr=PIPE` child
         that writes more than the kernel pipe buffer (~64 KiB on Linux) will
         block on its next stderr write, which surfaces in the parent as a
         silent death of the JSON-RPC channel.
+
+        Chunked rather than line-oriented, and the in-progress line is clipped
+        as it grows, so nothing here is proportional to what the child writes:
+        at most :data:`STDERR_TAIL_LINES` lines are kept and each is capped at
+        the byte budget, including a record that never sends a newline at all.
+        `read1` is preferred where the stream offers it, because a buffered
+        `read` waits for the full chunk and would hold the excerpt back until
+        the child had said that much more.
         """
         try:
             stream = getattr(process, "stderr", None)
             if stream is None:
                 return
-            for _line in iter(stream.readline, b""):
-                # Drain and discard; we do not currently surface stderr to
-                # the agent, but a future diagnostic flag could log it.
-                pass
+            read = getattr(stream, "read1", None) or getattr(stream, "read", None)
+            if not callable(read):
+                return
+            partial = b""
+            while True:
+                chunk = read(STDERR_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                *complete, partial = (partial + chunk).split(b"\n")
+                for raw in complete:
+                    self._append_stderr_line(raw)
+                # Keep the head of an over-long record: it is where a runtime
+                # puts the message, and clipping here is what keeps a child
+                # that never emits a newline from growing the parent.
+                if len(partial) > STDERR_TAIL_MAX_BYTES:
+                    partial = partial[:STDERR_TAIL_MAX_BYTES]
+            self._append_stderr_line(partial)
         except Exception:  # noqa: BLE001 - drain must never raise
             pass
+
+    def _stderr_excerpt(self) -> str:
+        """Buffered child stderr, newest lines last, capped at the byte budget."""
+        lines = list(self._stderr_tail)
+        excerpt = "\n".join(lines)
+        if len(excerpt) > STDERR_TAIL_MAX_BYTES:
+            excerpt = excerpt[-STDERR_TAIL_MAX_BYTES:]
+        return excerpt.strip()
+
+    def _with_stderr_excerpt(self, exc: BaseException) -> BaseException:
+        """The handshake failure, re-stated with what the child said on stderr.
+
+        ``stop()`` has already torn the child down, so the drain thread is
+        about to see EOF; give it a bounded moment to land its last lines
+        rather than reporting a truncated cause. Only transport failures are
+        rewritten - a JSON-RPC rejection came from a server that is talking,
+        and its stderr is noise - and the original exception is returned
+        untouched when the child said nothing.
+        """
+        if not isinstance(exc, BridgeTransportError):
+            return exc
+        thread = self._stderr_thread
+        if thread is not None and thread.is_alive():
+            thread.join(_STDERR_DRAIN_JOIN_SECONDS)
+        excerpt = self._stderr_excerpt()
+        if not excerpt:
+            return exc
+        return type(exc)(f"{exc}\n--- child stderr (last lines) ---\n{excerpt}")
 
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
+            self._stderr_tail.clear()
+            self._stderr_thread = None
             self._proc = self._spawn(self._argv())
             self._client = JsonRpcStdioClient(
                 self._proc.stdin, self._proc.stdout, timeout=resolve_request_timeout()
@@ -355,11 +445,14 @@ class McpBrainBridge:
                 )
                 self._client.notify("notifications/initialized")
                 result = self._client.request("tools/list", {})
-            except BaseException:
+            except BaseException as exc:
                 # A failed handshake must not leak the spawned process.
                 logger.warning("open-second-brain MCP handshake failed pid=%s", pid)
                 self.stop()
-                raise
+                explained = self._with_stderr_excerpt(exc)
+                if explained is exc:
+                    raise
+                raise explained from exc
             self._tools = list((result or {}).get("tools", []))
             self._started = True
             logger.debug("open-second-brain MCP child ready pid=%s", pid)
