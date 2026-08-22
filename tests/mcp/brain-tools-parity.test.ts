@@ -51,7 +51,19 @@
  * archive it took does not cover a note living outside `Brain/`) and
  * `brain_scaffold_stub` (the unresolved wikilink targets the search index
  * holds, and the verb that materialises a note for one - the list REFUSES
- * a missing or partially-resolved index rather than reporting zero).
+ * a missing or partially-resolved index rather than reporting zero); the
+ * salience-lifecycle-enrichment release added three: `brain_expire` (set,
+ * change or clear the `expiration_date` of one signal or preference by id
+ * - the mutation half of a field that until now could only be declared at
+ * creation, kept off `brain_lifecycle` because every action there
+ * addresses its subject by a note PATH and the path envelope refuses the
+ * `Brain/` root these artifacts live under), `brain_extract_signals` (the
+ * batch counterpart to regex fact extraction: hands the calling agent one
+ * session's user turns inside a needs-llm-step envelope and writes the
+ * validated answer as speculative `source_type: auto_extract` inbox
+ * signals), and `brain_design_note` (the one-shot sibling of the panel
+ * lane: a read-only grounding pass over tension, decision and truth
+ * records, one envelope, and a committed note under `Brain/decisions/`).
  */
 
 import { describe, expect, test } from "bun:test";
@@ -85,12 +97,15 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_deep_synthesis",
   "brain_delete_by_source",
   "brain_derive_fact",
+  "brain_design_note",
   "brain_diarize",
   "brain_distill_source",
   "brain_doctor",
   "brain_dream",
   "brain_entity",
   "brain_event_trace",
+  "brain_expire",
+  "brain_extract_signals",
   "brain_feedback",
   "brain_foresight",
   "brain_generation_reports",

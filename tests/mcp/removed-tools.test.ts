@@ -183,5 +183,13 @@ test("the shadow surface is gone: no hidden tools, removed names unlisted", asyn
   //   wiring-what-exists B2 t_ae62fabd) = 109.
   // + brain_scaffold_stub (materialise a note for an unresolved wikilink
   //   target, wiring-what-exists B3 t_783b37f8) = 110.
-  expect(list.result.tools.length).toBe(110);
+  // + brain_expire (set / change / clear a signal's or preference's
+  //   expiration_date by id, salience-lifecycle-enrichment unit 3c
+  //   t_5e338af1) = 111.
+  // + brain_extract_signals (model-mined session signals,
+  //   salience-lifecycle-enrichment t_1dace26d) = 112.
+  // + brain_design_note (one-shot design note grounded in tension,
+  //   decision and truth records, salience-lifecycle-enrichment
+  //   t_c87644b4) = 113.
+  expect(list.result.tools.length).toBe(113);
 });

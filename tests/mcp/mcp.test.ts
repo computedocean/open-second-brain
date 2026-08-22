@@ -290,6 +290,10 @@ describe("tool listing", () => {
         "brain_deep_synthesis",
         // Subject diarization (knowledge-intake-and-consolidation, t_28ba3fc4).
         "brain_diarize",
+        // Model-mined session signals (salience-lifecycle-enrichment, t_1dace26d).
+        "brain_extract_signals",
+        // One-shot design note (salience-lifecycle-enrichment, t_c87644b4).
+        "brain_design_note",
         "brain_idea_discovery",
         // Entity Truth & Self-Improving Dream Suite.
         "brain_truth",
@@ -339,6 +343,8 @@ describe("tool listing", () => {
         // Route-level MCP latency (context-pack-economics-observability).
         "brain_route_metrics",
         "brain_scaffold_stub",
+        // Expiration mutation by id (salience-lifecycle-enrichment unit 3c).
+        "brain_expire",
         // Shadow-only retrieval advisor (retrieval-quality-and-context-delivery).
         "brain_retrieval_plan",
         // Durable token-impact ledger (context-pack-economics-observability).
@@ -710,7 +716,15 @@ describe("stdio loop", () => {
     //   wiring-what-exists B2 t_ae62fabd) = 109.
     // + brain_scaffold_stub (materialise a note for an unresolved wikilink
     //   target, wiring-what-exists B3 t_783b37f8) = 110.
-    expect(list.result.tools.length).toBe(110);
+    // + brain_expire (set / change / clear a signal's or preference's
+    //   expiration_date by id, salience-lifecycle-enrichment unit 3c
+    //   t_5e338af1) = 111.
+    // + brain_extract_signals (model-mined session signals,
+    //   salience-lifecycle-enrichment t_1dace26d) = 112.
+    // + brain_design_note (one-shot design note grounded in tension,
+    //   decision and truth records, salience-lifecycle-enrichment
+    //   t_c87644b4) = 113.
+    expect(list.result.tools.length).toBe(113);
   });
 
   test("returns parse error for invalid JSON", async () => {

@@ -42,6 +42,12 @@ export type BrainSignalSign = (typeof BRAIN_SIGNAL_SIGN)[keyof typeof BRAIN_SIGN
  *                 `@osb` marker in a vault file.
  *   - `session` — replayed from a session JSONL by
  *                 `o2b brain import-session`.
+ *
+ * `extracted` and `auto_extract` are deliberately separate members:
+ * both mine a session, but one is a regex over structure and the other
+ * is a model reading prose, and their trust profiles differ forever.
+ * Folding the second into the first would make a model-authored signal
+ * indistinguishable from a deterministic one the day after it is written.
  */
 export const BRAIN_SIGNAL_SOURCE_TYPE = {
   live: "live",
@@ -49,18 +55,31 @@ export const BRAIN_SIGNAL_SOURCE_TYPE = {
   session: "session",
   /** Regex fact extraction (Memory Integrity Suite). */
   extracted: "extracted",
+  /**
+   * Model-mined from an imported session by `o2b brain extract-signals`
+   * (salience-lifecycle-enrichment). Speculative by construction: the
+   * inbox trial lane plus the dream pass is the only route to a
+   * confirmed preference.
+   */
+  autoExtract: "auto_extract",
 } as const;
 export type BrainSignalSourceType =
   (typeof BRAIN_SIGNAL_SOURCE_TYPE)[keyof typeof BRAIN_SIGNAL_SOURCE_TYPE];
 
-const BRAIN_SIGNAL_SOURCE_TYPE_VALUES: ReadonlyArray<BrainSignalSourceType> =
-  Object.values(BRAIN_SIGNAL_SOURCE_TYPE);
+/**
+ * The membership list, exported so a refusal can NAME the vocabulary
+ * instead of restating it. Both refusal sites in `signal.ts` used to
+ * carry a hand-written "'live', 'inline', or 'session'" that had already
+ * gone stale on `extracted`; a message that omits a legal value teaches
+ * the reader the wrong contract.
+ */
+export const BRAIN_SIGNAL_SOURCE_TYPES: ReadonlyArray<BrainSignalSourceType> = Object.freeze(
+  Object.values(BRAIN_SIGNAL_SOURCE_TYPE),
+);
 
 /** Type-guard for the enum union — used by writer + parser. */
 export function isBrainSignalSourceType(v: unknown): v is BrainSignalSourceType {
-  return (
-    typeof v === "string" && (BRAIN_SIGNAL_SOURCE_TYPE_VALUES as ReadonlyArray<string>).includes(v)
-  );
+  return typeof v === "string" && (BRAIN_SIGNAL_SOURCE_TYPES as ReadonlyArray<string>).includes(v);
 }
 
 export const BRAIN_PREFERENCE_STATUS = {
@@ -459,6 +478,17 @@ export const BRAIN_LOG_EVENT_KIND = {
    * records only runs that actually examined documents.
    */
   eventAnchorBackfill: "event-anchor-backfill",
+  /**
+   * `expiration-set` (unit 3c) - a signal's or preference's
+   * `expiration_date` was set, changed, or explicitly cleared after the
+   * artifact was written. Payload carries the `target` wikilink, its
+   * `kind`, the new `expiration` and the `previous` one (both spelled
+   * `none` when absent), and the `agent`. Both sides are recorded because
+   * "cleared" and "moved to a later date" are different decisions and the
+   * frontmatter afterwards cannot tell them apart. A no-op re-set writes
+   * no event, so the log records changes and not calls.
+   */
+  expirationSet: "expiration-set",
 } as const;
 export type BrainLogEventKind = (typeof BRAIN_LOG_EVENT_KIND)[keyof typeof BRAIN_LOG_EVENT_KIND];
 
@@ -1269,6 +1299,16 @@ export interface BrainDreamConfig {
    * byte-identical. Absent is treated as `false`.
    */
   readonly heal_enrich_enabled?: boolean;
+  /**
+   * Salience-lifecycle-enrichment (unit 1). Minimum combined salience
+   * score, in `[0, 1]`, a fact must reach to enter the rollup ladder's
+   * fold set. See `salience-gate.ts` for the formula. Absent (the
+   * default) leaves the gate OPEN: nothing is scored, every fact is
+   * counted, and the run behaves exactly as it did before the gate
+   * existed. Excluded facts are always named in the dream summary, so
+   * raising this never drops anything silently.
+   */
+  readonly salience_threshold?: number;
 }
 
 export interface BrainRetireConfig {

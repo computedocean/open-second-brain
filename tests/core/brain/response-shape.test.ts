@@ -18,8 +18,11 @@ import { parseDeriveFactInput } from "../../../src/core/brain/derived-fact.ts";
 import { parseResearchReportInput } from "../../../src/core/brain/research/research.ts";
 import {
   DERIVED_FACT_SHAPE,
+  DESIGN_NOTE_SHAPE,
   DISTILL_CLAIMS_SHAPE,
+  EXTRACTED_SIGNALS_SHAPE,
   MODEL_AUTHORED_SHAPES,
+  SKILL_PAGE_DRAFT_SHAPE,
   RESEARCH_REPORT_SHAPE,
   ResponseShapeError,
   SHAPE_DESCRIPTOR_KEYS,
@@ -137,7 +140,14 @@ describe("assertResponseShape", () => {
 describe("model-authored descriptors", () => {
   test("one descriptor per model-authored write path, all registered", () => {
     expect(new Set(Object.values(MODEL_AUTHORED_SHAPES))).toEqual(
-      new Set([DISTILL_CLAIMS_SHAPE, DERIVED_FACT_SHAPE, RESEARCH_REPORT_SHAPE]),
+      new Set([
+        DISTILL_CLAIMS_SHAPE,
+        DERIVED_FACT_SHAPE,
+        RESEARCH_REPORT_SHAPE,
+        EXTRACTED_SIGNALS_SHAPE,
+        SKILL_PAGE_DRAFT_SHAPE,
+        DESIGN_NOTE_SHAPE,
+      ]),
     );
   });
 

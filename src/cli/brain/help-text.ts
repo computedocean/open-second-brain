@@ -33,10 +33,11 @@ export const BRAIN_HELP = `usage: o2b brain <verb> [args...]
 Brain verbs (observing memory):
   init             Bootstrap <vault>/Brain/ (idempotent; --force overwrites)
   feedback         Record a taste signal (--topic, --signal, --principle)
-  dream            Deterministic dreaming pass; stage/validate/apply staged bundles
+  dream            Deterministic dreaming pass; stage/validate/apply/retriage bundles
   apply-evidence   Log a real-work application of a preference
   note             Append a one-line narrative milestone to Brain/log/today
   lifecycle        Tombstone/supersede a memory, resolve chain tips, curator slices
+  expire           Set, change or clear a signal's or preference's expiration date
   note-lifecycle   Note FILES: rename/move/archive/delete one, rewriting inbound links
   scaffold-stub    Unresolved wikilink targets: list them, or materialise a stub
   claims           Claim-graph query: current truth, truth-at-T, replaced-by, contested-by
@@ -123,7 +124,7 @@ Brain verbs (observing memory):
   recall-telemetry    List/summarize opt-in recall telemetry records
   knowledge-gaps      Rank recurring queries the vault answers poorly (unmet demand)
   generation-reports  Record/list/summarize opt-in LLM generation traces
-  skill-proposals     Learn/list/review deterministic skill proposals
+  skill-proposals     Learn/list/review skill proposals, from telemetry and from mature vault pages
   procedural-memory   Reconcile/list procedural memory index and usage
   procedural-graph    Rebuild/show procedural graph and hint projections
   recurrence          Inspect and update recurrence/support diagnostics
@@ -134,6 +135,7 @@ Brain verbs (observing memory):
   apply-markers       Apply @osb set frontmatter write-backs (report by default; --apply writes)
   pending             Review the write-approval queue: list | apply <id> | reject <id>
   signal              Fact signal lifecycle: retire <id> --reason <text>
+  capture             Stage one capture from the terminal: body, source, sender, guidance
   telegram-capture    Inbound Telegram capture bot: run (long-poll) | catchup
   inbox-drain         Classify and route staged captures (dry-run; --apply to route)
   repair-lane         Propose memory-graph edges (dry-run; --apply --confirm to write, holdout-gated)
@@ -160,6 +162,8 @@ Brain verbs (observing memory):
   trigger             Proactive trigger queue with anti-nag lifecycle (scan/list/ack/dismiss/act/suppress/unsuppress/history)
   deep-synthesis      Topic dossier: notes, agreements, contradictions, stale claims, gaps
   diarize             Subject profile: document set, stated-vs-evidenced gap, needs-llm-step skeleton
+  extract-signals     Mine taste signals from an imported session's user turns (two-phase, needs-llm-step)
+  design-note         One-shot design note grounded in tensions, decisions and truth records
   ideas               Ranked next-direction candidates from open loops (--triggers to enqueue)
   continuity          Export continuity records as ATOF/ATIF trajectories (read-only)
   bench               Memory quality benchmark over a disposable fixture vault
@@ -195,11 +199,14 @@ export const VERB_HELP: Record<string, string> = {
     "Creates a `sig-*.md` in Brain/inbox/. With --force-confirmed also creates a `pref-*.md`.\n",
   dream:
     "usage: o2b brain dream [run] [--dry-run] | stage | validate <run-id> | apply <run-id> |\n" +
-    "  discard <run-id> | list  [--now <ISO-8601>] [--agent <name>] [--vault <path>] [--json]\n" +
+    "  retriage <run-id> | discard <run-id> | list  [--now <ISO-8601>] [--agent <name>]\n" +
+    "  [--vault <path>] [--json]\n" +
     "Runs the deterministic dreaming algorithm (idempotent), or manages the staged\n" +
     "lifecycle: stage persists a reviewable proposal bundle under Brain/dream/staged/,\n" +
     "validate proves the vault has not drifted, apply re-validates then runs the same\n" +
-    "engine live, discard drops the bundle.\n",
+    "engine live, discard drops the bundle. retriage re-runs the salience gate\n" +
+    "(dream.salience_threshold) against the bundle and names the facts that would move\n" +
+    "into or out of the rollup fold set; it changes nothing, so re-stage to adopt it.\n",
   "apply-evidence":
     "usage: o2b brain apply-evidence --pref <id> --artifact <wikilink> --result applied|violated|outdated\n" +
     "  [--agent <name>] [--note <text>] [--vault <path>] [--json]\n" +
@@ -220,15 +227,33 @@ export const VERB_HELP: Record<string, string> = {
     "[--high-use-min <n>] lists injected-never-used, contradicted, and high-used\n" +
     "memories from observed-use verdicts. Tombstoned entries stay on disk for audit\n" +
     "but are excluded from recall, inject, and active.md.\n",
+  expire:
+    "usage: o2b brain expire <id> --expires <YYYY-MM-DD|ISO-8601|none>\n" +
+    "  [--agent <name>] [--vault <path>] [--json]\n" +
+    "Set, change or clear the expiration_date of one signal or preference,\n" +
+    "addressed by id (sig-<date>-<slug>, pref-<slug> or ret-<slug>). An expired\n" +
+    "memory is FILTERED on read, never deleted or moved - `o2b brain query\n" +
+    "--show-expired` still shows it. --expires none clears the date; it is a word\n" +
+    "rather than an empty string so a broken shell expansion cannot un-expire a\n" +
+    "memory. An unparseable date, or an id naming no artifact, exits 2 by name.\n" +
+    "Create-time expirations come from `o2b brain feedback --expires` instead.\n",
   "note-lifecycle":
     "usage: o2b brain note-lifecycle <rename|move|archive|delete> <path> [<to>]\n" +
-    "  [--apply] [--confirm] [--expect <n>] [--strict] [--vault <path>] [--config <path>] [--json]\n" +
+    "  [--apply] [--confirm] [--delete-linked] [--expect <n>] [--strict] [--vault <path>]\n" +
+    "  [--config <path>] [--json]\n" +
     "Note FILES, not memories: rename changes the filename in place, move changes the\n" +
     "directory, archive displaces the note under Archive/ mirroring its path, delete\n" +
     "removes it. Dry run by default - it walks, counts and writes nothing. --apply\n" +
     "performs it; delete additionally requires --confirm, because no archive covers a\n" +
-    "note outside Brain/. --expect <n> asserts the inbound-reference count before any\n" +
-    "write and --strict refuses a mutation carrying no such guard.\n" +
+    "note outside Brain/. --expect <n> asserts the count before any write and --strict\n" +
+    "refuses a mutation carrying no such guard.\n" +
+    "--delete-linked (delete only) widens the removal to the Brain files that DECLARE\n" +
+    "the note as their provenance and trace SOLELY to it - a per-item summary, signal,\n" +
+    "preference or entity page whose frontmatter names it and whose whole content\n" +
+    "restates it. A page that merely mentions the note in prose is reported and kept,\n" +
+    "as is a page citing a second source, as is every user note; the receipt prints\n" +
+    "the deletion set and the reported set separately, names the scope it scanned,\n" +
+    "and --expect then counts the deletion set.\n" +
     "Inbound [[wikilinks]] are rewritten across the vault, minus what vault scope\n" +
     "excludes, minus code fences, and minus Brain/log, which is append-only. The\n" +
     "receipt names how stale the search index now is and the command that fixes it.\n" +
@@ -671,6 +696,33 @@ export const VERB_HELP: Record<string, string> = {
     "One canonical entity per (category, name); aliases resolve to the canonical record.\n" +
     "Labels are decoration-stripped and quality-gated on set; prune removes historical\n" +
     "malformed nodes and their edges. Denylist: entities.label_denylist config key.",
+  "design-note":
+    "usage: o2b brain design-note <topic> [--vault <vault>] [--agent <name>]\n" +
+    "                              [--payload <json> | --payload-file <path>] [--json]\n" +
+    "The one-shot sibling of `o2b brain panel`. Without a payload it is\n" +
+    "read-only: it grounds the topic in the vault's tension records, decision\n" +
+    "records and truth projections - naming any store the vault holds nothing\n" +
+    "in, which is not the same as a store that matched nothing - and prints\n" +
+    "the single needs-llm-step envelope the calling agent answers.\n" +
+    "With --payload / --payload-file it validates the written note and commits\n" +
+    "it as Brain/decisions/design-<date>-<topic>.md, beside the panel outputs.\n" +
+    "The note must weigh named alternatives and mark EXACTLY ONE recommended:\n" +
+    "zero and two-plus are both refused, and the refusal states the count.\n" +
+    "A note for the same topic on the same day is refused, never overwritten.\n",
+  "extract-signals":
+    "usage: o2b brain extract-signals <session-ref> [--vault <vault>] [--agent <name>]\n" +
+    "                                  [--payload <json> | --payload-file <path>] [--json]\n" +
+    "Mine durable taste signals out of an ALREADY-IMPORTED session's user\n" +
+    "turns. Without a payload the verb is read-only: it prints the turns it\n" +
+    "would mine and the single needs-llm-step envelope the calling agent\n" +
+    "answers. With --payload / --payload-file it validates that answer and\n" +
+    "writes the accepted items into Brain/inbox/ as speculative signals with\n" +
+    "source_type: auto_extract, subject to the durability denylist and to\n" +
+    "Brain/pending/ staging when write approval is enabled.\n" +
+    "Refusals are named: a payload over the per-session cap, or an item below\n" +
+    "the confidence floor, rejects the whole payload and writes nothing.\n" +
+    "Import the session with `o2b brain import-session --recall` first; a\n" +
+    "session with no imported turns is refused, never reported as empty.\n",
   "import-session":
     "usage: o2b brain import-session <path> [--vault <vault>]\n" +
     "                                [--format auto|<registered-adapter>]\n" +
@@ -823,14 +875,17 @@ export const VERB_HELP: Record<string, string> = {
     "       o2b brain generation-reports show <report-id> [--vault <path>] [--json]\n" +
     "Inbound, opt-in LLM generation tracing. record is gated (default off) by --enable or generation_trace_enabled; only prompt_hash + counts are stored, never the prompt.\n",
   "skill-proposals":
-    "usage: o2b brain skill-proposals <learn|list|accept|reject|recover|usage> [args]\n" +
-    "Deterministic proposal queue lifecycle.\n" +
+    "usage: o2b brain skill-proposals <learn|list|accept|reject|recover|usage|page-candidates|page-draft> [args]\n" +
+    "Proposal queue lifecycle, from continuity telemetry and from mature vault pages.\n" +
     "  learn [--min-support <n>] [--vault <path>] [--json]\n" +
     "  list [--vault <path>] [--json]\n" +
     "  accept <slug> [--note <text>] [--vault <path>] [--json]\n" +
     "  reject <slug> --note <text> [--vault <path>] [--json]\n" +
     "  recover [--discard-unreadable] [--vault <path>] [--json]\n" +
     "  usage [--vault <path>] [--json]\n" +
+    "  page-candidates [--vault <path>] [--json]\n" +
+    "  page-draft <page> (--payload <json> | --payload-file <path>) [--vault <path>] [--json]\n" +
+    "page-candidates is read-only: it gates the vault's user pages on the page-meta trio (core tier, non-stale lifecycle, high confidence) and an observed-reuse floor, skips any page an installed skill already covers, and returns one needs-llm-step envelope per admitted page plus every skip with its reason. page-draft validates the returned draft and STAGES it as a pending mature_page proposal inside the vault; accept is what materializes the SKILL.md under the configured skills root.\n" +
     "recover resolves accept sequences a crash abandoned. It refuses, naming the file, on a held accept lock and on an unreadable journal marker; --discard-unreadable removes those markers.\n",
   "procedural-memory":
     "usage: o2b brain procedural-memory <reconcile|list|mark-used> [args]\n" +
@@ -903,6 +958,18 @@ export const VERB_HELP: Record<string, string> = {
     "excludes it from the dream pass while it stays readable in Brain/retired/.\n" +
     "Retiring a missing, already-retired, or non-signal id exits 2 (never a\n" +
     "silent no-op).\n",
+  capture:
+    "usage: o2b brain capture [<body>] [--source <channel>] [--sender <who>]\n" +
+    "  [--guidance <text>] [--at <ISO>] [--vault <path>] [--json]\n" +
+    "Stage one capture through the capture-note contract - the same writer the\n" +
+    "Telegram bot uses, so the id, the frontmatter and the staging path are\n" +
+    "identical. The body is the argument, or stdin when no argument is given.\n" +
+    "--source names the channel (default cli) and --sender who is capturing\n" +
+    "(default the configured agent); --at backdates a replayed capture to its\n" +
+    "own instant. --guidance records what should be DONE with the capture as a\n" +
+    "## Guidance body section, kept apart from the captured text and part of\n" +
+    "the id hash, so two captures differing only in guidance stay distinct.\n" +
+    "An empty body or a blank --guidance is refused by name and exits 2.\n",
   "telegram-capture":
     "usage: o2b brain telegram-capture <run|catchup> [--vault <path>]\n" +
     "Inbound Telegram capture bot. run long-polls getUpdates via fetch (needs\n" +
@@ -1094,7 +1161,9 @@ export const VERB_HELP: Record<string, string> = {
   architect:
     "usage: o2b brain architect <project-path> [--vault V] [--json]\n" +
     "Scan a project tree deterministically (stdlib-only, no LLM) and\n" +
-    "write architecture notes under Brain/projects/arch/<repo-key>/.\n" +
+    "write architecture notes under Brain/projects/arch/<repo-key>/:\n" +
+    "an overview, a key-decisions note listing this repo's ADR\n" +
+    "candidates, and one note per detected module.\n" +
     "Generated content lives in sentinel regions; operator prose\n" +
     "outside regions survives every re-scan byte-for-byte.",
   git:

@@ -253,6 +253,12 @@ export const DISTILL_CLAIMS_SURFACE = "distill_claims";
 export const DERIVED_FACT_SURFACE = "derived_fact";
 /** Surface label of the research-report synthesis payload. */
 export const RESEARCH_REPORT_SURFACE = "research_report";
+/** Surface label of the model-mined session-signal payload. */
+export const EXTRACTED_SIGNALS_SURFACE = "extracted_signals";
+/** Surface label of the skill draft written from a mature vault page. */
+export const SKILL_PAGE_DRAFT_SURFACE = "skill_page_draft";
+/** Surface label of the one-shot design note. */
+export const DESIGN_NOTE_SURFACE = "design_note";
 
 const STRING_SHAPE: ShapeDescriptor = { type: "string" };
 const STRING_LIST_SHAPE: ShapeDescriptor = { type: "array", items: STRING_SHAPE };
@@ -321,6 +327,88 @@ export const RESEARCH_REPORT_SHAPE: ShapeDescriptor = freezeDescriptor({
 });
 
 /**
+ * Taste signals a model mined from one imported session's user turns.
+ *
+ * Structure only. The two rules that actually protect the inbox - at most
+ * N items per session, and a floor under each item's confidence - read the
+ * whole list or compare a number against a limit, so they live in the
+ * semantic-check registry beside this descriptor rather than inside it.
+ * `sign` is checked against the two-member sign vocabulary here because a
+ * third value is a structural defect, not a judgement call.
+ */
+export const EXTRACTED_SIGNALS_SHAPE: ShapeDescriptor = freezeDescriptor({
+  type: "object",
+  required: ["items"],
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["topic", "signal", "principle", "confidence"],
+        properties: {
+          topic: FILLED_STRING_SHAPE,
+          signal: { enum: ["positive", "negative"] },
+          principle: FILLED_STRING_SHAPE,
+          confidence: { type: "number" },
+          scope: STRING_SHAPE,
+        },
+      },
+    },
+  },
+});
+
+/**
+ * A SKILL.md draft written from one mature vault page.
+ *
+ * Every field must carry content: a skill with a blank description is a
+ * skill no lexical matcher can ever surface, and a blank body is an
+ * installed file that teaches nothing. What is NOT here is the charset
+ * rule on `name` - the descriptor language has no pattern key, and the
+ * name becomes a DIRECTORY under the skills root, so the constraint is a
+ * semantic check beside this descriptor rather than a widening of it.
+ */
+export const SKILL_PAGE_DRAFT_SHAPE: ShapeDescriptor = freezeDescriptor({
+  type: "object",
+  required: ["name", "description", "triggers", "body"],
+  properties: {
+    name: FILLED_STRING_SHAPE,
+    description: FILLED_STRING_SHAPE,
+    triggers: FILLED_STRING_LIST_SHAPE,
+    body: FILLED_STRING_SHAPE,
+  },
+});
+
+/**
+ * A design note: named alternatives, one of them recommended.
+ *
+ * `recommended` is checked here only as a BOOLEAN. The rule that matters -
+ * exactly one alternative carries `true` - reads the whole array at once,
+ * which the descriptor language cannot express and is not being widened
+ * to; it lives in the semantic-check registry beside this descriptor.
+ */
+export const DESIGN_NOTE_SHAPE: ShapeDescriptor = freezeDescriptor({
+  type: "object",
+  required: ["title", "alternatives"],
+  properties: {
+    title: FILLED_STRING_SHAPE,
+    summary: FILLED_STRING_SHAPE,
+    alternatives: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["name", "approach", "tradeoffs", "recommended"],
+        properties: {
+          name: FILLED_STRING_SHAPE,
+          approach: FILLED_STRING_SHAPE,
+          tradeoffs: FILLED_STRING_SHAPE,
+          recommended: { type: "boolean" },
+        },
+      },
+    },
+  },
+});
+
+/**
  * Every declared descriptor, by surface. The registry exists so the shallow-
  * and-expressible discipline can be asserted over the whole set at once
  * rather than one descriptor at a time.
@@ -329,6 +417,9 @@ export const MODEL_AUTHORED_SHAPES: Readonly<Record<string, ShapeDescriptor>> = 
   [DISTILL_CLAIMS_SURFACE]: DISTILL_CLAIMS_SHAPE,
   [DERIVED_FACT_SURFACE]: DERIVED_FACT_SHAPE,
   [RESEARCH_REPORT_SURFACE]: RESEARCH_REPORT_SHAPE,
+  [EXTRACTED_SIGNALS_SURFACE]: EXTRACTED_SIGNALS_SHAPE,
+  [SKILL_PAGE_DRAFT_SURFACE]: SKILL_PAGE_DRAFT_SHAPE,
+  [DESIGN_NOTE_SURFACE]: DESIGN_NOTE_SHAPE,
 });
 
 // ----- Internals ----------------------------------------------------------

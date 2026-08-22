@@ -135,10 +135,25 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       [],
       [
         command("init", "Bootstrap Brain skeleton"),
-        command("feedback", "Record a taste signal"),
+        command("feedback", "Record a taste signal", [
+          flag("vault", "string"),
+          flag("topic", "string"),
+          flag("signal", "string"),
+          flag("principle", "string"),
+          flag("scope", "string"),
+          flag("source", "string-array"),
+          flag("agent", "string"),
+          flag("raw", "string"),
+          flag("raw-file", "string"),
+          flag("force-confirmed", "boolean"),
+          flag("date", "string"),
+          flag("slug", "string"),
+          flag("expires", "string"),
+        ]),
         command(
           "dream",
-          "Run deterministic consolidation; staged lifecycle via stage/validate/apply; " +
+          "Run deterministic consolidation; staged lifecycle via stage/validate/apply, " +
+            "retriage re-runs the salience gate over a staged bundle; " +
             "--step runs one independently-runnable step, --gate overrides a phase gate for one run",
           [flag("step", "string"), flag("gate", "string-array")],
         ),
@@ -363,6 +378,11 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "lifecycle",
           "Tombstone or supersede a memory, resolve chain tips, list curator slices",
         ),
+        command("expire", "Set, change or clear a signal's or preference's expiration date", [
+          flag("vault", "string"),
+          flag("expires", "string"),
+          flag("agent", "string"),
+        ]),
         command(
           "note-lifecycle",
           "Note FILES: rename, move, archive or delete one, rewriting inbound wikilinks",
@@ -371,6 +391,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
             flag("config", "string"),
             flag("apply", "boolean"),
             flag("confirm", "boolean"),
+            flag("delete-linked", "boolean"),
             flag("expect", "string"),
             flag("strict", "boolean"),
           ],
@@ -432,6 +453,26 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "diarize",
           "Subject profile: document set, stated-versus-evidenced gap, needs-LLM skeleton",
         ),
+        command(
+          "design-note",
+          "One-shot design note grounded in tension, decision, and truth records",
+          [
+            flag("vault", "string"),
+            flag("agent", "string"),
+            flag("payload", "string"),
+            flag("payload-file", "string"),
+          ],
+        ),
+        command(
+          "extract-signals",
+          "Mine taste signals from an imported session's user turns (two-phase, needs-LLM)",
+          [
+            flag("vault", "string"),
+            flag("agent", "string"),
+            flag("payload", "string"),
+            flag("payload-file", "string"),
+          ],
+        ),
         command("okf-export", "Write a portable Open Knowledge Format bundle"),
         command(
           "okf-import",
@@ -458,7 +499,8 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("knowledge-gaps", "Rank recurring queries the vault answers poorly"),
         command(
           "skill-proposals",
-          "Learn, list, review, and recover deterministic skill proposals",
+          "Learn, list, review, and recover skill proposals, including drafts from mature pages",
+          [flag("vault", "string"), flag("payload", "string"), flag("payload-file", "string")],
         ),
         command("procedural-memory", "Reconcile or list the procedural memory index and its usage"),
         command("procedural-graph", "Rebuild or show the procedural graph and hint projections"),
@@ -485,6 +527,14 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           ],
         ),
         command("signal", "Fact signal lifecycle: retire a signal with a reason"),
+        command("capture", "Stage one capture from the terminal: body, source, sender, guidance", [
+          flag("vault", "string"),
+          flag("source", "string"),
+          flag("sender", "string"),
+          flag("guidance", "string"),
+          flag("agent", "string"),
+          flag("at", "string"),
+        ]),
         command("telegram-capture", "Inbound Telegram capture bot: long-poll run or catchup"),
         command("inbox-drain", "Classify and route staged captures (dry-run by default)"),
         command(

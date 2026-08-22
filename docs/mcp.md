@@ -172,7 +172,7 @@ Either way a call that has already entered one of them runs it to the end.
 
 ## Tool Highlights
 
-The full server currently advertises 110 tools; the 18 deprecated predecessor
+The full server currently advertises 111 tools; the 18 deprecated predecessor
 names were removed in 1.0.0 and now answer a precise INVALID_PARAMS tombstone
 (see "Consolidated views and deprecated aliases" below). The table highlights
 the operator-facing core,
@@ -1189,3 +1189,46 @@ log line is machine-composed rather than authored.
   value is `INVALID_PARAMS` naming the accepted set. Records predating the
   field carry no channel and fall into no bucket - see
   [`observability.md`](observability.md).
+- Since v1.51.0 `brain_extract_signals` joins the surface (111 total): the
+  batch counterpart to the regex fact extractor. Called with a `session`
+  alone it is read-only and returns that session's imported USER turns plus
+  exactly one needs-llm-step envelope; called with `items` it validates the
+  mined signals - structurally, then against a per-session cap and a
+  per-item confidence floor - and writes the accepted ones into
+  `Brain/inbox/` as `source_type: auto_extract` signals, subject to the
+  durability denylist and to `Brain/pending/` staging when write approval is
+  on. `auto_extract` is a new member of the closed `source_type` vocabulary,
+  distinct from `extracted` (regex) forever, because their trust profiles
+  differ; a reader from an older build refuses a file carrying it rather
+  than misreading it. A payload over the cap or below the floor is refused
+  whole, naming the limit and the offending value - nothing partial lands.
+- Since v1.51.0 `brain_skill_proposals` accepts two further operations and
+  no new tool. `page_candidates` is read-only: it gates the vault's user
+  pages on the page-meta trio (`tier: core`, a non-stale lifecycle,
+  `_confidence: high`) and an observed-reuse floor, skips any page an
+  installed skill already covers, and returns one needs-llm-step envelope
+  per admitted page plus every skipped page with the reason and the
+  measured value behind it. `page_draft` validates the returned SKILL.md
+  draft - structurally, then against the rule that its `name` is a legal
+  skill directory name - and STAGES it as a pending proposal under the new
+  `mature_page` pattern kind, inside the vault. Nothing reaches the skills
+  root until `accept`, which materializes a `SKILL.md` there through the
+  same write-ahead journal the procedure branch uses; the journal records
+  the absolute path it is about to write, so a rollback removes exactly
+  that file (and the directory it created for it, only while empty).
+  Sticky rejection applies as it does to every other pattern kind.
+- Since v1.51.0 `brain_design_note` joins the surface (112 total): the
+  one-shot sibling of the panel lane. Called with a `topic` alone it is
+  read-only - it grounds the topic in the vault's tension records, decision
+  records and truth projections using the same deterministic token overlap
+  `brain_decision`'s similar-decision lookup ranks with, and returns one
+  needs-llm-step envelope. A store this vault holds NOTHING in is named in
+  `empty_stores`; a store that holds records and matched none of them is
+  not, because those are different facts and lead to different next moves.
+  An empty vault is a grounded report, never a refusal. Called with a
+  `note` it validates the written note - structurally, then against the
+  rule that EXACTLY ONE alternative sets `recommended: true` - and commits
+  it as `Brain/decisions/design-<date>-<topic>.md`, beside the panel
+  outputs. Zero and two-plus recommendations are both refused and the
+  refusal states the count found; a note for the same topic on the same day
+  is refused rather than overwriting the first.

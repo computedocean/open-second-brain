@@ -8,7 +8,7 @@
  * content-manifest entry) — without re-mining the vault or hand-chasing
  * summary pages.
  *
- * Two surfaces, one shared tracer:
+ * Three surfaces, one shared tracer:
  *   - {@link searchBySourceFile} — read-only. Every Brain page that traces
  *     to the exact source.
  *   - {@link deleteBySource} — DRY-RUN BY DEFAULT. Reports the blast radius
@@ -16,6 +16,11 @@
  *     the index artifacts; original user notes are removed ONLY with an
  *     explicit `includeOriginals`. Every confirmed cleanup writes a
  *     `source_invalidation` continuity record (auditable).
+ *   - {@link traceNoteDerivations} — read-only. The same classification
+ *     run for a NOTE path rather than an imported source, so
+ *     `noteLifecycle`'s `--delete-linked` cascade decides "derived solely
+ *     from this" with this module's rule instead of a second one of its
+ *     own. It removes nothing; the caller owns the ladder.
  *
  * Provenance a page can carry back to a source:
  *   - frontmatter `source_path` (the ingest summary page, kind
@@ -98,6 +103,31 @@ export interface SourceCleanupEntry {
   readonly deletable: boolean;
 }
 
+/**
+ * A traced entry plus the one thing a NOTE delete needs and a source
+ * delete does not.
+ *
+ * The extra field is on this type rather than on
+ * {@link SourceCleanupEntry} deliberately: `deleteBySource`'s payload is
+ * pinned byte-for-byte by
+ * `tests/core/brain/gates/recoverability.test.ts`, and its rule is
+ * long-settled. Only {@link traceNoteDerivations} reports it.
+ */
+export interface NoteDerivationEntry extends SourceCleanupEntry {
+  /**
+   * True when the page names the subject in STRUCTURED provenance - a
+   * `source_path`, a `session_ref`, a `source:` link, or the
+   * `evidenced_by` fold - rather than only mentioning it in prose.
+   *
+   * {@link tracesSolelyToSource} is vacuously true for a page carrying no
+   * `source:` array at all, so `deletable` alone cannot tell a derivation
+   * from a paragraph that happens to write `[[Note]]`. The
+   * `--delete-linked` cascade requires this as well before it will put a
+   * Brain page in a deletion set.
+   */
+  readonly structuredProvenance: boolean;
+}
+
 export interface SourceCleanupPlan {
   /** Canonical form of the queried source. */
   readonly source: string;
@@ -152,6 +182,70 @@ export interface DeleteBySourceOptions {
   readonly now?: Date;
   /** Agent identity recorded in the audit reason. */
   readonly agent?: string;
+}
+
+/**
+ * The spellings that name ONE subject, and the canonical form they all
+ * reduce to.
+ *
+ * `deleteBySource` has exactly one spelling - the canonical path of the
+ * imported file, which is how the ingest pipeline stamps `source_path`
+ * and how its provenance wikilinks are written. A NOTE is the same
+ * subject reached from the other side and Obsidian writes it two ways,
+ * `[[Projects/Note.md]]` and `[[Projects/Note]]`, so a tracer that knew
+ * only the first would leave a solely-derived signal unmatched and report
+ * it as a protected mention - a safe answer, but the wrong one.
+ *
+ * The bare `[[Note]]` spelling is deliberately NOT a member of any
+ * identity built here. It resolves to one note only when exactly one note
+ * in the vault carries the basename (`store/links.ts:66-69`), so
+ * attributing it would let a page derived from a DIFFERENT note of the
+ * same name into a deletion set. The caller still reports it: the
+ * note-delete surface's own inbound probe reads all three spellings.
+ */
+interface SourceIdentity {
+  /** Canonical form of the subject's own path. */
+  readonly canonical: string;
+  /** The subject as the caller spelled it, for `session_ref` equality. */
+  readonly sourceFile: string;
+  /** Every wikilink / `source_path` spelling that names the subject. */
+  readonly canonicalSpellings: ReadonlySet<string>;
+  /** The same spellings in match order, for the wikilink probes. */
+  readonly spellings: ReadonlyArray<string>;
+}
+
+/** One canonical path, spelled one way: `deleteBySource`'s subject. */
+function exactSourceIdentity(sourceFile: string): SourceIdentity {
+  const canonical = canonicalNotePath(sourceFile);
+  return Object.freeze({
+    canonical,
+    sourceFile,
+    canonicalSpellings: new Set([canonical]),
+    spellings: Object.freeze([canonical]),
+  });
+}
+
+/** The `.md` suffix, matched case-insensitively as the note surfaces do. */
+const MARKDOWN_SUFFIX = ".md";
+
+/** One note path, spelled with and without its `.md` suffix. */
+function noteIdentity(notePath: string): SourceIdentity {
+  const canonical = canonicalNotePath(notePath);
+  const bare = canonical.toLowerCase().endsWith(MARKDOWN_SUFFIX)
+    ? canonical.slice(0, -MARKDOWN_SUFFIX.length)
+    : canonical;
+  const spellings = bare === canonical ? [canonical] : [canonical, bare];
+  return Object.freeze({
+    canonical,
+    sourceFile: notePath,
+    canonicalSpellings: new Set(spellings),
+    spellings: Object.freeze(spellings),
+  });
+}
+
+/** Does `target` - any spelling - name this subject? */
+function namesSubject(identity: SourceIdentity, target: string): boolean {
+  return identity.canonicalSpellings.has(canonicalNotePath(target));
 }
 
 /** Directories whose pages are per-item, single-source derived artifacts. */
@@ -250,12 +344,7 @@ interface RawMatch {
  * transitive `evidenced_by` fold is resolved in a second pass once the set
  * of directly-derived signals is known.
  */
-function directMatch(
-  vault: string,
-  absPath: string,
-  canonical: string,
-  sourceFile: string,
-): RawMatch | null {
+function directMatch(vault: string, absPath: string, identity: SourceIdentity): RawMatch | null {
   let text: string;
   try {
     text = readFileSync(absPath, "utf8");
@@ -289,7 +378,7 @@ function directMatch(
   };
 
   const sourcePath = stringField(meta, "source_path");
-  if (sourcePath !== null && canonicalNotePath(sourcePath) === canonical) {
+  if (sourcePath !== null && namesSubject(identity, sourcePath)) {
     return {
       ...base,
       match: "source_path",
@@ -298,11 +387,14 @@ function directMatch(
   }
 
   const sessionRef = stringField(meta, "session_ref");
-  if (sessionRef !== null && (sessionRef === canonical || sessionRef === sourceFile)) {
+  if (
+    sessionRef !== null &&
+    (sessionRef === identity.canonical || sessionRef === identity.sourceFile)
+  ) {
     return { ...base, match: "session_ref", isIndexArtifact: false };
   }
 
-  if (wikilinkRegExp(canonical).test(text)) {
+  if (identity.spellings.some((spelling) => wikilinkRegExp(spelling).test(text))) {
     return { ...base, match: "wikilink", isIndexArtifact: false };
   }
 
@@ -314,16 +406,40 @@ function directMatch(
  * OTHER structured source link. A signal whose `source` array names a
  * second source is a shared observation — reported, never auto-deleted.
  */
-function tracesSolelyToSource(raw: RawMatch, canonical: string): boolean {
+function tracesSolelyToSource(raw: RawMatch, identity: SourceIdentity): boolean {
   for (const link of raw.sourceLinks) {
-    if (canonicalNotePath(wikilinkTarget(link)) !== canonical) return false;
+    if (!namesSubject(identity, wikilinkTarget(link))) return false;
   }
   return true;
+}
+
+/**
+ * Does the page declare the subject as its PROVENANCE, or does it merely
+ * mention it?
+ *
+ * Every match except `wikilink` is structured by construction: a
+ * `source_path`, a `session_ref` and the `evidenced_by` fold are all
+ * frontmatter this project writes. A wikilink match is structured only
+ * when one of the page's own `source:` links names the subject - the same
+ * spelling in a paragraph of prose is a reference, not a derivation, and
+ * {@link tracesSolelyToSource} cannot tell the two apart because a page
+ * with no `source:` array satisfies it vacuously.
+ */
+function hasStructuredProvenance(raw: RawMatch, identity: SourceIdentity): boolean {
+  if (raw.match !== "wikilink") return true;
+  return raw.sourceLinks.some((link) => namesSubject(identity, wikilinkTarget(link)));
 }
 
 interface Traced {
   readonly derived: ReadonlyArray<SourceCleanupEntry>;
   readonly mentions: ReadonlyArray<SourceCleanupEntry>;
+  /**
+   * Vault-relative paths of the pages that named the subject in
+   * structured provenance. Carried beside the two lists rather than on
+   * the entries so `deleteBySource`'s payload keeps the exact shape it
+   * shipped with; {@link traceNoteDerivations} is the one reader.
+   */
+  readonly structured: ReadonlySet<string>;
 }
 
 /**
@@ -331,13 +447,12 @@ interface Traced {
  * deletable-derived set and the reported-only mentions set. Deterministic:
  * both lists are sorted by vault-relative path.
  */
-function traceReferences(vault: string, sourceFile: string): Traced {
-  const canonical = canonicalNotePath(sourceFile);
+function traceReferences(vault: string, identity: SourceIdentity): Traced {
   const root = brainDirs(vault).brain;
   const rawMatches: RawMatch[] = [];
   if (existsSync(root)) {
     for (const absPath of walkBrainMarkdown(root)) {
-      const m = directMatch(vault, absPath, canonical, sourceFile);
+      const m = directMatch(vault, absPath, identity);
       if (m !== null) rawMatches.push(m);
     }
   }
@@ -376,8 +491,9 @@ function traceReferences(vault: string, sourceFile: string): Traced {
 
   const derived: SourceCleanupEntry[] = [];
   const mentions: SourceCleanupEntry[] = [];
+  const structured = new Set<string>();
   for (const raw of rawMatches) {
-    const deletable = computeDeletable(vault, raw, canonical, derivedSignalIds);
+    const deletable = computeDeletable(vault, raw, identity, derivedSignalIds);
     const entry: SourceCleanupEntry = {
       path: raw.path,
       id: raw.id,
@@ -386,9 +502,14 @@ function traceReferences(vault: string, sourceFile: string): Traced {
       isIndexArtifact: raw.isIndexArtifact,
       deletable,
     };
+    if (hasStructuredProvenance(raw, identity)) structured.add(entry.path);
     (deletable ? derived : mentions).push(entry);
   }
-  return { derived: derived.toSorted(byPath), mentions: mentions.toSorted(byPath) };
+  return {
+    derived: derived.toSorted(byPath),
+    mentions: mentions.toSorted(byPath),
+    structured,
+  };
 }
 
 function byPath(a: SourceCleanupEntry, b: SourceCleanupEntry): number {
@@ -398,7 +519,7 @@ function byPath(a: SourceCleanupEntry, b: SourceCleanupEntry): number {
 function computeDeletable(
   vault: string,
   raw: RawMatch,
-  canonical: string,
+  identity: SourceIdentity,
   derivedSignalIds: ReadonlySet<string>,
 ): boolean {
   // The ingest summary page is always an index artifact to purge.
@@ -406,7 +527,7 @@ function computeDeletable(
   // Only per-item derivation pages are ever auto-deleted.
   if (!inDerivationDir(vault, raw.absPath)) return false;
   // A signal citing a second source is a shared observation — report it.
-  if (!tracesSolelyToSource(raw, canonical)) return false;
+  if (!tracesSolelyToSource(raw, identity)) return false;
   // A preference folded from any foreign signal is a shared fold — report it.
   // This holds however the preference was first matched: a second-pass
   // `evidenced_by` fold OR a first-pass `[[source]]` wikilink match that also
@@ -456,8 +577,53 @@ export function searchBySourceFile(
   vault: string,
   sourceFile: string,
 ): ReadonlyArray<SourceCleanupEntry> {
-  const { derived, mentions } = traceReferences(vault, sourceFile);
+  const { derived, mentions } = traceReferences(vault, exactSourceIdentity(sourceFile));
   return Object.freeze([...derived, ...mentions].toSorted(byPath));
+}
+
+/**
+ * The vault-relative root the derived-set fold walks, and the whole of
+ * it: `Brain/`.
+ *
+ * Named rather than implied because a caller reporting an empty derived
+ * set has to be able to say whether that is a measurement or a scope
+ * boundary. Only `Brain/` holds per-item derivation pages, so a user note
+ * outside it is never a candidate for auto-deletion however tightly it
+ * references the subject - it is somebody's prose, and this fold does not
+ * reach it.
+ */
+export const DERIVATION_SCAN_SCOPE = "Brain/";
+
+/**
+ * Every Brain page tracing back to one NOTE path, classified by the same
+ * blast-radius rule {@link deleteBySource} applies to an imported source:
+ * `deletable` marks a single-purpose derived file tracing SOLELY to the
+ * note, everything else is a reported mention.
+ *
+ * Read-only. The caller decides what to do with the two lists; this
+ * function's whole contribution is that the rule deciding which list a
+ * page lands in is the SAME function in both cases, so a note delete and
+ * a source delete cannot come to disagree about what "derived solely
+ * from" means.
+ *
+ * Each entry additionally carries
+ * {@link NoteDerivationEntry.structuredProvenance}, which the shared rule
+ * does not read: a note, unlike an imported source, is something ordinary
+ * prose links to, and the cascade needs to tell a declared derivation
+ * from a sentence.
+ */
+export function traceNoteDerivations(
+  vault: string,
+  notePath: string,
+): ReadonlyArray<NoteDerivationEntry> {
+  const { derived, mentions, structured } = traceReferences(vault, noteIdentity(notePath));
+  return Object.freeze(
+    [...derived, ...mentions]
+      .toSorted(byPath)
+      .map((entry) =>
+        Object.freeze({ ...entry, structuredProvenance: structured.has(entry.path) }),
+      ),
+  );
 }
 
 /**
@@ -507,14 +673,15 @@ export function deleteBySource(
   sourceFile: string,
   opts: DeleteBySourceOptions = {},
 ): SourceCleanupPlan {
-  const canonical = canonicalNotePath(sourceFile);
+  const identity = exactSourceIdentity(sourceFile);
+  const canonical = identity.canonical;
   const confirm = opts.confirm === true;
   const includeOriginals = opts.includeOriginals === true;
   // Vault-identity write guard (context-integrity-gates, Unit J).
   // Dry-run (the default) plans and writes nothing, so it stays ungated.
   if (confirm) assertVaultIdentityForWrite(vault);
 
-  const { derived, mentions } = traceReferences(vault, sourceFile);
+  const { derived, mentions } = traceReferences(vault, identity);
   const originals = findOriginals(vault, canonical);
   const manifestKey = readManifest(vault).entries[canonical] !== undefined ? canonical : null;
   const blastRadius = derived.length + mentions.length + originals.length;

@@ -28,9 +28,12 @@ import {
 import {
   applyDreamBundle,
   discardDreamBundle,
+  DreamRetriageError,
   listDreamBundles,
+  retriageDreamBundle,
   stageDream,
   validateDreamBundle,
+  type DreamRetriageEntry,
 } from "../../core/brain/dream-stage.ts";
 import { BRAIN_ROLES } from "../../core/brain/trust/role.ts";
 import { resolveEffectiveScope, writeSignal } from "../../core/brain/signal.ts";
@@ -43,6 +46,14 @@ import {
 } from "../../core/brain/write-advisory.ts";
 import { loadFeedbackDefaultScopeSafe } from "../../core/brain/policy.ts";
 import { writePreference } from "../../core/brain/preference.ts";
+import { normalizeExpirationDate } from "../../core/brain/expiration.ts";
+import {
+  EXPIRATION_CLEAR,
+  ExpirationTargetNotFoundError,
+  ExpirationValueError,
+  InvalidExpirationTargetError,
+  setExpiration,
+} from "../../core/brain/expiration-set.ts";
 import { gatedOwnerScopeView, type OwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import { brainArtifactSlug } from "../../core/brain/wikilink.ts";
 import { validateBrainFeedbackInput } from "../../core/brain/sessions/validate-feedback.ts";
@@ -64,6 +75,7 @@ import {
   resolveSharedNamespace,
 } from "../../core/brain/shared-namespace.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "../protocol.ts";
+import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import {
   emitObservedUse,
@@ -132,6 +144,19 @@ async function toolBrainFeedback(
   // signal writer so a retried / double-delivered feedback call dedupes
   // instead of appending a second signal. Absent → historical behaviour.
   const idempotencyKey = coerceStr(args, "idempotency_key", false);
+  // Creation-time expiration (unit 3c). Validated through the one
+  // chokepoint BEFORE the signal write, so an unparseable date refuses
+  // the whole call rather than landing a signal and then failing on the
+  // preference beside it.
+  const expiresRaw = coerceStr(args, "expires", false);
+  let expires: string | undefined;
+  if (expiresRaw !== null && expiresRaw !== undefined) {
+    try {
+      expires = normalizeExpirationDate(expiresRaw);
+    } catch (err) {
+      throw new MCPError(INVALID_PARAMS, `brain_feedback: expires: ${(err as Error).message}`);
+    }
+  }
   const now = new Date();
   const createdAt = isoSecond(now);
   const signalStamp = eventTime ?? now;
@@ -166,6 +191,7 @@ async function toolBrainFeedback(
     // supplied, so a live "remember" stays byte-identical.
     ...(eventTime ? { valid_from: signalCreatedAt, recorded_at: signalCreatedAt } : {}),
     ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+    ...(expires !== undefined ? { expiration_date: expires } : {}),
   };
   const sigResult = writeSignal(ctx.vault, signalInput, writeOpts);
   // A deduped signal means this whole feedback call is a retry of one
@@ -256,6 +282,9 @@ async function toolBrainFeedback(
         // preferences. This writer now matches it.
         confidence_value: 0,
         ...(effectiveScope !== undefined ? { scope: effectiveScope } : {}),
+        // The same lifetime the signal carries: a rule confirmed from an
+        // observation that expires on a date does not outlive it.
+        ...(expires !== undefined ? { expiration_date: expires } : {}),
       },
       // Ownership is resolved by the writer, never echoed from `agent`:
       // that argument is caller-supplied, and a caller must not be able to
@@ -414,12 +443,13 @@ async function toolBrainDream(
     action !== "stage" &&
     action !== "validate" &&
     action !== "apply" &&
+    action !== "retriage" &&
     action !== "discard" &&
     action !== "list"
   ) {
     throw new MCPError(
       INVALID_PARAMS,
-      "brain_dream: action must be run|stage|validate|apply|discard|list",
+      "brain_dream: action must be run|stage|validate|apply|retriage|discard|list",
     );
   }
   const dryRun = coerceBool(args, "dry_run");
@@ -488,7 +518,7 @@ async function toolBrainDream(
     // Staged lifecycle (t_ae8a8ec0): stage -> validate -> apply over a
     // persisted bundle; dream() stays the only promotion engine.
     const runIdArg = coerceStr(args, "run_id", false);
-    if ((action === "validate" || action === "apply" || action === "discard") && !runIdArg) {
+    if (action !== "list" && action !== "stage" && !runIdArg) {
       throw new MCPError(INVALID_PARAMS, `brain_dream action=${action}: run_id is required`);
     }
     const now = nowDate ?? new Date();
@@ -528,6 +558,48 @@ async function toolBrainDream(
           ...(outcome.summary !== undefined
             ? { changed: outcome.summary.changed, ...scopedDreamRows(dreamView, outcome.summary) }
             : {}),
+        };
+      }
+      case "retriage": {
+        // Read-only: it re-runs the salience gate against the current
+        // threshold and reports what would move. The bundle is not
+        // rewritten, so a caller that likes the new partition re-stages.
+        let outcome;
+        try {
+          outcome = retriageDreamBundle(ctx.vault, runIdArg!, stageOpts);
+        } catch (exc) {
+          if (exc instanceof DreamRetriageError) {
+            throw new MCPError(INVALID_PARAMS, `brain_dream: ${exc.message}`);
+          }
+          throw exc;
+        }
+        const scopedDelta = (
+          entries: ReadonlyArray<DreamRetriageEntry>,
+        ): Array<Record<string, unknown>> =>
+          dreamView
+            .keep(entries, (entry) => [entry.pref_id, entry.path])
+            .map((entry) => ({
+              pref_id: entry.pref_id,
+              path: entry.path,
+              score: entry.score,
+              staged_score: entry.staged_score,
+            }));
+        return {
+          action,
+          run_id: runIdArg,
+          staged_threshold: outcome.stagedThreshold,
+          current_threshold: outcome.currentThreshold,
+          changed: outcome.changed,
+          considered: outcome.considered,
+          admitted: outcome.admitted,
+          // Counts before the owner filter, names after it: a scoped
+          // caller is still told HOW MANY facts moved, and only the
+          // identities it may not see are withheld.
+          newly_admitted_count: outcome.newlyAdmitted.length,
+          newly_excluded_count: outcome.newlyExcluded.length,
+          newly_admitted: scopedDelta(outcome.newlyAdmitted),
+          newly_excluded: scopedDelta(outcome.newlyExcluded),
+          notes: [...outcome.notes],
         };
       }
       case "discard": {
@@ -622,6 +694,26 @@ async function toolBrainDream(
       age_days: q.age_days,
       failed_gates: [...q.failed_gates],
     })),
+    // The salience gate over the rollup fold set. `threshold: null` says
+    // the gate was absent, and the two counts are reported before the
+    // owner filter so a scoped caller still learns how many facts were
+    // held back even where it may not see their names.
+    salience_gate: {
+      threshold: summary.salience_gate.threshold,
+      considered: summary.salience_gate.considered,
+      admitted: summary.salience_gate.admitted,
+      excluded_count: summary.salience_gate.excluded.length,
+      excluded: dreamView
+        .keep(summary.salience_gate.excluded, (entry) => [entry.pref_id, entry.path])
+        .map((entry) => ({
+          pref_id: entry.pref_id,
+          path: entry.path,
+          score: entry.score,
+          mass: entry.mass,
+          confidence: entry.confidence,
+          reuse: entry.reuse,
+        })),
+    },
     snapshot_path: summary.snapshot_path
       ? vaultRelativeSafe(ctx.vault, summary.snapshot_path)
       : null,
@@ -795,6 +887,56 @@ async function toolBrainNote(
 
 // ----- brain_write_session (Agent Write Contract Suite, v0.41.0) ------------
 
+/**
+ * Post-creation expiration mutation (unit 3c).
+ *
+ * A tool of its own rather than an action on `brain_lifecycle`, and the
+ * reason is how each addresses its subject: every `brain_lifecycle`
+ * action takes a vault-relative PATH and runs it through a note-path
+ * envelope, while a signal or preference is addressed by id and lives
+ * under the `Brain/` root that envelope exists to refuse. Folding them
+ * together would mean carving an exception into that refusal.
+ */
+const EXPIRE_TOOL = "brain_expire";
+
+async function toolBrainExpire(
+  ctx: ServerContext,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const id = coerceStr(args, "id", true)!;
+  const expires = coerceStr(args, "expires", true)!;
+  const agent = coerceStr(args, "agent", false);
+  try {
+    const res = setExpiration(ctx.vault, id, expires, {
+      ...(agent ? { agent } : {}),
+    });
+    return {
+      id: res.id,
+      kind: res.kind,
+      path: res.path,
+      expiration: res.expiration,
+      previous: res.previous,
+      changed: res.changed,
+    };
+  } catch (err) {
+    // Each of the three is the caller's fault and each has a different
+    // next move: fix the date, fix the id, or use a surface that takes a
+    // path. They keep their own class name as the reported code.
+    if (
+      err instanceof ExpirationValueError ||
+      err instanceof ExpirationTargetNotFoundError ||
+      err instanceof InvalidExpirationTargetError
+    ) {
+      throw new MCPError(INVALID_PARAMS, `${EXPIRE_TOOL}: ${err.message}`, { code: err.name });
+    }
+    if (err instanceof MCPError) throw err;
+    throw new MCPError(
+      INTERNAL_ERROR,
+      `${EXPIRE_TOOL}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 export const FEEDBACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_feedback",
@@ -850,6 +992,11 @@ export const FEEDBACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           description:
             "Optional client key that dedupes retried calls: same key + same payload is a no-op; same key + different payload is rejected.",
         },
+        expires: {
+          type: "string",
+          description:
+            "Optional YYYY-MM-DD or ISO-8601 lifetime. Past it the signal (and any force-confirmed preference) drops out of default reads; the file is never deleted.",
+        },
       },
       required: ["topic", "signal", "principle"],
       additionalProperties: false,
@@ -859,19 +1006,19 @@ export const FEEDBACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_dream",
     description:
-      "Deterministic learning pass over `Brain/inbox/`. action=run (default) promotes inline; the staged lifecycle persists a reviewable bundle: stage -> validate -> apply (or discard), plus list. Typically scheduled via cron.",
+      "Deterministic learning pass over `Brain/inbox/`. action=run (default) promotes inline; the staged lifecycle persists a reviewable bundle: stage -> validate -> apply (or discard), plus list and retriage. Typically scheduled via cron.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["run", "stage", "validate", "apply", "discard", "list"],
+          enum: ["run", "stage", "validate", "apply", "retriage", "discard", "list"],
           description:
-            "run executes inline; stage persists a proposal bundle; validate/apply/discard manage one bundle by run_id; list shows bundles.",
+            "run executes inline; stage persists a bundle; validate/apply/discard manage one by run_id; retriage re-scores a bundle's salience gate; list shows bundles.",
         },
         run_id: {
           type: "string",
-          description: "Bundle id for validate/apply/discard (from action=stage or list).",
+          description: "Bundle id for validate/apply/retriage/discard (from action=stage or list).",
         },
         dry_run: {
           type: "boolean",
@@ -1023,5 +1170,32 @@ export const FEEDBACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
       additionalProperties: false,
     },
     handler: toolBrainObservedUse,
+  },
+  {
+    name: EXPIRE_TOOL,
+    description:
+      "Set, change or clear the expiration_date of one signal or preference, by id. An expired memory is filtered out of default reads and never deleted or moved. Clearing is the explicit word 'none'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description:
+            "Artifact id: sig-<date>-<slug>, pref-<slug> or ret-<slug>. Never a path - this surface does not accept one.",
+        },
+        expires: {
+          type: "string",
+          description: `YYYY-MM-DD, an ISO-8601 timestamp, or '${EXPIRATION_CLEAR}' to clear. An unparseable value is refused before any write.`,
+        },
+        agent: {
+          type: "string",
+          description: "Optional agent identity stamped on the audit event.",
+        },
+      },
+      required: ["id", "expires"],
+      additionalProperties: false,
+    },
+    previewBudget: MCP_PREVIEW_BUDGET,
+    handler: toolBrainExpire,
   },
 ]);

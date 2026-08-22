@@ -355,13 +355,16 @@ export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclarati
 
     // --- Two-phase accept with a journalled rollback ---------------------
     "src/core/brain/skill-proposals.ts": {
-      calls: ["rmSync", "unlinkSync"],
+      calls: ["rmSync", "rmdirSync", "unlinkSync"],
       recovery: UNARCHIVED_BRAIN,
       reason:
         "unlinks the pending proposal only after the accepted copy landed through " +
         "`writeFrontmatterAtomic` and the journal recorded the commit phase; the " +
-        "`rmSync` arm is the rollback, and it removes the accepted copy and its " +
-        "procedure only when the journal recorded that neither existed beforehand.",
+        "`rmSync` arm is the rollback, and it removes the accepted copy and the " +
+        "artifact the accept materialised only when the journal recorded that neither " +
+        "existed beforehand. The `rmdirSync` finishes that rollback for a `mature_page` " +
+        "accept, which creates a directory to hold its SKILL.md: `rmdirSync` refuses a " +
+        "non-empty directory, so only the empty shell this sequence made is removed.",
     },
 
     // --- Repair under an explicit apply ----------------------------------
@@ -401,7 +404,9 @@ export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclarati
         "every other. The case-only rename cannot use that order - unlinking the source would " +
         "remove the destination with it - so it stages a third private name for the same inode " +
         "first. A note lives outside `Brain/` by construction, which is why no archive covers " +
-        "it and why the DELETE arm of the same module is behind the gate instead.",
+        "it and why the DELETE arm of the same module is behind the gate instead - including " +
+        "the `--delete-linked` cascade, whose extra unlinks all sit inside that one gate call " +
+        "and whose Brain-resident half the archive therefore does hold.",
     },
 
     // --- Outside the vault entirely --------------------------------------

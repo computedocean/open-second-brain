@@ -108,6 +108,8 @@ import {
   cmdBrainTrigger,
   cmdBrainDeepSynthesis,
   cmdBrainDiarize,
+  cmdBrainExtractSignals,
+  cmdBrainDesignNote,
   cmdBrainIdeas,
   cmdBrainSessionHook,
   cmdBrainImportClaudeMemory,
@@ -131,6 +133,8 @@ import {
   cmdBrainToday,
   cmdBrainApplyMarkers,
   cmdBrainPending,
+  cmdBrainCapture,
+  cmdBrainExpire,
   cmdBrainTelegramCapture,
   cmdBrainInboxDrain,
   cmdBrainRepairLane,
@@ -180,6 +184,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainNote(rest);
       case "lifecycle":
         return await cmdBrainLifecycle(rest);
+      case "expire":
+        return await cmdBrainExpire(rest);
       case "note-lifecycle":
         return await cmdBrainNoteLifecycle(rest);
       case "scaffold-stub":
@@ -356,6 +362,10 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainDeepSynthesis(rest);
       case "diarize":
         return await cmdBrainDiarize(rest);
+      case "extract-signals":
+        return await cmdBrainExtractSignals(rest);
+      case "design-note":
+        return await cmdBrainDesignNote(rest);
       case "ideas":
         return await cmdBrainIdeas(rest);
       case "entity":
@@ -420,6 +430,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainPending(rest);
       case "signal":
         return await cmdBrainSignal(rest);
+      case "capture":
+        return await cmdBrainCapture(rest);
       case "telegram-capture":
         return await cmdBrainTelegramCapture(rest);
       case "inbox-drain":
