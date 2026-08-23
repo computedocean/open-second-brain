@@ -37,7 +37,12 @@ import {
   type SessionDiscovery,
   type SessionImportRecord,
 } from "../../../core/brain/sessions/discover.ts";
+import {
+  SESSION_RESUME_DISCARD,
+  type SessionResumeDiscard,
+} from "../../../core/brain/sessions/checkpoint.ts";
 import { SessionImportError, type SessionAdapterId } from "../../../core/brain/sessions/types.ts";
+import { serializeImportCensus, type ImportCensus } from "../../../core/brain/import-census.ts";
 import {
   createSafeguard,
   OPERATION,
@@ -455,6 +460,21 @@ function emitCoverage(
   for (const line of discovery.unreadable) info(`  unreadable: ${line}`);
 }
 
+/**
+ * What each discard reason means, in one clause. Keyed by the vocabulary so
+ * a member added without a sentence fails to compile - the alternative was
+ * one sentence about the session log that was already wrong for a reason
+ * that is about the checkpoint's own bytes.
+ */
+const RESUME_DISCARD_EXPLANATION: Readonly<Record<SessionResumeDiscard, string>> = Object.freeze({
+  [SESSION_RESUME_DISCARD.headChanged]:
+    "the session log is not the one the boundary was taken against",
+  [SESSION_RESUME_DISCARD.fileShrank]:
+    "the session log has shrunk since the boundary was taken, so the boundary is past its end",
+  [SESSION_RESUME_DISCARD.payloadInvalid]:
+    "the checkpoint on disk carries a turn boundary this build could not have written",
+});
+
 /** The per-file import report, shared by the path form and the sweep. */
 function emitImportReport(
   result: {
@@ -485,6 +505,9 @@ function emitImportReport(
         filtered_turns: f.filtered_turns,
         recall_turns_imported: f.recall_turns_imported,
         recall_summary_nodes: f.recall_summary_nodes,
+        turns_resumed: f.turns_resumed,
+        resume_discarded: f.resume_discarded,
+        census: serializeImportCensus(f.census),
         errors: f.errors,
       })),
       warnings: result.warnings,
@@ -507,6 +530,16 @@ function emitImportReport(
     ok(`  signals_deduped: ${f.signals_deduped}`);
     ok(`  tool_replays: ${f.tool_replays}`);
     ok(`  filtered_turns: ${f.filtered_turns}`);
+    // Printed only when a checkpoint actually changed what the run did, so a
+    // first import's output is unchanged.
+    if (f.turns_resumed > 0) ok(`  turns_resumed: ${f.turns_resumed}`);
+    if (f.resume_discarded !== null) {
+      info(
+        `  resume checkpoint discarded (${f.resume_discarded}): ${RESUME_DISCARD_EXPLANATION[f.resume_discarded]}, ` +
+          "so the file was re-imported from the start.",
+      );
+    }
+    emitCensus(f.census);
     if (opts.recall) {
       ok(`  recall_turns_imported: ${f.recall_turns_imported}`);
       ok(`  recall_summary_nodes: ${f.recall_summary_nodes}`);
@@ -516,6 +549,18 @@ function emitImportReport(
   }
   for (const w of result.warnings) info(`  warning: ${w.path}: ${w.message}`);
   for (const f of failures) process.stderr.write(`error: ${f.path}: ${f.message}\n`);
+}
+
+/**
+ * The post-import read-back census, printed only when it has something to
+ * say: a run that wrote nothing has nothing to reconcile, and a clean census
+ * is one line rather than a list. A shortfall NAMES its hashes - the count
+ * alone is what this line exists not to be.
+ */
+function emitCensus(census: ImportCensus): void {
+  if (census.attempted === 0) return;
+  ok(`  census: ${census.found}/${census.attempted} written signals read back (${census.outcome})`);
+  for (const hash of census.missing) info(`    not found on disk: ${hash}`);
 }
 
 /** Map a session-import throw onto this verb's exit codes. */

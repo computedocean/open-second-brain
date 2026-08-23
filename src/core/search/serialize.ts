@@ -5,7 +5,14 @@
  */
 
 import type { StampMismatch } from "../integrity/stamp.ts";
-import type { ChunkWindowCensus, IndexStatusSnapshot, SearchCard } from "./types.ts";
+import type {
+  ChunkWindowCensus,
+  EmbedderRecordCensus,
+  IndexStatusSnapshot,
+  PendingVectorCensus,
+  SearchCard,
+  VisibilityHonestyFinding,
+} from "./types.ts";
 
 /**
  * Wire shape for a stamp comparison. `recorded` is what the index
@@ -40,6 +47,69 @@ export function serializeSearchCard(c: SearchCard): Record<string, unknown> {
     // surviving card was folded from. Absent, never null, when nothing
     // was merged - the card carries the key only in that case.
     ...(c.duplicatePointers !== undefined ? { duplicate_pointers: c.duplicatePointers } : {}),
+  };
+}
+
+/**
+ * Wire shape of the pending-vector census (nothing-writes-silently,
+ * unit A). Emitted in EVERY state, which is what separates it from the
+ * drift fields on the same report: those say nothing when there is
+ * nothing to say, while a census whose count could not be taken has
+ * something to say precisely then. The unrecorded arm carries no
+ * `pending` key at all, so a consumer cannot read a default zero out of
+ * a state that measured nothing.
+ */
+export function serializePendingVectorCensus(census: PendingVectorCensus): Record<string, unknown> {
+  if (census.verdict === "unrecorded") {
+    return { verdict: census.verdict, reason: census.reason };
+  }
+  return { verdict: census.verdict, pending: census.pending, chunks: census.chunks };
+}
+
+/**
+ * Wire shape of the record-vs-data embedder audit
+ * (nothing-writes-silently, unit G). Emitted in every state on the same
+ * terms as the pending-vector census beside it, and the `unrecorded`
+ * arm carries no numbers at all - there is no dimension to report when
+ * nothing was compared.
+ *
+ * `reconciliation` keeps the shared vocabulary's own field names, so a
+ * consumer reading this audit and one reading the import census read
+ * the same three words for the same three quantities.
+ */
+export function serializeEmbedderRecordCensus(
+  census: EmbedderRecordCensus,
+): Record<string, unknown> {
+  if (census.verdict === "unrecorded") {
+    return { verdict: census.verdict, reason: census.reason };
+  }
+  return {
+    verdict: census.verdict,
+    outcome: census.outcome,
+    recorded_dimension: census.recordedDimension,
+    stored_dimensions: census.storedDimensions,
+    vec_declared_width: census.vecDeclaredWidth,
+    reconciliation: {
+      attempted: census.reconciliation.attempted,
+      found: census.reconciliation.found,
+      missing: census.reconciliation.missing,
+    },
+  };
+}
+
+/**
+ * Wire shape of the visibility honesty finding (nothing-writes-silently,
+ * unit H, form B). Present only when the caller already established
+ * there is something to report - `search check` omits the key entirely
+ * rather than serializing a zero-count finding, the same convention
+ * `embeddingAbi` uses for a matching store.
+ */
+export function serializeVisibilityHonestyFinding(
+  finding: VisibilityHonestyFinding,
+): Record<string, unknown> {
+  return {
+    excluded_surface_count: finding.excludedSurfaceCount,
+    total_surface_count: finding.totalSurfaceCount,
   };
 }
 

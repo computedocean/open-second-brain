@@ -75,8 +75,20 @@ import {
 } from "../../../core/brain/diagnostics.ts";
 import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { formatStampMismatch } from "../../../core/integrity/stamp.ts";
-import { indexCheck, serializeStampMismatches } from "../../../core/search/index.ts";
-import type { IndexCheckReport, ResolvedSearchConfig } from "../../../core/search/index.ts";
+import {
+  indexCheck,
+  serializeEmbedderRecordCensus,
+  serializePendingVectorCensus,
+  serializeStampMismatches,
+  serializeVisibilityHonestyFinding,
+} from "../../../core/search/index.ts";
+import type {
+  EmbedderRecordCensus,
+  IndexCheckReport,
+  PendingVectorCensus,
+  ResolvedSearchConfig,
+  VisibilityHonestyFinding,
+} from "../../../core/search/index.ts";
 import { PROVIDER_PROBE } from "../../../core/search/provider-probe.ts";
 import { acquireWriterLock } from "../../../core/search/store.ts";
 import { runIntegrityCheck } from "../../../core/search/store/lifecycle.ts";
@@ -390,6 +402,20 @@ function jsonForCheck(r: IndexCheckReport): Record<string, unknown> {
     // the failure mode worth having.
     provider_probe: r.providerProbe,
     provider_reason: r.providerReason,
+    // Emitted in every state, unlike the drift block below: an index
+    // whose pending-vector count could not be taken is the one state
+    // this key exists to report, and an absent key would be read as a
+    // count of zero (nothing-writes-silently, unit A).
+    pending_vectors: serializePendingVectorCensus(r.pendingVectors),
+    // Same terms again: the audit says what it compared, or that it
+    // compared nothing (nothing-writes-silently, unit G).
+    embedder_record: serializeEmbedderRecordCensus(r.embedderRecord),
+    // Present only when the vault/index carries at least one
+    // visibility:-tagged page, so a vault that never uses the field
+    // stays byte-identical (nothing-writes-silently, unit H, form B).
+    ...(r.visibilityHonesty !== undefined
+      ? { visibility_honesty: serializeVisibilityHonestyFinding(r.visibilityHonesty) }
+      : {}),
     // Emitted only on drift, so a matching store's JSON is byte-identical
     // to the pre-gate output (context-integrity-gates, Unit E).
     ...(r.embeddingAbi.length > 0
@@ -425,6 +451,44 @@ function jsonForIntegrity(r: IntegrityReport): Record<string, unknown> {
   };
 }
 
+/** The record-vs-data audit as one operator-facing value. */
+function describeEmbedderRecord(census: EmbedderRecordCensus): string {
+  if (census.verdict === "unrecorded") return `${census.verdict} (${census.reason})`;
+  const stored = census.storedDimensions.join(", ");
+  return (
+    `${census.outcome} (records ${census.recordedDimension}; ` +
+    `stored ${stored === "" ? "none" : stored}; ` +
+    `chunk_vec declares ${census.vecDeclaredWidth ?? "nothing"})`
+  );
+}
+
+/** The pending-vector census as one operator-facing value. */
+function describePendingVectors(census: PendingVectorCensus): string {
+  if (census.verdict === "unrecorded") return `${census.verdict} (${census.reason})`;
+  return `${census.pending} of ${census.chunks} chunk(s) have no vector`;
+}
+
+/**
+ * The visibility honesty finding as one operator-facing line
+ * (nothing-writes-silently, unit H, form B). Both counts are the
+ * registry's own numbers, read at render time - never hand-written here.
+ *
+ * The line names the ENUMERATED population rather than implying it is
+ * the product's whole surface area. It is not: the MCP half is swept
+ * mechanically and its rule has stated blind spots, and the CLI half is
+ * hand-enumerated one row per MCP mirror. A reader who took the
+ * denominator for "every note-returning surface there is" would size the
+ * enforcement work against a number that is a floor.
+ */
+function describeVisibilityHonesty(finding: VisibilityHonestyFinding): string {
+  return (
+    "visibility: frontmatter is a caller-supplied view filter, not a privacy boundary; " +
+    `${finding.excludedSurfaceCount} of the ${finding.totalSurfaceCount} note-returning ` +
+    "surfaces the visibility census enumerates do not honor it, and the census does not " +
+    "claim to enumerate them all (see tests/core/architecture/visibility-surface-census.test.ts)"
+  );
+}
+
 function renderCheckHuman(r: IndexCheckReport): string {
   const lines: string[] = [];
   lines.push(`vault_readable:        ${ok(r.vaultReadable)}`);
@@ -443,6 +507,16 @@ function renderCheckHuman(r: IndexCheckReport): string {
   // about what could not be checked must not say.
   lines.push(`provider_probe:        ${r.providerProbe}`);
   if (r.providerReason) lines.push(`provider_reason:       ${r.providerReason}`);
+  // Always emitted, on the same terms and for the same reason: a count
+  // nobody could take is reported as unrecorded, never as zero.
+  lines.push(`pending_vectors:       ${describePendingVectors(r.pendingVectors)}`);
+  lines.push(`embedder_record:       ${describeEmbedderRecord(r.embedderRecord)}`);
+  // Present only when the vault/index carries at least one
+  // visibility:-tagged page - a vault that never uses the field gets no
+  // line at all, never a zero-count one.
+  if (r.visibilityHonesty !== undefined) {
+    lines.push(`visibility_honesty:    ${describeVisibilityHonesty(r.visibilityHonesty)}`);
+  }
   for (const w of r.warnings) lines.push(`warning: ${w}`);
   for (const f of r.fatal) lines.push(`fatal:   ${f}`);
   if (r.recommendations.length > 0) {

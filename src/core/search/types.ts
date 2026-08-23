@@ -15,6 +15,7 @@
 
 import type { DegradationNotice } from "../integrity/degradation.ts";
 import type { StampMismatch } from "../integrity/stamp.ts";
+import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliation-report.ts";
 import type { VaultPathRule, VaultScopeRules } from "../vault-scope/defaults.ts";
 import type { DegreePredicate } from "./property-filter.ts";
 import type { TemporalIntent } from "./temporal-intent.ts";
@@ -404,6 +405,102 @@ export interface IndexStatusSnapshot {
   readonly warnings: ReadonlyArray<string>;
 }
 
+/**
+ * What `search check` could establish about chunks that carry no vector
+ * (nothing-writes-silently, unit A).
+ *
+ * Two states, and the second is the point. The recommendation this
+ * census feeds used to be derived from a proxy - a reachable provider
+ * plus a loaded extension - which has no term for whether any vector
+ * exists, so a fully embedded vault was told to compute its first ones.
+ * A measured count replaces the proxy, and a count that could not be
+ * taken is reported as UNRECORDED rather than as zero: an absent or
+ * unreadable index proves nothing about how many chunks are waiting,
+ * and zero is precisely the answer that reads as "nothing is waiting".
+ *
+ * Emitted in every state, unlike the drift fields beside it. A report
+ * about what could not be checked must not answer with silence.
+ */
+export type PendingVectorCensus =
+  | {
+      readonly verdict: "measured";
+      /** Chunks with no row in `embeddings`. */
+      readonly pending: number;
+      /** Chunks the index holds at all. */
+      readonly chunks: number;
+    }
+  | {
+      /** No count was taken; the index was absent or would not open. */
+      readonly verdict: "unrecorded";
+      /** Which of those it was, in the words the open used. */
+      readonly reason: string;
+    };
+
+/**
+ * What the index's own record of its embedder says, measured against
+ * the vectors it holds (nothing-writes-silently, unit G).
+ *
+ * The `audited` arm's `outcome` is the wave's shared reconciliation
+ * vocabulary, and `contradicted` is the state this census exists for: a
+ * recorded dimension the stored data itself disproves. That is a
+ * different finding from the two that already had names - `embeddingAbi`
+ * drift, where the record disagrees with THIS BUILD, and an unrecorded
+ * token, where the index never made the claim at all - and folding it
+ * into either would report a wrong record as a stale one.
+ *
+ * `unrecorded` is every state with nothing to compare: no index, an
+ * index that would not open, no recorded dimension, or no stored vector
+ * to check it against. None of them is a clean audit.
+ */
+export type EmbedderRecordCensus =
+  | {
+      readonly verdict: "audited";
+      /** The dimension `index_state` claims. */
+      readonly recordedDimension: number;
+      /** Distinct widths the `embeddings` rows carry, ascending. */
+      readonly storedDimensions: ReadonlyArray<number>;
+      /** The width `chunk_vec` declares, or null when there is no such table. */
+      readonly vecDeclaredWidth: number | null;
+      /** Observations attempted, matched, and - by name - not matched. */
+      readonly reconciliation: ReconciliationReport;
+      /** `complete` or `contradicted`; see the note above. */
+      readonly outcome: ReconciliationOutcome;
+    }
+  | {
+      /** Nothing was compared, and why. */
+      readonly verdict: "unrecorded";
+      readonly reason: string;
+    };
+
+/**
+ * The visibility honesty finding (nothing-writes-silently, unit H, form
+ * B): `visibility:` frontmatter is a caller-supplied view filter, not a
+ * privacy boundary, and `excludedSurfaceCount` of `totalSurfaceCount`
+ * ENUMERATED note-returning surfaces do not honour it. Both counts are
+ * read off `visibility-surface-registry.ts`'s own exported list - never
+ * hand-written - so the number this finding names cannot drift from the
+ * census that backs it.
+ *
+ * The denominator is the census's population, not the product's whole
+ * surface area, and the surface that renders it says so: the MCP half is
+ * swept mechanically with stated blind spots and the CLI half is
+ * hand-enumerated. It also counts CALLABLE rows only - the registry's one
+ * `index_store` row is a structural fact about the index's storage, not
+ * something a caller invokes.
+ *
+ * Present on {@link IndexCheckReport} only when the vault/index carries
+ * at least one page tagged with the field; a vault that has never used
+ * `visibility:` has nothing this finding would be honest ABOUT, and
+ * warning it anyway would train operators to ignore the line on every
+ * vault that never triggers it.
+ */
+export interface VisibilityHonestyFinding {
+  /** Enumerated callable surfaces that never consult `visibility:`. */
+  readonly excludedSurfaceCount: number;
+  /** Every callable surface the registry classifies, covered or excluded. */
+  readonly totalSurfaceCount: number;
+}
+
 export interface IndexCheckReport {
   readonly vaultReadable: boolean;
   readonly indexDirWritable: boolean;
@@ -436,6 +533,26 @@ export interface IndexCheckReport {
    * field was stamped, which is reported and never treated as wrong.
    */
   readonly embeddingAbi: ReadonlyArray<StampMismatch>;
+  /**
+   * Chunks awaiting a vector, measured rather than inferred - or the
+   * statement that no count could be taken. See
+   * {@link PendingVectorCensus}; it is the term the reindex
+   * recommendation below now gates on.
+   */
+  readonly pendingVectors: PendingVectorCensus;
+  /**
+   * The index's recorded embedder identity measured against the vectors
+   * it holds. See {@link EmbedderRecordCensus}; its `contradicted`
+   * outcome is a statement neither {@link embeddingAbi} nor
+   * {@link pendingVectors} can make.
+   */
+  readonly embedderRecord: EmbedderRecordCensus;
+  /**
+   * The visibility honesty finding, present only when the vault/index
+   * carries at least one `visibility:`-tagged page. See
+   * {@link VisibilityHonestyFinding}.
+   */
+  readonly visibilityHonesty?: VisibilityHonestyFinding;
   readonly warnings: ReadonlyArray<string>;
   readonly fatal: ReadonlyArray<string>;
   /**

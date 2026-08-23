@@ -49,8 +49,10 @@ export type {
   ExpandHitInput,
   ExpandHitResult,
   IndexCheckReport,
+  EmbedderRecordCensus,
   IndexStats,
   IndexStatusSnapshot,
+  PendingVectorCensus,
   ResolvedEmbeddingConfig,
   ResolvedRecallConfig,
   ResolvedRerankConfig,
@@ -63,6 +65,7 @@ export type {
   StructuredRecallQueryDocument,
   VaultPathRule,
   VaultScopeRules,
+  VisibilityHonestyFinding,
 } from "./types.ts";
 export {
   chunkWindowDiagnosticCode,
@@ -86,10 +89,24 @@ export { evaluateSurfacingGate, type SurfacingGateDecision } from "./surfacing-g
 export { buildEvidencePack, serializeEvidencePack } from "./evidence-pack.ts";
 export {
   serializeChunkWindowCensus,
+  serializeEmbedderRecordCensus,
+  serializePendingVectorCensus,
   serializeSearchCard,
   serializeIndexStatus,
   serializeStampMismatches,
+  serializeVisibilityHonestyFinding,
 } from "./serialize.ts";
+export {
+  callableVisibilitySurfaces,
+  excludedCallableVisibilitySurfaces,
+  excludedVisibilitySurfaces,
+  VISIBILITY_SURFACE_CATEGORY,
+  VISIBILITY_SURFACE_KIND,
+  VISIBILITY_SURFACE_REGISTRY,
+  type VisibilitySurfaceCategory,
+  type VisibilitySurfaceEntry,
+  type VisibilitySurfaceKind,
+} from "./visibility-surface-registry.ts";
 export {
   loadProviderRegistry,
   addProviderProfile,

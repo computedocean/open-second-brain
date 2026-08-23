@@ -26,6 +26,8 @@ let configHome: string;
 
 const NOW = new Date("2026-06-13T12:00:00Z");
 const CAPS = { maxBatchBytes: 100_000, maxBatchFiles: 100 } as const;
+/** A plan id the checkpoint store accepts, for fixtures that need any id. */
+const SEED_PLAN_ID = "5eed01";
 
 beforeEach(() => {
   vault = mkdtempSync(join(tmpdir(), "o2b-reconcile-vault-"));
@@ -110,8 +112,12 @@ describe("reconcilePlan", () => {
     write("Docs/b.md");
     // Ingest both so the content manifest records them; a re-plan then
     // classifies every source `unchanged` (manifest skips), not new work.
-    ingest("Docs/a.md", "seed-plan");
-    ingest("Docs/b.md", "seed-plan");
+    // A valid (hex) plan id that is not the plan under test: the checkpoint
+    // it writes is irrelevant here, and the assertions below are about the
+    // manifest path. The old fixture passed "seed-plan", which the
+    // checkpoint store rejects - the argument did nothing at all.
+    ingest("Docs/a.md", SEED_PLAN_ID);
+    ingest("Docs/b.md", SEED_PLAN_ID);
     const plan = planBatches(vault, "Docs", CAPS);
     expect(plan.batches).toEqual([]); // nothing new to dispatch
 
@@ -152,5 +158,53 @@ describe("reconcilePlan", () => {
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
     // The reconcile must not write, clear, or otherwise touch the checkpoint.
     expect(readFileSync(cpPath, "utf8")).toBe(before);
+  });
+});
+
+/**
+ * The gap report above answers "what did the checkpoint never record". The
+ * census answers the question one step further out: of the sources the
+ * checkpoint DOES claim, which can still be read back from the content
+ * manifest? A claim nobody can reproduce is not a completed ingest, and
+ * before this it was reported as one.
+ */
+describe("reconcilePlan - the post-import read-back census", () => {
+  test("a plan whose ingested sources all read back is complete", () => {
+    write("Docs/a.md");
+    write("Docs/b.md");
+    const plan = planBatches(vault, "Docs", CAPS);
+    ingest("Docs/a.md", plan.planId);
+    ingest("Docs/b.md", plan.planId);
+
+    const report = reconcilePlan(vault, plan);
+    expect(report.census.attempted).toBe(2);
+    expect(report.census.found).toBe(2);
+    expect([...report.census.missing]).toEqual([]);
+    expect(report.census.outcome).toBe("complete");
+  });
+
+  test("a source the checkpoint claims but the manifest cannot confirm is named", () => {
+    write("Docs/a.md");
+    write("Docs/b.md");
+    const plan = planBatches(vault, "Docs", CAPS);
+    ingest("Docs/a.md", plan.planId);
+    ingest("Docs/b.md", plan.planId);
+    // The write landed in the checkpoint and then the source vanished: the
+    // gap report still calls the plan complete, the census does not.
+    rmSync(join(vault, "Docs/b.md"));
+
+    const report = reconcilePlan(vault, plan);
+    expect(report.complete).toBe(true);
+    expect(report.census.found).toBe(1);
+    expect([...report.census.missing]).toEqual(["Docs/b.md"]);
+    expect(report.census.outcome).toBe("partial");
+  });
+
+  test("a plan that ingested nothing censuses zero rather than claiming success", () => {
+    write("Docs/a.md");
+    const plan = planBatches(vault, "Docs", CAPS);
+    const report = reconcilePlan(vault, plan);
+    expect(report.census.attempted).toBe(0);
+    expect(report.census.outcome).toBe("complete");
   });
 });

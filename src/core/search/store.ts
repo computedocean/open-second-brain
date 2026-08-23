@@ -55,6 +55,7 @@ import * as vectors from "./store/vectors.ts";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export {
+  describeUnreadableIndex,
   EMBEDDING_DIMENSION_STATE_KEY,
   EMBEDDING_MODEL_STATE_KEY,
   EMBEDDING_PREFIX_PASSAGE_STATE_KEY,
@@ -71,7 +72,10 @@ export type { IndexPeek } from "./store/state.ts";
 export {
   contradictedAbiFields,
   EMBEDDING_ABI_FIX_COMMAND,
+  EMBEDDING_VEC_VERSION_FIX_COMMAND,
+  embeddingAbiFixCommand,
   formatEmbeddingAbiDrift,
+  peekEmbeddingAbiSync,
   readEmbeddingAbiSync,
   runtimeEmbeddingAbi,
 } from "./store/embedding-abi.ts";
@@ -82,6 +86,16 @@ export {
   WRITER_LOCK_STALE_MS,
 } from "./store/writer-lock.ts";
 
+export { peekPendingVectorsSync } from "./store/counts.ts";
+
+export { peekVisibilityTagPresence } from "./store/visibility-tag.ts";
+
+export {
+  auditEmbedderRecord,
+  formatEmbedderRecordContradiction,
+  readEmbedderRecordCensusSync,
+} from "./store/embedder-audit.ts";
+
 export { normalizeAlias } from "./store/aliases.ts";
 
 export type { DocumentInput, DocumentSummary } from "./store/documents.ts";
@@ -90,7 +104,7 @@ export type { ChunkInput, ChunkRow, HydratedChunk } from "./store/chunks.ts";
 export type { KeywordHit } from "./store/keyword.ts";
 export type { DanglingLinkTarget, LinkInput, LinkResolutionCounts } from "./store/links.ts";
 export type { EmbeddingPrefixPair, ModelChangeOutcome, SemanticHit } from "./store/vectors.ts";
-export type { StoreCounts } from "./store/counts.ts";
+export type { PendingVectorTally, StoreCounts } from "./store/counts.ts";
 
 export interface StoreOpenOptions {
   /** "read" never locks; "write" acquires an exclusive proper-lockfile. */

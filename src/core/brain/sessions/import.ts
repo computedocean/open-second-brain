@@ -23,6 +23,32 @@
  * Idempotency: dedup index is built once at the start of each
  * `importSession` run by reading the inbox and processed dirs. A
  * second run on the same file finds every hash already present.
+ *
+ * Resume (nothing-writes-silently, Unit F). Dedup alone is
+ * re-do-and-discard: it makes a second run harmless, not cheap, so an
+ * interrupted 50k-turn import re-read and re-hashed every turn to
+ * conclude it had nothing to write. An applied run now records the turn
+ * boundary it has reached into {@link ./checkpoint.ts} - the sessions
+ * lane's extension of the ingest checkpoint substrate, not a second one
+ * of its own - and the next run over the same file with the same filters
+ * skips straight past those turns. What that saves is the extraction
+ * work: the marker scan, the dedup hashing, the fact pass and the writes.
+ * The lines themselves are still read, because a JSONL transcript has no
+ * index to seek into.
+ *
+ * Recall is the one thing the boundary does not vouch for, and the resumed
+ * run re-collects it. `--recall` accumulates turns in memory and commits
+ * them to the recall DAG AFTER the loop, so a run that stopped at the
+ * boundary committed none of them; skipping those turns on the resumed run
+ * would leave the head of the transcript permanently missing from the DAG
+ * while both runs reported success. Re-collection costs nothing extra (the
+ * lines are read regardless) and is idempotent, because the recall importer
+ * keys every turn on a content dedupe key.
+ *
+ * Census (same unit). After the run, the dedup hashes of the signals it
+ * claims to have written are read back from disk, and the result carries
+ * `claimed / found / missing` with the missing hashes NAMED. See
+ * {@link ../import-census.ts} for what the census does and does not cover.
  */
 
 import { existsSync, statSync } from "node:fs";
@@ -30,13 +56,24 @@ import { basename, resolve } from "node:path";
 
 import { delegatedAgentName } from "../../agent-identity.ts";
 import { readSkillOfferId, SKILL_OFFER_ID_KEY } from "../../surface/skill-offer.ts";
+import { checkpointingEnabled } from "../checkpoint-store.ts";
 import { buildDedupIndex, computeDedupHash, type DedupIndexEntry } from "../dedup-hash.ts";
+import { censusSessionSignals, type ImportCensus } from "../import-census.ts";
 import { appendContinuityRecord } from "../continuity/store.ts";
 import { discoverMarkersDetailed, isFeedbackMarker } from "../inline.ts";
 import { writeSignal } from "../signal.ts";
 import { importSessionRecall } from "../session-recall.ts";
 import { isoDate, isoSecond } from "../time.ts";
 import { BRAIN_SIGNAL_SOURCE_TYPE } from "../types.ts";
+import {
+  clearSessionCheckpoint,
+  computeSessionHeadHash,
+  computeSessionImportId,
+  recordSessionProgress,
+  resolveSessionResume,
+  SESSION_CHECKPOINT_TURN_INTERVAL,
+  type SessionResumeDiscard,
+} from "./checkpoint.ts";
 import { readFirstLine } from "./read-lines.ts";
 import { detectAdapter, getAdapter } from "./registry.ts";
 import { sessionFilesUnder } from "./session-files.ts";
@@ -190,6 +227,25 @@ export interface ImportSessionResult {
   readonly facts_deduped: number;
   readonly recall_turns_imported: number;
   readonly recall_summary_nodes: number;
+  /**
+   * Turns a checkpoint from an earlier, interrupted run let this one skip.
+   * Always 0 on a first run, a dry run, and a run with checkpointing opted
+   * out. `turns_scanned` still counts every turn the adapter yielded, so the
+   * pair says how much of the file was re-read and how little was re-worked.
+   */
+  readonly turns_resumed: number;
+  /**
+   * Why a checkpoint that existed was NOT resumed from, or `null` when none
+   * was refused. A boundary silently ignored is a full re-import nobody was
+   * told about, which is the class of quiet this unit removes.
+   */
+  readonly resume_discarded: SessionResumeDiscard | null;
+  /**
+   * Read-back census of the signals this run claims to have written:
+   * `attempted / found / missing`, with the missing dedup hashes named. A
+   * dry run claims nothing and censuses zero.
+   */
+  readonly census: ImportCensus;
   readonly errors: ReadonlyArray<{ path: string; message: string }>;
 }
 
@@ -220,13 +276,20 @@ export function sessionRefIdentity(absPath: string, recallSessionId?: string): s
  *
  * Autodetect needs exactly one line, and `readFirstLine` stops at the first
  * newline: the file used to be read whole here and then read a second time by
- * `adapter.iterate`. An explicit `--format` reads nothing at all.
+ * `adapter.iterate`. An explicit `--format` reads nothing at all - hence the
+ * lazy `readHead`, shared with the resume checkpoint's file-identity probe so
+ * the head line is read at most once per import and not at all when neither
+ * caller needs it.
  */
-async function chooseAdapter(path: string, format?: SessionAdapterId): Promise<SessionAdapter> {
+async function chooseAdapter(
+  path: string,
+  readHead: () => Promise<string>,
+  format?: SessionAdapterId,
+): Promise<SessionAdapter> {
   if (format !== undefined) {
     return getAdapter(format);
   }
-  const first = await readFirstLine(path);
+  const first = await readHead();
   const a = detectAdapter(first);
   if (!a) {
     throw new SessionImportError(
@@ -245,7 +308,9 @@ export async function importSession(
   if (!existsSync(path)) {
     throw new SessionImportError("IO", `session file does not exist: ${path}`);
   }
-  const adapter = await chooseAdapter(path, opts.format);
+  let headLine: string | null = null;
+  const readHead = async (): Promise<string> => (headLine ??= await readFirstLine(path));
+  const adapter = await chooseAdapter(path, readHead, opts.format);
   // Reuse the caller-supplied index when present (directory walk lifts
   // the build out of the per-file loop). Otherwise build our own.
   const dedup = opts.dedupIndex ?? buildDedupIndex(vault);
@@ -278,6 +343,11 @@ export async function importSession(
    * one write and one dedup.
    */
   const withheldHashes = new Set<string>();
+  /**
+   * Dedup hashes of the signals this run actually wrote - the claim the
+   * post-import census reads back against the vault.
+   */
+  const createdHashes: string[] = [];
   const recallTurns: SessionTurn[] = [];
   const filterRoles =
     opts.filterRoles && opts.filterRoles.length > 0 ? new Set(opts.filterRoles) : null;
@@ -355,6 +425,7 @@ export async function importSession(
         ...(opts.rawCodec === true ? { rawCodec: true } : {}),
       });
       dedup.set(input.dedupHash, { id: res.id, path: res.path });
+      createdHashes.push(input.dedupHash);
       signalsCreated++;
     } catch (err) {
       errors.push({
@@ -390,33 +461,105 @@ export async function importSession(
       facts_deduped: 0,
       recall_turns_imported: 0,
       recall_summary_nodes: 0,
+      turns_resumed: 0,
+      resume_discarded: null,
+      census: censusSessionSignals(vault, []),
       errors: Object.freeze([]),
     });
   if (boundaryDecision === "ignore") return emptyResult();
 
-  for await (const turn of adapter.iterate(path)) {
-    turnsScanned++;
+  // Resume (Unit F). Only an APPLIED capture run checkpoints: a dry run
+  // writes nothing to resume, and a stateless/ignored file is scanned
+  // read-only. The id folds the import's filters in, so a differently
+  // filtered run never inherits this one's boundary.
+  const checkpointActive = opts.dryRun !== true && mayWrite && checkpointingEnabled();
+  const importId = computeSessionImportId(absPath, opts);
+  let resumeFrom = 0;
+  let resumeDiscarded: SessionResumeDiscard | null = null;
+  let turnsResumed = 0;
+  let fileIdentity = { headHash: "", bytes: 0 };
+  if (checkpointActive) {
+    fileIdentity = {
+      headHash: computeSessionHeadHash(await readHead()),
+      bytes: statSync(absPath).size,
+    };
+    const decision = resolveSessionResume(vault, importId, fileIdentity);
+    resumeFrom = decision.turns;
+    resumeDiscarded = decision.discarded;
+  }
+
+  /**
+   * Whether a turn belongs to this run's question, and which counter says
+   * so when it does not. One function because the resumed prefix has to ask
+   * the same question the main body does - a filter applied on one path and
+   * not the other would put a turn in the recall DAG that the run's own
+   * filters exclude.
+   */
+  const admitTurn = (turn: SessionTurn): "admit" | "before_since" | "filtered" | "suppressed" => {
     if (sinceMs !== undefined) {
       const t = Date.parse(turn.timestamp);
-      if (Number.isFinite(t) && t < sinceMs) continue;
+      if (Number.isFinite(t) && t < sinceMs) return "before_since";
     }
-    if (filterRoles !== null && !filterRoles.has(turn.role)) {
-      filteredTurns++;
-      continue;
-    }
+    if (filterRoles !== null && !filterRoles.has(turn.role)) return "filtered";
     if (filterNeedle !== null) {
       const haystack = turn.text?.toLowerCase() ?? "";
-      if (!haystack.includes(filterNeedle)) {
-        filteredTurns++;
-        continue;
-      }
+      if (!haystack.includes(filterNeedle)) return "filtered";
     }
     // Message-level boundary: suppressed text never reaches marker or
     // fact extraction (and is not stored for recall).
-    if (turn.text && boundary.suppressMessage(turn.text)) {
+    if (turn.text && boundary.suppressMessage(turn.text)) return "suppressed";
+    return "admit";
+  };
+
+  for await (const turn of adapter.iterate(path)) {
+    turnsScanned++;
+    // Past the boundary an earlier run recorded: the extraction, the
+    // hashing and the writes for these turns already happened. The lines
+    // are still read because a JSONL transcript cannot be seeked into.
+    if (turnsScanned <= resumeFrom) {
+      turnsResumed++;
+      // Recall is the one thing the boundary does NOT vouch for. It is
+      // accumulated in memory and committed after this loop, so the run
+      // that stopped at the boundary committed none of it - skipping these
+      // turns would leave the head of the transcript permanently absent
+      // from the recall DAG while the run reported success. Re-collecting
+      // them is cheap (the lines are read either way) and idempotent (the
+      // recall importer keys each turn on a content dedupe key).
+      if (opts.recall === true && mayWrite && admitTurn(turn) === "admit") recallTurns.push(turn);
+      continue;
+    }
+    // Everything before THIS turn is done, so the boundary is recorded
+    // here rather than at the foot of the loop - the body has several
+    // early `continue`s, and a turn skipped by a filter needs no re-work
+    // either.
+    const completedTurns = turnsScanned - 1;
+    if (
+      checkpointActive &&
+      completedTurns > resumeFrom &&
+      completedTurns % SESSION_CHECKPOINT_TURN_INTERVAL === 0
+    ) {
+      recordSessionProgress(
+        vault,
+        importId,
+        {
+          sessionFile: absPath,
+          headHash: fileIdentity.headHash,
+          bytes: fileIdentity.bytes,
+          turnsCompleted: completedTurns,
+        },
+        now,
+      );
+    }
+    const admission = admitTurn(turn);
+    if (admission === "filtered") {
+      filteredTurns++;
+      continue;
+    }
+    if (admission === "suppressed") {
       suppressedTurns++;
       continue;
     }
+    if (admission === "before_since") continue;
     if (opts.recall === true && mayWrite) recallTurns.push(turn);
 
     // Facts from USER turns only (the HANDOFF carve-out's conservative
@@ -569,6 +712,11 @@ export async function importSession(
     });
   }
 
+  // The run drained the file, so its resume point has nothing left to say -
+  // the same settle the ingest lane performs on a fully drained plan, after
+  // which the dedup index is the authoritative final state.
+  if (checkpointActive) clearSessionCheckpoint(vault, importId);
+
   return Object.freeze({
     file: absPath,
     format: adapter.id,
@@ -588,6 +736,11 @@ export async function importSession(
     filtered_turns: filteredTurns,
     recall_turns_imported: recallTurnsImported,
     recall_summary_nodes: recallSummaryNodes,
+    turns_resumed: turnsResumed,
+    resume_discarded: resumeDiscarded,
+    // Read back AFTER every write this run makes, including the recall
+    // import above: the point is to ask the disk, not the run's own belief.
+    census: censusSessionSignals(vault, createdHashes),
     errors: Object.freeze(errors),
   });
 }

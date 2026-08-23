@@ -1232,3 +1232,26 @@ log line is machine-composed rather than authored.
   outputs. Zero and two-plus recommendations are both refused and the
   refusal states the count found; a note for the same topic on the same day
   is refused rather than overwriting the first.
+- Since v1.52.0 the three needs-llm-step lanes whose artifact is a wikilinked note -
+  `brain_diarize`, `brain_design_note`, and the dream pass's rollup rungs -
+  additively carry `link_candidates` on their envelope: the note basenames a
+  `[[wikilink]]` in the answer can actually resolve to, with the `total` the
+  vault holds and a `truncated` flag when the bound could not carry them
+  all. It is built from the basename walker alone - no embedding, no vector
+  store, no index - and a truncated manifest says so in its own schema hint
+  rather than reading as the whole vault. The envelope spine is unchanged
+  and the three lanes that produce no wikilinked note (`brain_extract_signals`,
+  `brain_skill_proposals` page drafts, `brain_write_session`) carry nothing new.
+- Since v1.52.0 `brain_extract_signals` is the one lane that commits SEVERAL artifacts from
+  one validated payload - a file per mined item - so its result additively
+  carries `reconciliation` (`attempted` / `found` / `missing`, the missing
+  keys named, in the wave's shared vocabulary; a deduped or gate-rejected
+  item is a named refusal, not an attempted write). A commit that fails part
+  way still refuses with the same accounting AND the first real error, never
+  a partial success, and now also leaves a durable record of the partial
+  write under `<vault>/.open-second-brain/dead-letters/` - the new
+  `write_dead_letters` state surface - so a caller that drops the response is
+  not the only record that it happened. Nothing in this tool removes a dead
+  letter; `o2b state status` names the location and the records are listable
+  from core. Single-artifact lanes are deliberately excluded: their one
+  failure IS the response. No new tool - the surface stays at 113.

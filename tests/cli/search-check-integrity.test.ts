@@ -334,6 +334,15 @@ test("without --integrity the verb spends nothing and emits the bytes it always 
     // code now depends on the difference.
     "provider_probe",
     "provider_reason",
+    // The pending-vector census (nothing-writes-silently, unit A) sits
+    // in a slot of its own rather than replacing anything, and it is
+    // present in every state - including the one where no count could
+    // be taken, which is the state it exists to report.
+    "pending_vectors",
+    // The record-vs-data embedder audit (unit G) rides beside it on the
+    // same terms: present in every state, including the one where
+    // nothing could be compared.
+    "embedder_record",
     "warnings",
     "fatal",
     "recommendations",

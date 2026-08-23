@@ -597,14 +597,15 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "clears the git ingest `state.json` on a rescan that found no head, so the next " +
       "run starts as an initial walk rather than inheriting a stale marker.",
   },
-  "src/core/brain/ingest/checkpoint.ts": {
+  "src/core/brain/checkpoint-store.ts": {
     categories: [C.retentionDelete],
     calls: ["rmSync"],
     reason:
-      "clears one ingest plan's checkpoint behind `assertVaultIdentityForWrite`, reporting false " +
-      "rather than throwing when there was nothing to clear. Absence is the terminal state for a " +
-      "resume point: a plan with no checkpoint starts from the beginning, which is the same thing " +
-      "a checkpoint rewritten to empty would have to mean.",
+      "clears one checkpoint - an ingest plan's or a session import's - behind " +
+      "`assertVaultIdentityForWrite`, reporting false rather than throwing when there was nothing " +
+      "to clear. Absence is the terminal state for a resume point: a lane with no checkpoint " +
+      "starts from the beginning, which is the same thing a checkpoint rewritten to empty would " +
+      "have to mean.",
   },
   "src/core/brain/ingest/sources-registry.ts": {
     categories: [C.retentionDelete],
@@ -1099,8 +1100,87 @@ const DIRECT_WRITE_ROWS = 68;
  * 98 -> 99: `src/core/brain/design-note.ts` commits its note through
  * `writeFrontmatterAtomic`, exclusively, so it needs no exclusion either -
  * it arrives in the class the record wants modules to arrive in.
+ *
+ * 99 -> 100: `src/core/brain/dead-letter.ts` writes one record per failed
+ * multi-artifact commit through `atomicWriteFileSync`, and removes
+ * nothing - deleting the only evidence of a partial write is exactly what
+ * that module declines to do - so it too arrives with no exclusion owed.
  */
-const SHARED_HELPER_ROWS = 99;
+const SHARED_HELPER_ROWS = 100;
+
+// ----- Origin-channel coverage boundary (Unit C) ----------------------------
+
+/**
+ * The origin-channel stamp reaches four writers, and this census is where
+ * the OTHER ones are counted rather than described.
+ *
+ * Unit C derives a channel (`mcp-tool` / `cli` / `import`) at the process
+ * entry point and stamps it on four record families. The population is
+ * bounded on purpose - a stamp is only worth having on records that
+ * already carry structured metadata - so the honest statement of what
+ * ships is "four writers carry it and N measured write sites do not",
+ * and N has to come from the same walk that produces every other number
+ * in this file. A prose claim of uniformity would be the exact
+ * dishonesty the wave removes.
+ *
+ * Against the write-binding taxonomy (`src/core/write-binding/index.ts`)
+ * the four are one CALLER-NAMED envelope (the note target resolver), one
+ * SLUG-DERIVED writer (signals), and two FULLY-DERIVED writers (the log
+ * pair and the continuity ledger). The rest of the fully-derived class -
+ * dream workruns, decision receipts, capture decisions, every telemetry
+ * ledger - is inside the uncovered counts below and stays there.
+ */
+const ORIGIN_CHANNEL_STAMPED: ReadonlyArray<string> = Object.freeze([
+  "src/core/brain/continuity/store.ts",
+  "src/core/brain/log.ts",
+  "src/core/brain/notes/create-note.ts",
+  "src/core/brain/signal.ts",
+]);
+
+/** Import specifier of the resolver, in either quote style. */
+const ORIGIN_CHANNEL_IMPORT_RE = /from\s*["'][^"']*\/origin-channel\.ts["']/;
+
+/**
+ * The record-writer read. Keyed on the READ and not on the import,
+ * because the entry points that CLAIM the channel import the same module
+ * and write no record - counting them would inflate the covered class
+ * with modules that stamp nothing.
+ */
+const ORIGIN_CHANNEL_READ_RE = /\boriginChannelStamp\s*\(/;
+
+function stampsOriginChannel(file: CensusFile): boolean {
+  const views = lexedViews(file);
+  return (
+    ORIGIN_CHANNEL_IMPORT_RE.test(views.withoutComments) && ORIGIN_CHANNEL_READ_RE.test(views.code)
+  );
+}
+
+const STAMPED_PATHS: ReadonlySet<string> = new Set(
+  SOURCE_TREE.filter(stampsOriginChannel).map((file) => file.path),
+);
+
+/**
+ * Direct-`fs` write sites the stamp does not reach - MEASURED off the
+ * sweep, not derived from {@link DIRECT_WRITE_ROWS}.
+ *
+ * It used to be written as `DIRECT_WRITE_ROWS - 1` and asserted against
+ * `DIRECT_ROWS.length - stampedDirect.length`, which is the same
+ * arithmetic on both sides of an `expect`: the assertion restated pins
+ * the file had already made and could not fail on its own. The number
+ * below is what the sweep actually reports, so the assertion measures
+ * the swept tree; the one excused site that IS stamped is the continuity
+ * ledger, which appends its own record shape and carries the channel on
+ * the record rather than in frontmatter.
+ */
+const UNSTAMPED_DIRECT_ROWS = 67;
+
+/**
+ * Shared-helper write sites the stamp does not reach, measured the same
+ * way. The three stamped writers that route through the shared helpers -
+ * the log pair through `atomicWriteFileSync`, signals and notes through
+ * `writeFrontmatterAtomic` - are the ones missing from this count.
+ */
+const UNSTAMPED_SHARED_ROWS = 97;
 
 describe("in-vault write-site census", () => {
   test("every direct-fs write site carries a written exclusion", () => {
@@ -1162,6 +1242,70 @@ describe("in-vault write-site census", () => {
     const direct = new Set(DIRECT_ROWS.map((row) => row.path));
     expect(direct.has("src/core/brain/handoff.ts")).toBe(false);
     expect(direct.has("src/cli/brain/verbs/links.ts")).toBe(false);
+  });
+});
+
+describe("origin-channel coverage boundary", () => {
+  test("exactly the four declared writers stamp the channel", () => {
+    // Named, not counted, in both directions: a new stamper and a writer
+    // that stopped stamping are different findings and read differently.
+    expect([...STAMPED_PATHS].toSorted()).toEqual([...ORIGIN_CHANNEL_STAMPED]);
+  });
+
+  test("the direct-fs exclusion record is uncovered but for the continuity ledger", () => {
+    const stampedDirect = DIRECT_ROWS.filter((row) => STAMPED_PATHS.has(row.path)).map(
+      (row) => row.path,
+    );
+    expect(stampedDirect.toSorted()).toEqual(["src/core/brain/continuity/store.ts"]);
+    // The measured remainder, counted off the sweep rather than
+    // subtracted from a pin. This is the honest sizing of the unit: the
+    // stamp lands on four writers, and this many swept direct-`fs`
+    // sites - append-only ledgers, lifecycle moves, retention deletes,
+    // machine artifacts - put bytes in the vault without one.
+    const unstampedDirect = DIRECT_ROWS.filter((row) => !STAMPED_PATHS.has(row.path));
+    expect(unstampedDirect.length).toBe(UNSTAMPED_DIRECT_ROWS);
+  });
+
+  test("the shared-helper class is uncovered but for the log, signal and note writers", () => {
+    const sharedRows = ROWS.filter((row) => row.sharedCalls > 0);
+    const stampedShared = sharedRows
+      .filter((row) => STAMPED_PATHS.has(row.path))
+      .map((row) => row.path);
+    expect(stampedShared.toSorted()).toEqual([
+      "src/core/brain/log.ts",
+      "src/core/brain/notes/create-note.ts",
+      "src/core/brain/signal.ts",
+    ]);
+    const unstampedShared = sharedRows.filter((row) => !STAMPED_PATHS.has(row.path));
+    expect(unstampedShared.length).toBe(UNSTAMPED_SHARED_ROWS);
+  });
+
+  test("a new stamper anywhere in the tree is reported, not absorbed", () => {
+    // The detector's own failure mode: a module that reads the stamp and
+    // is not in the declared four has widened the covered class, and the
+    // boundary numbers above are stale the moment it lands.
+    const intruder: CensusFile = {
+      path: "src/core/brain/synthetic-stamper.ts",
+      text:
+        'import { originChannelStamp } from "../origin-channel.ts";\n' +
+        "export const channel = originChannelStamp();\n",
+    };
+    expect(stampsOriginChannel(intruder)).toBe(true);
+    expect(STAMPED_PATHS.has(intruder.path)).toBe(false);
+  });
+
+  test("claiming the channel is not stamping it", () => {
+    // The entry points import the same module to CLAIM the channel and
+    // write no record. Keying the detector on the import alone would put
+    // them in the covered class and overstate the coverage by three.
+    expect(
+      stampsOriginChannel({
+        path: "src/cli/synthetic-entry-point.ts",
+        text:
+          'import { ORIGIN_CHANNEL, setOriginChannel } from "../core/origin-channel.ts";\n' +
+          "setOriginChannel(ORIGIN_CHANNEL.cli);\n",
+      }),
+    ).toBe(false);
   });
 });
 

@@ -75,6 +75,8 @@ import {
   type ProgressCounter,
 } from "./progress.ts";
 import { regenerateLessonsQuiet } from "./lessons.ts";
+import { buildLinkCandidateManifest, type LinkCandidateManifest } from "./notes/link-candidates.ts";
+import { gatedOwnerScopeView } from "./owner-scope-view.ts";
 import { brainDirsForWrite, dreamWorkrunPath } from "./paths.ts";
 import { loadBrainConfig } from "./policy.ts";
 import { buildReconcileOutcomes } from "./reconcile-outcomes.ts";
@@ -271,13 +273,21 @@ function dreamRun(
   // which is why an un-opted-in vault pays no I/O here.
   const salienceGate = applySalienceGate({ vault, preferences: scan.preferences, cfg, now });
 
+  // The wikilink targets a fired rung's envelope offers, built at most
+  // ONCE per dream run and only if a rung fires. The manifest is a whole
+  // -vault walk (a frontmatter read per note under owner-scope delivery),
+  // the ladder is planned before the `changed` gate, and the runId
+  // collision path below re-plans - so an eager build paid that walk on
+  // every dry run that fires nothing, and twice on a collision.
+  const linkCandidates = memoizedLinkCandidates(vault, opts.agentName);
+
   // Count-triggered fact rollup ladder (S3): pure counters over the
   // ADMITTED fact artifacts (preferences) against the persisted per-tier
   // baselines. Computed before the `changed` gate so a run whose ONLY
   // effect is a rollup still counts as changed; below threshold it fires
   // nothing and the ledger is never written, so the run stays
   // byte-identical.
-  let rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId);
+  let rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
 
   if (!hasStateChange(plan, refresh, scan.corrupted.length, rollupPlan)) {
     if (!dryRun) {
@@ -338,7 +348,7 @@ function dreamRun(
         // the pre-collision runId; if the ladder corrected it, rebuild the
         // plan so every target_path embeds the final run_id.
         if (rollupPlan.fired && runId !== baseRunId) {
-          rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId);
+          rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
         }
         opts.safeguard?.checkpoint();
         const handle = openWorkrun(vault, runId);
@@ -528,13 +538,37 @@ function buildRollupPlan(
   cfg: BrainConfig,
   factCount: number,
   runId: string,
+  linkCandidates: () => LinkCandidateManifest,
 ): RollupLadderPlan {
   return planRollupLadder({
     factCount,
     ledger: readRollupLedger(vault),
     thresholds: resolveRollupThresholds(cfg),
     runId,
+    linkCandidates,
   });
+}
+
+/**
+ * The link-candidate manifest for this run, walked at most once and only
+ * if something asks for it. Both callers of {@link buildRollupPlan} share
+ * one of these, so a runId collision re-plans off the manifest already
+ * built rather than walking the vault a second time.
+ *
+ * No query: the ladder is count-only by design and never learns which
+ * items it is folding, so ranking the candidates would be inventing a
+ * relevance nothing measured. The manifest says `alphabetical` and names
+ * the total, which is the honest form of that.
+ */
+function memoizedLinkCandidates(
+  vault: string,
+  agentName: string | undefined,
+): () => LinkCandidateManifest {
+  let manifest: LinkCandidateManifest | null = null;
+  return () =>
+    (manifest ??= buildLinkCandidateManifest(vault, {
+      visible: gatedOwnerScopeView(vault, agentName).visible,
+    }));
 }
 
 function formatRunId(d: Date): string {
