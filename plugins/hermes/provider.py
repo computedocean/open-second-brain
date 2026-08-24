@@ -48,6 +48,7 @@ MEMORY_TOOLS: tuple[str, ...] = (
     "brain_recall_gate",
     "brain_context",
     "brain_context_pack",
+    "brain_context_pack_outcome",
     # continuity
     "brain_pre_compact_extract",
 )
@@ -143,6 +144,7 @@ SESSION_TRANSCRIPT_FILENAME = "session-transcript.jsonl"
 
 # Token budget for the recall slice fetched on each prefetch.
 _PREFETCH_MAX_TOKENS = 1024
+_PREFETCH_RECEIPT_HOST = "hermes"
 
 # A provider instance is created per AIAgent, but the MCP server is a gateway
 # resource rather than a session resource. Keep one bridge per effective server
@@ -285,6 +287,7 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
         self._lock = threading.Lock()
         self._sync_threads: list[threading.Thread] = []
         self._queued_query: str = ""
+
 
     # -- required surface ----------------------------------------------------
 
@@ -594,6 +597,13 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
 
     # -- lifecycle hooks -----------------------------------------------------
 
+    @staticmethod
+    def _receipt_id(pack: Any) -> str | None:
+        """Return the server-issued opaque receipt id, if this pack has one."""
+        structured = OpenSecondBrainMemoryProvider._structured(pack)
+        receipt_id = structured.get("receipt_id")
+        return str(receipt_id) if receipt_id else None
+
     def system_prompt_block(self) -> str:
         """Static provider context: the current active-preferences body."""
         result = self._safe_call("brain_context", {})
@@ -607,12 +617,36 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
         always appended when an agent identity is configured.
         """
         parts: list[str] = []
+        sid = session_id or self._session_id
         gate = self._structured(self._safe_call("brain_recall_gate", {"prompt": query}))
         if gate.get("retrieve"):
-            pack = self._safe_call("brain_context_pack", {"max_tokens": _PREFETCH_MAX_TOKENS})
+            pack = self._safe_call(
+                "brain_context_pack",
+                {
+                    "max_tokens": _PREFETCH_MAX_TOKENS,
+                    "receipt": True,
+                    "receipt_host": _PREFETCH_RECEIPT_HOST,
+                    "telemetry": True,
+                    "telemetry_host": _PREFETCH_RECEIPT_HOST,
+                    **({"session_id": sid} if sid else {}),
+                },
+            )
             recalled = self._context_pack_text(pack)
             if recalled:
                 parts.append(recalled)
+                receipt_id = self._receipt_id(pack)
+                if receipt_id:
+                    parts.append(
+                        "[O2B context-pack metadata] "
+                        + json.dumps(
+                            {
+                                "sample_id": receipt_id,
+                                "outcome": "unknown_until_explicit_tool_call",
+                                "tool": "brain_context_pack_outcome",
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
         # Skill auto-attach (Agent Surface Suite): the TS side gates on the
         # skill_auto_attach config key and returns an empty block when off,
         # so the default injection stays byte-identical. Fail-soft like every
