@@ -18,8 +18,8 @@ import logging
 import os
 import shutil
 import threading
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
@@ -142,9 +142,17 @@ def _resolved_config_values() -> dict[str, str]:
 # Durable per-session transcript written under ``hermes_home``.
 SESSION_TRANSCRIPT_FILENAME = "session-transcript.jsonl"
 
-# Token budget for the recall slice fetched on each prefetch.
+# Token budget for the recall slice fetched on each prefetch. Enforced
+# SERVER-side by `brain_context_pack`, which estimates tokens against the
+# bodies it emits; the provider never re-spends it as a character budget,
+# because the four-bytes-per-token heuristic that would take is wrong by two
+# to four times on Cyrillic and CJK vaults.
 _PREFETCH_MAX_TOKENS = 1024
 _PREFETCH_RECEIPT_HOST = "hermes"
+# How `brain_context_pack` reads the turn: order the curated candidates by
+# relevance rather than filtering them, so a natural-language turn spends the
+# budget on what matters instead of substring-missing every page.
+_PREFETCH_QUERY_MODE = "ranked"
 
 # A provider instance is created per AIAgent, but the MCP server is a gateway
 # resource rather than a session resource. Keep one bridge per effective server
@@ -492,7 +500,17 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
         if tool_name not in MEMORY_TOOLS:
             # Enforce the curated surface at execution time, not just discovery.
             raise BridgeError(f"unsupported memory tool: {tool_name}")
-        return self._as_tool_content(self._bridge.call_tool(tool_name, args or {}))
+        forward_args = dict(args or {})
+        # Correlation defaults for the outcome POST only. `host` and
+        # `session_id` are also READ filters on list/summary, so supplying
+        # them there would narrow an agent's query to this host's rows
+        # without ever telling it - the "narrowed without saying so" failure
+        # the architecture notes call out by name.
+        if tool_name == "brain_context_pack_outcome" and forward_args.get("operation") == "post":
+            forward_args.setdefault("host", _PREFETCH_RECEIPT_HOST)
+            if self._session_id:
+                forward_args.setdefault("session_id", self._session_id)
+        return self._as_tool_content(self._bridge.call_tool(tool_name, forward_args))
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         """The wizard's field list, derived from :data:`_CONFIG_FIELDS`.
@@ -604,6 +622,23 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
         receipt_id = structured.get("receipt_id")
         return str(receipt_id) if receipt_id else None
 
+    def _log_pack_warnings(self, pack: Any) -> None:
+        """Surface the pack's own warnings; a degraded recall must name itself.
+
+        `brain_context_pack` reports injection-time tension warnings and the
+        owner-scope observation. They describe the material about to enter the
+        prompt - a memory that is the subject of an unresolved contradiction,
+        for one - and are for the operator, not the model, so they go to the
+        log rather than into the injected text.
+        """
+        warnings = self._structured(pack).get("warnings")
+        if not isinstance(warnings, list):
+            return
+        for warning in warnings:
+            text = str(warning).strip()
+            if text:
+                logger.warning("%s: brain_context_pack: %s", self.PROVIDER_NAME, text)
+
     def system_prompt_block(self) -> str:
         """Static provider context: the current active-preferences body."""
         result = self._safe_call("brain_context", {})
@@ -615,22 +650,49 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
         The recall gate decides whether a retrieval runs; the identity reminder
         (the behaviour the retired ``pre_llm_call`` hook used to provide) is
         always appended when an agent identity is configured.
+
+        Recall has exactly ONE lane, ``brain_context_pack``, and the turn's
+        query rides it in ranked mode. That lane is where the prompt-injection
+        guard, the curated preference pool, the tombstone and supersession-tip
+        filters, owner-scope delivery, the enforced token budget, and the
+        server-issued receipt live; a raw ``brain_search`` recall would have
+        query-awareness and none of them. There is no second lane and no
+        fallback: a lane that fails says so through ``_safe_call`` and this
+        turn is injected nothing.
         """
         parts: list[str] = []
         sid = session_id or self._session_id
-        gate = self._structured(self._safe_call("brain_recall_gate", {"prompt": query}))
+        turn_id = str(_kwargs.get("turn_id") or "")
+        gate_args: dict[str, Any] = {
+            "prompt": query,
+            "telemetry_host": _PREFETCH_RECEIPT_HOST,
+        }
+        if sid:
+            gate_args["session_id"] = sid
+        if turn_id:
+            gate_args["turn_id"] = turn_id
+        gate = self._structured(self._safe_call("brain_recall_gate", gate_args))
         if gate.get("retrieve"):
-            pack = self._safe_call(
-                "brain_context_pack",
-                {
-                    "max_tokens": _PREFETCH_MAX_TOKENS,
-                    "receipt": True,
-                    "receipt_host": _PREFETCH_RECEIPT_HOST,
-                    "telemetry": True,
-                    "telemetry_host": _PREFETCH_RECEIPT_HOST,
-                    **({"session_id": sid} if sid else {}),
-                },
-            )
+            pack_args: dict[str, Any] = {
+                "max_tokens": _PREFETCH_MAX_TOKENS,
+                "receipt": True,
+                "receipt_host": _PREFETCH_RECEIPT_HOST,
+                "telemetry": True,
+                "telemetry_host": _PREFETCH_RECEIPT_HOST,
+            }
+            # Ranked mode ORDERS the curated candidates by relevance to this
+            # turn and excludes none, so the budget decides what is dropped.
+            # The server refuses a mode with no query, so both travel or
+            # neither does.
+            if query.strip():
+                pack_args["query"] = query
+                pack_args["query_mode"] = _PREFETCH_QUERY_MODE
+            if sid:
+                pack_args["session_id"] = sid
+            if turn_id:
+                pack_args["turn_id"] = turn_id
+            pack = self._safe_call("brain_context_pack", pack_args)
+            self._log_pack_warnings(pack)
             recalled = self._context_pack_text(pack)
             if recalled:
                 parts.append(recalled)
@@ -647,6 +709,15 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
                             ensure_ascii=False,
                         )
                     )
+            else:
+                # A gated turn that recalls nothing is a fact worth stating:
+                # on an empty vault it is normal, and after a failed bridge
+                # call it is the second half of the warning `_safe_call`
+                # already emitted. Either way it is not a silent no-op.
+                logger.info(
+                    "%s: brain_context_pack returned no recall for a gated turn",
+                    self.PROVIDER_NAME,
+                )
         # Skill auto-attach (Agent Surface Suite): the TS side gates on the
         # skill_auto_attach config key and returns an empty block when off,
         # so the default injection stays byte-identical. Fail-soft like every
