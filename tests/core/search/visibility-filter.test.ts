@@ -9,13 +9,17 @@
 import { test, expect, beforeEach, afterEach, describe } from "bun:test";
 
 import {
+  REMOTE_DENY_VISIBILITY_TOKEN,
   isVisible,
   normalizeVisibilityScope,
   pageVisibility,
 } from "../../../src/core/graph/visibility.ts";
+import { TRANSPORT_REACH } from "../../../src/core/graph/transport-reach.ts";
 import { indexVault } from "../../../src/core/search/indexer.ts";
 import { search } from "../../../src/core/search/search.ts";
 import { createTempVault, makeConfig, writeMd } from "../../helpers/search-fixtures.ts";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 
 describe("visibility rule (pure)", () => {
   test("a page with no visibility tag is always reachable", () => {
@@ -57,13 +61,61 @@ describe("visibility scoping in search", () => {
     const defPaths = def.results.map((r) => r.path).toSorted();
     expect(defPaths).toEqual(["public.md"]);
 
+    // The caller argument still lifts the page for a caller this server
+    // established local access for - the operator's own CLI, unchanged.
     const scoped = await search(cfg, {
       query: "lattice widgets",
       limit: 10,
-      visibility: ["private"],
+      visibility: [REMOTE_DENY_VISIBILITY_TOKEN],
+      transportReach: TRANSPORT_REACH.local,
     });
     const scopedPaths = scoped.results.map((r) => r.path).toSorted();
     expect(scopedPaths).toEqual(["public.md", "secret.md"]);
+  });
+
+  test("the caller argument narrows only: it cannot lift the reserved token", async () => {
+    writeMd(vault, "public.md", "# Public\n\nshared lattice notes about widgets");
+    writeMd(
+      vault,
+      "secret.md",
+      "---\nvisibility: [private]\n---\n# Secret\n\nclassified lattice notes about widgets",
+    );
+    const cfg = makeConfig({ vault, dbPath });
+    await indexVault(cfg);
+
+    const asked = await search(cfg, {
+      query: "lattice widgets",
+      limit: 10,
+      visibility: [REMOTE_DENY_VISIBILITY_TOKEN],
+      transportReach: TRANSPORT_REACH.remote,
+    });
+    expect(asked.results.map((r) => r.path).toSorted()).toEqual(["public.md"]);
+  });
+
+  test("an unmeasurable page is withheld at remote reach and kept at local", async () => {
+    // A document still in the index whose file was deleted since the last
+    // run has an UNREADABLE visibility claim, and an unreadable claim is
+    // not the absence of one. Fail closed at remote reach; the local
+    // caller, who could read the file directly anyway, keeps the row.
+    writeMd(vault, "gone.md", "# Gone\n\nlattice widget vanishing");
+    writeMd(vault, "here.md", "# Here\n\nlattice widget staying");
+    const cfg = makeConfig({ vault, dbPath });
+    await indexVault(cfg);
+    rmSync(join(vault, "gone.md"));
+
+    const remote = await search(cfg, {
+      query: "lattice widget",
+      limit: 10,
+      transportReach: TRANSPORT_REACH.remote,
+    });
+    expect(remote.results.map((r) => r.path).toSorted()).toEqual(["here.md"]);
+
+    const local = await search(cfg, {
+      query: "lattice widget",
+      limit: 10,
+      transportReach: TRANSPORT_REACH.local,
+    });
+    expect(local.results.map((r) => r.path).toSorted()).toEqual(["gone.md", "here.md"]);
   });
 
   test("default scope backfills untagged matches when tagged pages crowd a narrow pool", async () => {
@@ -87,6 +139,56 @@ describe("visibility scoping in search", () => {
     const paths = out.results.map((r) => r.path).toSorted();
     expect(paths).toEqual(["public-0.md", "public-1.md", "public-2.md", "public-3.md"]);
     expect(out.results.every((r) => r.path.startsWith("public-"))).toBe(true);
+  });
+
+  test("the retrieval trail never counts what the reserved-token rule withheld", async () => {
+    // The trail answers "did MY scope remove my results". The reach rule
+    // is not a scope the caller requested, so a count of its drops would
+    // tell this caller that pages it may not read matched its query -
+    // the existence oracle a withheld page is supposed to be free of.
+    writeMd(vault, "reserved.md", "---\nvisibility: [private]\n---\nlattice widget reserved");
+    writeMd(vault, "open.md", "# Open\n\nlattice widget open");
+    const cfg = makeConfig({ vault, dbPath });
+    await indexVault(cfg);
+
+    const remote = await search(cfg, { query: "lattice widget", limit: 10 });
+    expect(remote.results.map((r) => r.path)).toEqual(["open.md"]);
+    const codes = (remote.retrievalTrail?.degraded ?? []).map((d) => d.code);
+    expect(codes).not.toContain("scope-filters-dropped-rows");
+
+    // The local half is the control: the same corpus reaches both pages
+    // once the caller's own scope names the token too - the reach rule
+    // and the caller-scope rule are independent, and BOTH have to admit
+    // the page. Still nothing to report as narrowing.
+    const local = await search(cfg, {
+      query: "lattice widget",
+      limit: 10,
+      visibility: [REMOTE_DENY_VISIBILITY_TOKEN],
+      transportReach: TRANSPORT_REACH.local,
+    });
+    expect(local.results.map((r) => r.path).toSorted()).toEqual(["open.md", "reserved.md"]);
+    expect((local.retrievalTrail?.degraded ?? []).map((d) => d.code)).not.toContain(
+      "scope-filters-dropped-rows",
+    );
+  });
+
+  test("a scope the caller DID request is still reported as narrowing", async () => {
+    // The counterweight to the test above: removing the reach drop from
+    // the trail must not silence the narrowing the trail exists for.
+    writeMd(vault, "team.md", "---\nvisibility: [team]\n---\nlattice widget team");
+    writeMd(vault, "open.md", "# Open\n\nlattice widget open");
+    const cfg = makeConfig({ vault, dbPath });
+    await indexVault(cfg);
+
+    const out = await search(cfg, {
+      query: "lattice widget",
+      limit: 10,
+      visibility: ["some-other-token"],
+    });
+    expect(out.results.map((r) => r.path)).toEqual(["open.md"]);
+    expect((out.retrievalTrail?.degraded ?? []).map((d) => d.code)).toContain(
+      "scope-filters-dropped-rows",
+    );
   });
 
   test("an all-untagged vault is unaffected by the default scope", async () => {

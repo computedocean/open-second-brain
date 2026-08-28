@@ -13,6 +13,7 @@
  * before is still exported from this path.
  */
 
+import type { TransportReach } from "../graph/transport-reach.ts";
 import type { DegradationNotice } from "../integrity/degradation.ts";
 import type { StampMismatch } from "../integrity/stamp.ts";
 import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliation-report.ts";
@@ -499,6 +500,24 @@ export interface VisibilityHonestyFinding {
   readonly excludedSurfaceCount: number;
   /** Every callable surface the registry classifies, covered or excluded. */
   readonly totalSurfaceCount: number;
+  /**
+   * Indexed documents declaring the token reserved against remote reads -
+   * the population this boundary withholds from a remote caller.
+   *
+   * Reported because the boundary is a BEHAVIOUR CHANGE for a vault that
+   * tags pages, and an operator has to be able to see its size rather
+   * than infer it from a search that came back shorter.
+   */
+  readonly reservedDocumentCount: number;
+  /**
+   * Indexed documents the index measured nothing for - it holds no
+   * frontmatter chunk to read.
+   *
+   * Reported rather than absorbed into "declares nothing": the two are
+   * different statements, and folding the legacy population into the
+   * measured one would answer a question nobody could check.
+   */
+  readonly unmeasuredDocumentCount: number;
 }
 
 export interface IndexCheckReport {
@@ -629,6 +648,19 @@ export interface ExpandHitInput {
    * would confirm the chunk exists. Omitted / blank filters nothing.
    */
   readonly agentScope?: string;
+  /**
+   * How far this caller reached, minted by the transport
+   * (`src/core/graph/transport-reach.ts`). Absent resolves to the
+   * narrowest, on the same terms {@link SearchOptions.transportReach}
+   * does.
+   *
+   * A chunk id is a sequential integer, so this surface is the enumerable
+   * back door to every reserved page in the index. A page reserved
+   * against remote reads is refused here with the SAME error an absent
+   * chunk produces - the convention the owner-scope refusal above already
+   * follows, for the same reason.
+   */
+  readonly transportReach?: TransportReach;
 }
 
 /**
@@ -813,8 +845,30 @@ export interface SearchOptions {
    * a page that declares visibility values is returned only when this
    * scope includes one of them. Absent/empty = default scope (reaches
    * untagged pages only). See src/core/graph/visibility.ts.
+   *
+   * This argument NARROWS and cannot lift: a scope naming
+   * {@link REMOTE_DENY_VISIBILITY_TOKEN} does not make a page reserved
+   * against remote reads readable at {@link TRANSPORT_REACH.remote}. See
+   * {@link SearchOptions.transportReach}.
    */
   readonly visibility?: ReadonlyArray<string>;
+  /**
+   * How far the caller of this search had to reach to get here, minted by
+   * the transport that accepted the request
+   * (`src/core/graph/transport-reach.ts`).
+   *
+   * Absent resolves to {@link TRANSPORT_REACH.remote}, the narrowest: a
+   * search whose caller nobody established anything about is not a search
+   * that proved local access. Every internal lane that must see the whole
+   * corpus - benchmarks, recall feedback, rerank fit - passes
+   * {@link TRANSPORT_REACH.local} explicitly, and so does the CLI, which
+   * runs in the operator's own shell.
+   *
+   * NOT to be confused with {@link SearchOptions.disclosure}, which is
+   * the result-DEPTH mode; this one decides which pages exist for this
+   * caller at all.
+   */
+  readonly transportReach?: TransportReach;
   /**
    * Requested agent-ownership scope (Unit 5). When set, a page that
    * declares an `owner:` frontmatter token is returned only if its owner

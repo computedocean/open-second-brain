@@ -82,7 +82,7 @@ import {
   formatEmbedderRecordContradiction,
   formatEmbeddingAbiDrift,
   peekPendingVectorsSync,
-  peekVisibilityTagPresence,
+  peekVisibilityColumnCensus,
   readEmbedderRecordCensusSync,
   readEmbeddingAbiSync,
   runtimeEmbeddingAbi,
@@ -110,6 +110,7 @@ import type {
   ResolvedSearchConfig,
   VisibilityHonestyFinding,
 } from "./types.ts";
+import { REMOTE_DENY_VISIBILITY_TOKEN, pageVisibility } from "../graph/visibility.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -461,6 +462,13 @@ async function indexIntoRun(
           // above: unchanged content can only ever resolve to the same
           // anchor, so declining to recompute it cannot stale it.
           eventAnchor: resolveEventAnchor(frontmatter, body),
+          // What this run MEASURED of the page's visibility declaration,
+          // from the frontmatter already parsed above (v12). The indexer
+          // marks; it never skips. A `continue` here would be a live
+          // defect: `seen.add` runs BEFORE the content is read, so the
+          // deletion sweep would not purge a skipped page's stale rows and
+          // the page would keep whatever chunks it already had.
+          visibility: pageVisibility(frontmatter),
         });
         // Framework-kind files feed the tier-guard post-pass: keep the
         // parsed frontmatter of this run's changed docs that declare a
@@ -1656,9 +1664,9 @@ function readPendingVectorCensus(dbPath: string): PendingVectorCensus {
  * The visibility honesty finding for an index path, or `null` when there
  * is nothing to be honest ABOUT: the index does not exist, would not
  * open, or - the common case - has never carried a `visibility:`-tagged
- * page. Both counts are read off the registry's own exported list at
- * call time, never hand-written, so the finding cannot drift from the
- * census that backs it (nothing-writes-silently, unit H, form B).
+ * page AND measured every document it holds. The surface counts are read off the registry's own exported list
+ * at call time and the document counts off the index's own column, never
+ * hand-written, so the finding cannot drift from what backs it.
  *
  * CALLABLE rows only. The registry also carries one `index_store` row -
  * the fact that `chunks` stores a private page's text whatever a
@@ -1666,11 +1674,23 @@ function readPendingVectorCensus(dbPath: string): PendingVectorCensus {
  * operator could call would inflate a number reported to operators.
  */
 function readVisibilityHonestyFinding(dbPath: string): VisibilityHonestyFinding | null {
-  const peek = peekVisibilityTagPresence(dbPath);
-  if (peek.kind !== "read" || !peek.value) return null;
+  const peek = peekVisibilityColumnCensus(dbPath, REMOTE_DENY_VISIBILITY_TOKEN);
+  if (peek.kind !== "read") return null;
+  // Reported when the index HAS something to be honest about, which is
+  // either a tagged page or a population it could not measure. Gating on
+  // `tagged` alone suppressed the unmeasured count in exactly the state
+  // it exists to surface: an index migrated to v12 whose chunk-zero rows
+  // are gone reads as untagged for every row, so the operator was told
+  // nothing at all about the documents the index measured nothing for.
+  if (!peek.value.tagged && peek.value.unmeasured === 0) return null;
   return Object.freeze({
     excludedSurfaceCount: excludedCallableVisibilitySurfaces().length,
     totalSurfaceCount: callableVisibilitySurfaces().length,
+    // Both from the store, never hand-written, for the same reason the
+    // two surface counts are read off the registry: a number an operator
+    // acts on must be the measurement rather than a copy of one.
+    reservedDocumentCount: peek.value.reserved,
+    unmeasuredDocumentCount: peek.value.unmeasured,
   });
 }
 

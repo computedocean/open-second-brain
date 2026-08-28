@@ -12,7 +12,13 @@ import { parseFrontmatterWithNotices } from "../vault.ts";
 import { BRAIN_STATE_REL } from "../brain/paths.ts";
 import { DEGRADATION_CODE } from "../integrity/degradation.ts";
 import type { FrontmatterMap } from "../types.ts";
-import { isVisible, pageVisibility } from "../graph/visibility.ts";
+import {
+  REMOTE_DENY_VISIBILITY_TOKEN,
+  isRemotelyReadable,
+  isVisible,
+  pageVisibility,
+} from "../graph/visibility.ts";
+import { type TransportReach } from "../graph/transport-reach.ts";
 import { isOwnerVisible, pageOwner } from "../graph/agent-scope.ts";
 import { scopeAxisReachable, scopeFromFrontmatter, type CompositeScope } from "../scope-key.ts";
 import { applyDegreeFilters, filterByProperties, type DegreePredicate } from "./property-filter.ts";
@@ -246,21 +252,99 @@ export function applyDegreeFilter(
   return applyDegreeFilters(ranked, predicates, (path) => degreeForPath(snapshot, path));
 }
 
+/**
+ * The reserved-token rule over a ranked result set: root A.
+ *
+ * Separate from {@link applyVisibilityScope}, and the separation is
+ * load-bearing rather than tidy. The two answer different questions -
+ * this one "may a caller at this REACH see the page at all", that one
+ * "does the caller's requested scope reach the page's tags" - and only
+ * the second is a filter the CALLER asked for. The retrieval trail
+ * reports how many rows the caller's own scopes removed, so a reach drop
+ * counted on that side would hand the caller the number of pages it was
+ * withheld from, which is the existence oracle this boundary exists to
+ * close. Running first, and being counted out before the trail's
+ * baseline is taken, is what makes a withheld page indistinguishable
+ * from an absent one.
+ *
+ * The per-path verdict is {@link isPathReadableAtReach}, so this pass
+ * and the by-chunk-id drill-down cannot drift on what "reserved" means -
+ * including the unreadable-file verdict, which an empty frontmatter map
+ * cannot express.
+ */
+export function applyReachFilter(
+  ranked: ReadonlyArray<BrainSearchResult>,
+  reach: TransportReach,
+  vault: string,
+  frontmatterCache: FrontmatterCache,
+): ReadonlyArray<BrainSearchResult> {
+  return ranked.filter((r) => isPathReadableAtReach(vault, r.path, reach, frontmatterCache));
+}
+
+/**
+ * The caller's requested visibility scope over a ranked result set.
+ *
+ * Answers {@link isVisible} only, and is still caller-liftable for every
+ * non-reserved token. It cannot lift the reserved one because
+ * {@link applyReachFilter} has already run and this pass only ever
+ * narrows further.
+ *
+ * Deliberately does NOT see the unmeasurable-page substitution
+ * {@link isPathReadableAtReach} makes: letting that token reach
+ * {@link isVisible} would drop every unreadable page from every
+ * default-scope search at every reach, which is a caller-scope rule this
+ * boundary has no business changing.
+ */
 export function applyVisibilityScope(
   ranked: ReadonlyArray<BrainSearchResult>,
   scope: ReadonlySet<string>,
   vault: string,
   frontmatterCache: FrontmatterCache,
 ): ReadonlyArray<BrainSearchResult> {
-  const tagsFor = (path: string): string[] => {
-    try {
-      return pageVisibility(readCachedFrontmatter(frontmatterCache, vault, path));
-    } catch {
-      return [];
-    }
-  };
-  return ranked.filter((r) => isVisible(tagsFor(r.path), scope));
+  return ranked.filter((r) =>
+    isVisible(pageVisibility(readCachedFrontmatter(frontmatterCache, vault, r.path)), scope),
+  );
 }
+
+/**
+ * May a caller at `reach` read the page at this vault-relative path? The
+ * one place the reserved-token rule meets the filesystem, so every
+ * surface that owns a path - ranked results, the by-chunk-id drill-down,
+ * a report row naming an artifact - resolves it identically.
+ *
+ * FAILS CLOSED at {@link TRANSPORT_REACH.remote} on a page whose file
+ * cannot be READ, the routine trigger being a document still in the index
+ * whose file was deleted, renamed or made unreadable since the last run.
+ * An unreadable visibility claim is not the absence of one, the
+ * convention {@link isPathOwnerVisible} beside it already holds for
+ * ownership. The verdict comes from {@link readCachedFrontmatterEntry}
+ * rather than from an empty metadata map, because the parser resolves an
+ * unreadable file to `{}` and never throws, so a `catch` arm here would
+ * be dead code. At {@link TRANSPORT_REACH.local} the page is readable
+ * unconditionally - that caller can open the file directly anyway, and
+ * hiding a stale index row from the operator who has to fix it helps
+ * nobody.
+ */
+export function isPathReadableAtReach(
+  vault: string,
+  path: string,
+  reach: TransportReach,
+  frontmatterCache: FrontmatterCache,
+): boolean {
+  const entry = readCachedFrontmatterEntry(frontmatterCache, vault, path);
+  const tags = entry.unreadable ? UNMEASURABLE_VISIBILITY : pageVisibility(entry.meta);
+  return isRemotelyReadable(tags, reach);
+}
+
+/**
+ * The tag list an unreadable page answers with: the reserved token, so a
+ * page nobody can measure is treated exactly as one that reserved itself.
+ * Spelled as a constant rather than an inline literal so the fail-closed
+ * choice is visible at the definition rather than inferred from a branch.
+ */
+const UNMEASURABLE_VISIBILITY: ReadonlyArray<string> = Object.freeze([
+  REMOTE_DENY_VISIBILITY_TOKEN,
+]);
 
 /**
  * Composite scope filter (t_37c05a34): drop results outside the requested

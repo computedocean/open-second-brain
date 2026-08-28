@@ -68,6 +68,7 @@ import {
 import { CLI_COMMAND_MANIFEST, manifestForJson } from "./command-manifest.ts";
 import { COMPLETION_SHELLS, isCompletionShell, renderCompletions } from "./completions.ts";
 import { MCPServer } from "../mcp/server.ts";
+import { CLI_TRANSPORT_REACH } from "./transport-reach.ts";
 import { startHttp, isLoopbackHost } from "../mcp/http.ts";
 import { serveStdio } from "../mcp/stdio.ts";
 import { SERVER_VERSION } from "../mcp/protocol.ts";
@@ -572,7 +573,7 @@ async function cmdIndex(argv: string[]): Promise<number> {
   const vault = requireVault(flags["vault"] as string | undefined, defaultConfigPath());
   let pages;
   try {
-    pages = listVaultPages(vault);
+    pages = listVaultPages(vault, { reach: CLI_TRANSPORT_REACH });
   } catch (exc) {
     process.stderr.write(`error: failed to list vault pages: ${(exc as Error).message ?? exc}\n`);
     return 1;
@@ -919,7 +920,11 @@ async function cmdToolCall(argv: string[]): Promise<number> {
       args[k] = v;
     }
   }
-  const server = new MCPServer({ vault, configPath: config });
+  // The CLI tool-call bridge runs in the operator's own shell against
+  // the operator's own vault, so it establishes the same reach stdio
+  // does - and for the same reason: filesystem-equivalent access is
+  // already held before the first argument is parsed.
+  const server = new MCPServer({ vault, configPath: config }, { reach: CLI_TRANSPORT_REACH });
   try {
     const result = await server.callTool(toolName, args);
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");

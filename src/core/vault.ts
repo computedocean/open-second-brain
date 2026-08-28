@@ -64,6 +64,12 @@ import {
   emitDegradationNotice,
 } from "./integrity/degradation.ts";
 import { vaultRelative } from "./path-safety.ts";
+import { type TransportReach } from "./graph/transport-reach.ts";
+import {
+  REMOTE_DENY_VISIBILITY_TOKEN,
+  isRemotelyReadable,
+  pageVisibility,
+} from "./graph/visibility.ts";
 import type { FrontmatterMap, FrontmatterValue, VaultPage } from "./types.ts";
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n?/;
@@ -556,7 +562,13 @@ export function extractWikilinks(content: string): string[] {
   return result;
 }
 
-export interface ListVaultPagesOptions {
+/**
+ * What every walker in this module accepts. Separate from
+ * {@link ListVaultPagesOptions} because only the walker that PARSES
+ * frontmatter can answer the visibility question, and a shared type would
+ * have let the cheap basename walkers claim an answer they cannot give.
+ */
+export interface VaultWalkOptions {
   readonly skipDirs?: ReadonlyArray<string>;
   readonly skipFiles?: ReadonlyArray<string>;
   /**
@@ -575,7 +587,35 @@ export interface ListVaultPagesOptions {
   readonly site?: string;
 }
 
+export interface ListVaultPagesOptions extends VaultWalkOptions {
+  /**
+   * How far the caller of this walk reached, minted by the transport
+   * (`src/core/graph/transport-reach.ts`). REQUIRED, and deliberately so.
+   *
+   * This walker is one of the three roots every callable surface reaches
+   * page content through, and the two ways to get it wrong fail in
+   * opposite directions: a maintenance lane that quietly stopped seeing
+   * reserved pages would corrupt the link graph it repairs, while a read
+   * surface that quietly saw them would be the boundary failing. Neither
+   * is a decision to make by omission, so there is no default to inherit
+   * - every call site says which caller it is walking for.
+   */
+  readonly reach: TransportReach;
+}
+
 const LIST_VAULT_PAGES_SITE = "vault.listVaultPages";
+
+/**
+ * The tag list a page whose file could not be read answers with: the
+ * reserved token, so a page nobody can measure is treated exactly as one
+ * that reserved itself. The twin of `UNMEASURABLE_VISIBILITY` in
+ * `core/search/result-filters.ts`, which makes the same substitution for
+ * roots A and C - spelled from the same exported token so the two cannot
+ * come to mean different things.
+ */
+const UNMEASURABLE_PAGE_VISIBILITY: ReadonlyArray<string> = Object.freeze([
+  REMOTE_DENY_VISIBILITY_TOKEN,
+]);
 
 /**
  * Walk the vault and return every Markdown page with parsed frontmatter
@@ -583,17 +623,43 @@ const LIST_VAULT_PAGES_SITE = "vault.listVaultPages";
  * mirror the Python defaults.
  *
  * Pass `opts.notices` to collect what the walk discarded — see
- * {@link ListVaultPagesOptions}.
+ * {@link VaultWalkOptions}.
+ *
+ * Root B of the visibility boundary: a page reserved against remote reads
+ * is dropped at {@link TRANSPORT_REACH.remote}, over the frontmatter this
+ * walk has already parsed, so a caller pays no extra read. The drop
+ * happens BEFORE the sort and before the array leaves this function, so
+ * no caller can count what it cannot see - a total that still included
+ * the withheld page would answer "there is one more page here than I am
+ * showing you". A vault that never wrote the token is byte-identical at
+ * both reaches.
+ *
+ * FAILS CLOSED on a page whose file could not be read, which is the one
+ * input the three roots must not disagree about. The parsed map resolves
+ * an unreadable file to `{}`, and reading that as "declares nothing"
+ * would admit at remote reach exactly the page
+ * {@link isPathReadableAtReach} denies for roots A and C - so the walk
+ * carries the read verdict beside the map (see {@link WalkedPage}) and
+ * substitutes {@link UNMEASURABLE_PAGE_VISIBILITY} for it, which is the
+ * same substitution those roots make.
  */
-export function listVaultPages(vaultDir: string, opts: ListVaultPagesOptions = {}): VaultPage[] {
+export function listVaultPages(vaultDir: string, opts: ListVaultPagesOptions): VaultPage[] {
   const skipDirs = new Set(opts.skipDirs ?? DEFAULT_SKIP_DIRS);
   const skipFiles = new Set((opts.skipFiles ?? DEFAULT_SKIP_FILES).map((f) => f.toLowerCase()));
 
-  const pages: VaultPage[] = [];
-  walk(vaultDir, vaultDir, skipDirs, skipFiles, pages, {
+  const walked: WalkedPage[] = [];
+  walk(vaultDir, vaultDir, skipDirs, skipFiles, walked, {
     sink: opts.notices,
     site: opts.site ?? LIST_VAULT_PAGES_SITE,
   });
+  const pages = walked
+    .filter((w) =>
+      isRemotelyReadable(
+        w.unreadable ? UNMEASURABLE_PAGE_VISIBILITY : pageVisibility(w.page.metadata),
+        opts.reach,
+      ),
+    )
+    .map((w) => w.page);
   pages.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
   return pages;
 }
@@ -617,10 +683,7 @@ interface WalkNoticeSink {
  * — and until now it was accepted and dropped, so a caller that asked
  * where the walk went blind was answered with silence.
  */
-export function listVaultBasenames(
-  vaultDir: string,
-  opts: ListVaultPagesOptions = {},
-): Set<string> {
+export function listVaultBasenames(vaultDir: string, opts: VaultWalkOptions = {}): Set<string> {
   return new Set(
     listVaultNotePaths(vaultDir, {
       ...opts,
@@ -639,10 +702,7 @@ export function listVaultBasenames(
  * before publishing the basename needs both, and deriving the path back
  * from a basename is exactly the guess this project refuses.
  */
-export function listVaultNotePaths(
-  vaultDir: string,
-  opts: ListVaultPagesOptions = {},
-): Array<string> {
+export function listVaultNotePaths(vaultDir: string, opts: VaultWalkOptions = {}): Array<string> {
   const skipDirs = new Set(opts.skipDirs ?? DEFAULT_SKIP_DIRS);
   const skipFiles = new Set((opts.skipFiles ?? DEFAULT_SKIP_FILES).map((f) => f.toLowerCase()));
   const out: string[] = [];
@@ -699,12 +759,29 @@ function walkBasenames(
   }
 }
 
+/**
+ * A walked page plus the one fact the parsed map cannot carry: whether
+ * its file could be READ at all.
+ *
+ * {@link VaultPage.metadata} resolves an unreadable file to `{}`, which is
+ * byte-indistinguishable from a page that declares nothing - so root B
+ * would read an unreadable page as untagged and admit it, while roots A
+ * and C substitute the reserved token for exactly that state and deny it.
+ * Two spellings of one rule, disagreeing in the fail direction. Internal
+ * to this module: the flag exists to decide the walk's own filter, and
+ * `VaultPage` stays the shape every caller already consumes.
+ */
+interface WalkedPage {
+  readonly page: VaultPage;
+  readonly unreadable: boolean;
+}
+
 function walk(
   root: string,
   dir: string,
   skipDirs: Set<string>,
   skipFiles: Set<string>,
-  out: VaultPage[],
+  out: WalkedPage[],
   notices: WalkNoticeSink,
 ): void {
   let entries;
@@ -746,7 +823,12 @@ function walk(
     if (notices.sink !== undefined) notices.sink.push(...pageNotices);
     const titleVal = meta["title"];
     const title = typeof titleVal === "string" && titleVal ? titleVal : stem(entry.name);
-    out.push({ title, path: full, metadata: meta });
+    out.push({
+      page: { title, path: full, metadata: meta },
+      // The same verdict `readCachedFrontmatterEntry` carries for roots A
+      // and C, read off the notices this walk already produced.
+      unreadable: pageNotices.some((n) => n.code === DEGRADATION_CODE.frontmatterUnreadable),
+    });
   }
 }
 

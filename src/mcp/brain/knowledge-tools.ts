@@ -37,6 +37,8 @@ import {
 import { diarize, DiarizationError } from "../../core/brain/diarization.ts";
 import { discoverIdeas, ideaCandidates } from "../../core/brain/idea-discovery.ts";
 import { auditMoc, MocAuditError } from "../../core/brain/link-graph/moc-audit.ts";
+import { reachView } from "../../core/brain/reach-view.ts";
+import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
 import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import { normaliseWikilinkTarget } from "../../core/brain/wikilink.ts";
 import { isoSecond } from "../../core/brain/time.ts";
@@ -62,11 +64,23 @@ import {
   type ClaimNode,
 } from "../../core/brain/claim-graph.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
+import { contextReach } from "../tool-contract.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { AGENT_SCOPE_SCHEMA, coerceAgentScope, coerceStr, coerceBool } from "../coerce.ts";
 import { coercePositiveInteger, toolSafeguard } from "./shared.ts";
+
+/**
+ * Vault-relative locations these two handlers read BY PATH, rather than
+ * through one of the three read roots. Named here because each was
+ * spelled twice - once to build the absolute path and once to report the
+ * relative one - and the two spellings had to agree for the boundary
+ * check below to be asking about the page it was returning.
+ */
+const BRAIN_CLUSTERS_REL = "Brain/clusters";
+const BRAIN_PROPOSALS_REL = "Brain/proposals";
+const BRIDGE_PROPOSALS_FILE = "bridges.md";
 
 /** Forward-looking projection envelope; read-only fold. */
 function toolBrainForesight(
@@ -139,12 +153,19 @@ async function toolBrainBridges(
     }
   }
   if (op === "list") {
-    const path = join(ctx.vault, "Brain", "proposals", "bridges.md");
-    if (!existsSync(path)) return { exists: false, proposals: 0 };
+    const rel = join(BRAIN_PROPOSALS_REL, BRIDGE_PROPOSALS_FILE);
+    const path = join(ctx.vault, rel);
+    // Root closure: this reads a vault page BY PATH without going through
+    // one of the three read roots, so it asks the rule here. A reserved
+    // proposals page answers exactly as an absent one - the same shape
+    // the by-path read primitives hold.
+    if (!existsSync(path) || !reachView(ctx.vault, contextReach(ctx)).visible(rel)) {
+      return { exists: false, proposals: 0 };
+    }
     const [meta] = parseFrontmatter(path);
     return {
       exists: true,
-      path: "Brain/proposals/bridges.md",
+      path: rel,
       generated_at: meta["generated_at"] ?? null,
       proposals: Number(meta["proposals"] ?? 0),
     };
@@ -194,12 +215,25 @@ async function toolBrainBridges(
     } catch {
       // Metrics are observability, not correctness.
     }
+    // Root closure over what the CALLER is told. Detection stays
+    // vault-wide - a bridge proposed from the visible half of a link
+    // graph would differ per caller and the proposals are written to one
+    // shared artifact - so the walk is unfiltered, the write is
+    // unfiltered, and the response is not. A proposal names two pages by
+    // path, so one withheld end withholds the proposal WHOLE: a bridge
+    // reported with one end missing is not a narrower true finding but a
+    // false one. `scanned_candidates` is a corpus size that names nothing
+    // and is the same number at every reach, so it stays as measured.
+    //
+    // `list` reads the artifact this branch just wrote, and asks the rule
+    // over the FILE - which is why writing it unfiltered is safe here.
+    const view = reachView(ctx.vault, contextReach(ctx));
     return {
       vec_available: report.vecAvailable,
       ...(report.reason !== undefined ? { reason: report.reason } : {}),
       scanned_candidates: report.scannedCandidates,
-      proposals: report.proposals,
-      artifact: "Brain/proposals/bridges.md",
+      proposals: report.proposals.filter((p) => view.row(p.source, p.target)),
+      artifact: join(BRAIN_PROPOSALS_REL, BRIDGE_PROPOSALS_FILE),
     };
   } finally {
     await store.close();
@@ -219,16 +253,23 @@ async function toolBrainClusters(
     throw new MCPError(INVALID_PARAMS, "brain_clusters: operation must be run|list");
   }
   if (op === "list") {
-    const dir = join(ctx.vault, "Brain", "clusters");
+    const dir = join(ctx.vault, BRAIN_CLUSTERS_REL);
     if (!existsSync(dir)) return { clusters: [] };
+    // Root closure: a directory listing by path, outside the three read
+    // roots, so the rule is asked per page here. A withheld cluster is
+    // dropped and nothing counts it - the caller cannot tell this listing
+    // from one over a vault that never held the page.
+    const view = reachView(ctx.vault, contextReach(ctx));
     const clusters = readdirSync(dir)
       .filter((f) => f.endsWith(".md"))
       .toSorted()
       .map((f) => {
+        const rel = join(BRAIN_CLUSTERS_REL, f);
+        if (!view.visible(rel)) return null;
         const [meta] = parseFrontmatter(join(dir, f));
         return meta["kind"] === "brain-cluster"
           ? {
-              path: `Brain/clusters/${f}`,
+              path: rel,
               cluster: String(meta["cluster"] ?? ""),
               size: Number(meta["size"] ?? 0),
               density: Number(meta["density"] ?? 0),
@@ -300,7 +341,16 @@ async function toolBrainClusters(
     // visible half of a link graph would produce different communities
     // for every caller and write them over each other. This filters what
     // the CALLER is told, which is the boundary the gate declares.
-    const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+    // Both rules, ANDed: a community naming a page EITHER rule withholds
+    // is dropped whole. The reserved-token half arrived with the read
+    // roots; the argument above for dropping rather than trimming is the
+    // same for it, and detection stays vault-wide for the same reason -
+    // clustering the visible half of a link graph would produce different
+    // communities per caller and write them over each other.
+    const view = everyArtifactRefView(
+      gatedOwnerScopeView(ctx.vault, ctx.agentName),
+      reachView(ctx.vault, contextReach(ctx)),
+    );
     const visible = view.keep(communities, (c) => c.members.map((m) => m.path));
     // `written` / `removed` are the cluster NOTES, and a cluster note is
     // named `cluster-<community id>.md` after the seed page - so its own
@@ -318,11 +368,11 @@ async function toolBrainClusters(
       })),
       written: materialized.written.filter((p) => visibleNotes.has(p)),
       // A removal names a community that no longer exists, so there is
-      // no surviving membership to ask about. Under a scope the list is
-      // withheld whole: it is the one field here whose subject cannot be
-      // resolved, and a `removed` entry naming a hidden seed is the same
-      // disclosure as a `written` one.
-      removed: view.scope === null ? materialized.removed : [],
+      // no surviving membership to ask about. Whenever ANY rule is live
+      // the list is withheld whole: it is the one field here whose
+      // subject cannot be resolved, and a `removed` entry naming a hidden
+      // seed is the same disclosure as a `written` one.
+      removed: view.filtersNothing ? materialized.removed : [],
       ...(materialized.batches ? { batches: materialized.batches } : {}),
     };
   } finally {
@@ -393,6 +443,7 @@ async function toolBrainDeepSynthesis(
     now,
     limit,
     ...(agentScope !== undefined ? { agentScope } : {}),
+    transportReach: contextReach(ctx),
   });
   let triggersCreated: number | undefined;
   if (enqueue) {

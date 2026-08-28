@@ -29,6 +29,7 @@ import {
 } from "../../core/brain/types.ts";
 import type { BrainLogEntry } from "../../core/brain/log.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
+import { contextReach } from "../tool-contract.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
@@ -51,6 +52,8 @@ import {
 import { loadGuardrailsConfigSafe } from "../../core/brain/policy.ts";
 import { normalizeAgentScope } from "../../core/graph/agent-scope.ts";
 import { isPreferenceVisible } from "../../core/brain/owner-scoped-facts.ts";
+import { reachView } from "../../core/brain/reach-view.ts";
+import { logEntryArtifactRefs } from "../../core/brain/log.ts";
 
 /** Accepted `at` forms, named in every refusal so the exit is actionable. */
 const AS_OF_FORMS = "an ISO-8601 instant or YYYY-MM-DD date";
@@ -147,6 +150,11 @@ async function toolBrainQuery(
     ? normalizeAgentScope(requestedScope)
     : null;
 
+  // Root C's rule over the reference-shaped rows this tool returns:
+  // a signal, a log event and a preference each NAME an artifact, and a
+  // row naming one the caller may not see discloses it by naming it.
+  const queryView = reachView(ctx.vault, contextReach(ctx));
+
   const startedAtMs = Date.now();
   const emitQueryTelemetry = (status: "ok" | "empty" | "error", resultCount: number): void => {
     // Lazy emit kernel (t_5d7aa7c5): gate off = thunk never runs; a
@@ -175,8 +183,19 @@ async function toolBrainQuery(
         // retired record is read through the same predicate as an active
         // one - retiring a memory must not publish it.
         const prefOwner = res.preference.owner;
+        // Both refusals carry the CALLER'S OWN ARGUMENT, which is what
+        // `queryByPreference` throws for a preference that does not
+        // exist. `BrainNotFoundError` formats the sentence itself, so
+        // passing a sentence to it produced "...found for id 'preference
+        // not found: pref-x'" against the absent form's "...for id
+        // 'pref-x'" - two messages, over a `pref-<slug>` key space a
+        // caller can enumerate, which is exactly the existence oracle the
+        // comment claimed was closed.
         if (ownerScope !== null && !isPreferenceVisible({ owner: prefOwner }, ownerScope)) {
-          throw new BrainNotFoundError(`preference not found: ${preference}`);
+          throw new BrainNotFoundError(preference);
+        }
+        if (!queryView.visible(res.preference.id)) {
+          throw new BrainNotFoundError(preference);
         }
         emitQueryTelemetry(res.evidence.length > 0 ? "ok" : "empty", res.evidence.length);
         return {
@@ -199,9 +218,17 @@ async function toolBrainQuery(
       const showExpired = coerceBoolOptional(args, "show_expired") ?? false;
       const res = queryByTopic(ctx.vault, topic, {
         showExpired,
+        transportReach: contextReach(ctx),
         ...(asOf !== null ? { now: asOf } : {}),
       });
-      const resultCount = res.signals.length + res.all_log_events.length;
+      // Filter BEFORE the count, as the `since` branch below does. The
+      // count is written to the vault's recall-telemetry log and handed
+      // back verbatim by `brain_recall_telemetry`, so a pre-filter number
+      // tells the caller how many rows it was not shown - a count oracle
+      // reached through a second tool rather than this one.
+      const signals = queryView.keep(res.signals, (sig) => [sig.id]);
+      const logEvents = queryView.keep(res.all_log_events, (e) => logEntryArtifactRefs(e));
+      const resultCount = signals.length + logEvents.length;
       emitQueryTelemetry(resultCount > 0 ? "ok" : "empty", resultCount);
       const topicPrefOwner = res.preference?.owner;
       const topicPrefVisible =
@@ -211,19 +238,20 @@ async function toolBrainQuery(
       return {
         mode: "topic",
         topic,
-        signals: res.signals.map(serializeSignal),
+        signals: signals.map(serializeSignal),
         preference: topicPrefVisible ? serializePreference(res.preference!) : null,
-        all_log_events: res.all_log_events.map(serializeLogEntry),
+        all_log_events: logEvents.map(serializeLogEntry),
       };
     }
 
     // since
     const res = queryByLogSince(ctx.vault, since!);
-    emitQueryTelemetry(res.length > 0 ? "ok" : "empty", res.length);
+    const events = queryView.keep(res, (e) => logEntryArtifactRefs(e));
+    emitQueryTelemetry(events.length > 0 ? "ok" : "empty", events.length);
     return {
       mode: "since",
       since: since!.toISOString(),
-      events: res.map(serializeLogEntry),
+      events: events.map(serializeLogEntry),
     };
   } catch (exc) {
     emitQueryTelemetry("error", 0);
@@ -327,7 +355,19 @@ async function toolBrainBacklinks(
   // (a-label-is-not-a-boundary, U3). The scope is the gated one: no
   // argument exists on this tool, and under `off` the view hides nothing.
   const index = buildBacklinkIndex(ctx.vault, gatedOwnerScopeView(ctx.vault, ctx.agentName).scope);
-  const refs = index.get(target) ?? [];
+  // The same reasoning one rule over: a ref names the artifact that WROTE
+  // it, so an index unfiltered by reach publishes the id of a page
+  // reserved against remote reads. A withheld TARGET answers as an absent
+  // one - the empty backlink document - rather than refusing, because an
+  // unknown target is a legitimate zero here and a refusal would be the
+  // one response shape that proves the page exists.
+  const view = reachView(ctx.vault, contextReach(ctx));
+  const refs = view.visible(target)
+    ? (index.get(target) ?? []).filter((r) => view.visible(r.source))
+    : [];
+  const unparsed = index.unparsed
+    .filter((u) => view.visible(u.source))
+    .map((u) => ({ source: u.source, source_kind: u.sourceKind, reason: u.reason }));
   return {
     id: target,
     count: refs.length,
@@ -340,17 +380,15 @@ async function toolBrainBacklinks(
     // A `count` beside a non-empty `unparsed` is not a measurement: the
     // walk skipped artifacts whose references it could not read, and a
     // caller told only the count would read a legacy vault's zero as a
-    // genuine zero. Omitted entirely when the walk was clean, so a
-    // healthy vault's payload is byte-identical.
-    ...(index.unparsed.length > 0
-      ? {
-          unparsed: index.unparsed.map((u) => ({
-            source: u.source,
-            source_kind: u.sourceKind,
-            reason: u.reason,
-          })),
-        }
-      : {}),
+    // genuine zero. Omitted entirely when the walk is clean, so a healthy
+    // vault's payload is byte-identical.
+    //
+    // Filtered by the same rule the refs are. Each entry NAMES its source
+    // artifact by id, so an unfiltered list disclosed a reserved page's id
+    // through a call that never mentioned it - and the honesty this field
+    // exists for does not extend to being honest about pages the caller
+    // may not know exist.
+    ...(unparsed.length > 0 ? { unparsed } : {}),
   };
 }
 
